@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use serde::Serialize;
 use worker::*;
 
@@ -11,6 +12,8 @@ struct HealthResponse<'a> {
     status: &'a str,
     mission: &'a str,
 }
+
+const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -31,19 +34,43 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── Runs (WS2) ────────────────────────────────────────
         .post_async("/v1/runs", |mut req, _ctx| async move {
             let body: models::CreateRun = req.json().await?;
-            let _ = (&body.trigger, &body.metadata);
-            Response::from_json(&models::RunCreated {
+            let _ = (&body.trigger, &body.actor, &body.metadata);
+            Response::from_json(&models::Created {
                 id: generate_id()?,
                 status: "created".into(),
-                repo: body.repo,
             })
         })
         .get("/v1/runs", |_, _| {
             Response::from_json(&serde_json::json!({ "runs": [] }))
         })
+        // ── WS2 domain stubs (plans, tool-calls, releases) ────
+        .post_async("/v1/plans", |mut req, _ctx| async move {
+            let body: models::CreatePlan = req.json().await?;
+            let _ = (&body.run_id, &body.task_ids, &body.metadata);
+            Response::from_json(&models::Created {
+                id: generate_id()?,
+                status: "created".into(),
+            })
+        })
+        .post_async("/v1/tool-calls", |mut req, _ctx| async move {
+            let body: models::RecordToolCall = req.json().await?;
+            let _ = (&body.run_id, &body.task_id, &body.output, &body.duration_ms);
+            Response::from_json(&models::Created {
+                id: generate_id()?,
+                status: "recorded".into(),
+            })
+        })
+        .post_async("/v1/releases", |mut req, _ctx| async move {
+            let body: models::CreateRelease = req.json().await?;
+            let _ = (&body.run_id, &body.artifact_ids, &body.metadata);
+            Response::from_json(&models::Created {
+                id: generate_id()?,
+                status: "created".into(),
+            })
+        })
         // ── Provenance Events (WS3) ───────────────────────────
         .post_async("/v1/events", |mut req, _ctx| async move {
-            let body: models::ProvenanceEvent = req.json().await?;
+            let body: models::IngestEvent = req.json().await?;
             let _ = (&body.run_id, &body.actor, &body.payload);
             Response::from_json(&models::EventAck {
                 id: generate_id()?,
@@ -51,10 +78,32 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 accepted: true,
             })
         })
-        // ── Artifacts (R2-backed) ─────────────────────────────
+        // ── Artifacts (R2-backed, streaming validated) ────────
         .put_async("/v1/artifacts/:key", |mut req, ctx| async move {
-            let key = ctx.param("key").unwrap().to_string();
-            let data = req.bytes().await?;
+            let Some(key) = ctx.param("key").map(ToString::to_string) else {
+                return Response::error("missing artifact key", 400);
+            };
+
+            if let Some(value) = req.headers().get("content-length")? {
+                let content_length = match value.parse::<usize>() {
+                    Ok(parsed) => parsed,
+                    Err(_) => return Response::error("invalid content-length header", 400),
+                };
+                if content_length > MAX_ARTIFACT_BYTES {
+                    return Response::error("artifact exceeds max size", 413);
+                }
+            }
+
+            let mut stream = req.stream()?;
+            let mut data = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                data.extend_from_slice(&chunk);
+                if data.len() > MAX_ARTIFACT_BYTES {
+                    return Response::error("artifact exceeds max size", 413);
+                }
+            }
+
             let bucket = ctx.env.bucket("ARTIFACTS")?;
             let size = storage::put_blob(&bucket, &key, data).await?;
             Response::from_json(&serde_json::json!({
@@ -64,11 +113,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }))
         })
         .get_async("/v1/artifacts/:key", |_req, ctx| async move {
-            let key = ctx.param("key").unwrap().to_string();
+            let Some(key) = ctx.param("key").map(ToString::to_string) else {
+                return Response::error("missing artifact key", 400);
+            };
             let bucket = ctx.env.bucket("ARTIFACTS")?;
             match storage::get_blob(&bucket, &key).await? {
                 Some(data) => {
-                    let mut headers = Headers::new();
+                    let headers = Headers::new();
                     headers.set("content-type", "application/octet-stream")?;
                     Ok(Response::from_bytes(data)?.with_headers(headers))
                 }
@@ -85,9 +136,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 reason: "no policy restrictions configured".into(),
             })
         })
-        // ── Tasks (M1) ────────────────────────────────────────
+        // ── Agent Tasks (M1) ──────────────────────────────────
         .post_async("/v1/tasks", |mut req, ctx| async move {
-            let body: models::CreateTask = req.json().await?;
+            let body: models::CreateAgentTask = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
             db::create_task(&d1, &id, &body).await?;
@@ -249,6 +300,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 fn generate_id() -> Result<String> {
     let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).map_err(|e| Error::RustError(e.to_string()))?;
+    getrandom::getrandom(&mut buf)
+        .map_err(|err| Error::RustError(format!("failed to generate id: {err}")))?;
     Ok(hex::encode(buf))
 }

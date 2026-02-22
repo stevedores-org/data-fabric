@@ -22,7 +22,7 @@ fn opt_json(v: &Option<serde_json::Value>) -> JsValue {
 
 // ── Tasks ───────────────────────────────────────────────────────
 
-pub async fn create_task(db: &D1Database, id: &str, body: &models::CreateTask) -> Result<()> {
+pub async fn create_task(db: &D1Database, id: &str, body: &models::CreateAgentTask) -> Result<()> {
     let now = now_iso();
     let max_retries = body.max_retries.unwrap_or(3);
 
@@ -52,7 +52,7 @@ pub async fn claim_next_task(
     db: &D1Database,
     agent_id: &str,
     capabilities: &[&str],
-) -> Result<Option<models::Task>> {
+) -> Result<Option<models::AgentTask>> {
     let now = now_iso();
     let lease = lease_time(300);
 
@@ -107,7 +107,7 @@ pub async fn claim_next_task(
         .first(None)
         .await?;
 
-    Ok(task.map(|r| r.into_task()))
+    Ok(task.map(|r| r.into_agent_task()))
 }
 
 pub async fn heartbeat_task(db: &D1Database, task_id: &str, agent_id: &str) -> Result<bool> {
@@ -368,8 +368,8 @@ pub struct TaskRow {
 }
 
 impl TaskRow {
-    pub fn into_task(self) -> models::Task {
-        models::Task {
+    pub fn into_agent_task(self) -> models::AgentTask {
+        models::AgentTask {
             id: self.id,
             job_id: self.job_id,
             task_type: self.task_type,
