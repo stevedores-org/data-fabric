@@ -22,8 +22,12 @@ jobs:
           target: wasm32-unknown-unknown
           components: rustfmt, clippy
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
       - name: Install local-ci
         run: go install github.com/stevedores-org/local-ci@latest
 
       - name: Run local-ci
-        run: local-ci fmt clippy check --no-cache --json
+        run: local-ci fmt clippy check test --no-cache --json
