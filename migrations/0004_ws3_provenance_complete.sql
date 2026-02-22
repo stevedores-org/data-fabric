@@ -11,3 +11,7 @@ CREATE TABLE IF NOT EXISTS run_summaries (
     event_types TEXT,  -- JSON array of unique event types
     updated_at TEXT NOT NULL
 );
+
+-- ── Unique constraint for causality edge deduplication ──────────
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rel_unique_edge
+  ON relationships(rel_type, from_kind, from_id, to_kind, to_id);

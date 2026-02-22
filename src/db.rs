@@ -871,7 +871,7 @@ pub async fn insert_relationship(
 ) -> Result<()> {
     let now = now_iso();
     db.prepare(
-        "INSERT INTO relationships (rel_type, from_kind, from_id, to_kind, to_id, relation, created_at)
+        "INSERT OR IGNORE INTO relationships (rel_type, from_kind, from_id, to_kind, to_id, relation, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
     .bind(&[
@@ -903,7 +903,7 @@ pub async fn get_provenance_chain(
         "WITH RECURSIVE chain(depth, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at) AS (
            SELECT 0, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at
              FROM relationships WHERE to_kind = ?1 AND to_id = ?2
-           UNION ALL
+           UNION
            SELECT c.depth + 1, r.rel_type, r.from_kind, r.from_id, r.to_kind, r.to_id, r.relation, r.created_at
              FROM relationships r JOIN chain c ON r.to_kind = c.from_kind AND r.to_id = c.from_id
              WHERE c.depth < ?3
@@ -912,7 +912,7 @@ pub async fn get_provenance_chain(
         "WITH RECURSIVE chain(depth, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at) AS (
            SELECT 0, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at
              FROM relationships WHERE from_kind = ?1 AND from_id = ?2
-           UNION ALL
+           UNION
            SELECT c.depth + 1, r.rel_type, r.from_kind, r.from_id, r.to_kind, r.to_id, r.relation, r.created_at
              FROM relationships r JOIN chain c ON r.from_kind = c.to_kind AND r.from_id = c.to_id
              WHERE c.depth < ?3
@@ -961,83 +961,47 @@ pub async fn upsert_run_summary(
     created_at: &str,
 ) -> Result<()> {
     let now = now_iso();
+    let actor_json: Vec<&str> = actor.into_iter().collect();
+    let event_type_json = vec![event_type];
 
-    // Try to fetch existing summary
-    let existing: Option<RunSummaryRow> = db
-        .prepare("SELECT * FROM run_summaries WHERE run_id = ?1")
-        .bind(&[JsValue::from_str(run_id)])?
-        .first(None)
-        .await?;
-
-    match existing {
-        Some(row) => {
-            let new_count = row.event_count + 1;
-            let first = row
-                .first_event_at
-                .as_deref()
-                .filter(|f| *f <= created_at)
-                .unwrap_or(created_at);
-            let last = row
-                .last_event_at
-                .as_deref()
-                .filter(|l| *l >= created_at)
-                .unwrap_or(created_at);
-
-            // Merge actors
-            let mut actors: Vec<String> = row
-                .actors
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
-            if let Some(a) = actor {
-                if !actors.iter().any(|x| x == a) {
-                    actors.push(a.to_string());
-                }
-            }
-
-            // Merge event_types
-            let mut event_types: Vec<String> = row
-                .event_types
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
-            if !event_types.iter().any(|x| x == event_type) {
-                event_types.push(event_type.to_string());
-            }
-
-            db.prepare(
-                "UPDATE run_summaries SET event_count = ?1, first_event_at = ?2, last_event_at = ?3, actors = ?4, event_types = ?5, updated_at = ?6 WHERE run_id = ?7",
-            )
-            .bind(&[
-                JsValue::from(new_count),
-                JsValue::from_str(first),
-                JsValue::from_str(last),
-                JsValue::from_str(&serde_json::to_string(&actors).unwrap()),
-                JsValue::from_str(&serde_json::to_string(&event_types).unwrap()),
-                JsValue::from_str(&now),
-                JsValue::from_str(run_id),
-            ])?
-            .run()
-            .await?;
-        }
-        None => {
-            let actors: Vec<&str> = actor.into_iter().collect();
-            let event_types = vec![event_type];
-            db.prepare(
-                "INSERT INTO run_summaries (run_id, event_count, first_event_at, last_event_at, actors, event_types, updated_at)
-                 VALUES (?1, 1, ?2, ?2, ?3, ?4, ?5)",
-            )
-            .bind(&[
-                JsValue::from_str(run_id),
-                JsValue::from_str(created_at),
-                JsValue::from_str(&serde_json::to_string(&actors).unwrap()),
-                JsValue::from_str(&serde_json::to_string(&event_types).unwrap()),
-                JsValue::from_str(&now),
-            ])?
-            .run()
-            .await?;
-        }
-    }
+    // Atomic upsert: INSERT on first event, ON CONFLICT merge arrays + update counts.
+    // json_group_array(DISTINCT ...) via subquery deduplicates actors/event_types.
+    db.prepare(
+        "INSERT INTO run_summaries (run_id, event_count, first_event_at, last_event_at, actors, event_types, updated_at)
+         VALUES (?1, 1, ?2, ?2, ?3, ?4, ?5)
+         ON CONFLICT(run_id) DO UPDATE SET
+           event_count = event_count + 1,
+           first_event_at = MIN(first_event_at, excluded.first_event_at),
+           last_event_at = MAX(last_event_at, excluded.last_event_at),
+           actors = (
+             SELECT json_group_array(value) FROM (
+               SELECT DISTINCT value FROM (
+                 SELECT value FROM json_each(run_summaries.actors)
+                 UNION ALL
+                 SELECT value FROM json_each(excluded.actors)
+               )
+             )
+           ),
+           event_types = (
+             SELECT json_group_array(value) FROM (
+               SELECT DISTINCT value FROM (
+                 SELECT value FROM json_each(run_summaries.event_types)
+                 UNION ALL
+                 SELECT value FROM json_each(excluded.event_types)
+               )
+             )
+           ),
+           updated_at = excluded.updated_at",
+    )
+    .bind(&[
+        JsValue::from_str(run_id),
+        JsValue::from_str(created_at),
+        JsValue::from_str(&serde_json::to_string(&actor_json).unwrap()),
+        JsValue::from_str(&serde_json::to_string(&event_type_json).unwrap()),
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
     Ok(())
 }
 
@@ -1058,20 +1022,6 @@ pub async fn list_run_summaries(db: &D1Database, limit: u32) -> Result<Vec<model
         .await?;
     let rows: Vec<RunSummaryRow> = result.results()?;
     Ok(rows.into_iter().map(|r| r.into_summary()).collect())
-}
-
-pub async fn count_trace_events_for_run(db: &D1Database, run_id: &str) -> Result<u32> {
-    let row: Option<CountRow> = db
-        .prepare("SELECT COUNT(*) as cnt FROM events_bronze WHERE run_id = ?1")
-        .bind(&[JsValue::from_str(run_id)])?
-        .first(None)
-        .await?;
-    Ok(row.map(|r| r.cnt as u32).unwrap_or(0))
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CountRow {
-    cnt: i64,
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -343,13 +343,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let limit =
                 parse_limit_query(req.url().ok(), "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
             let d1 = ctx.env.d1("DB")?;
-            let total = db::count_trace_events_for_run(&d1, &run_id).await?;
-            let events = db::get_trace_for_run(&d1, &run_id, limit).await?;
-            let truncated = total > events.len() as u32;
+            // Fetch limit+1 to detect truncation without a separate COUNT query
+            let mut events = db::get_trace_for_run(&d1, &run_id, limit + 1).await?;
+            let truncated = events.len() > limit as usize;
+            if truncated {
+                events.truncate(limit as usize);
+            }
             Response::from_json(&models::TraceResponse {
                 run_id,
                 events,
-                total: Some(total as usize),
+                total: None,
                 truncated: Some(truncated),
             })
         })
@@ -358,15 +361,14 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
             };
-            let hops = parse_limit_query(req.url().ok(), "hops").unwrap_or(5);
+            let limit = parse_limit_query(req.url().ok(), "hops").unwrap_or(100);
             let d1 = ctx.env.d1("DB")?;
-            let edges = db::get_provenance_chain(&d1, "run", &run_id, "forward", hops).await?;
-            Response::from_json(&models::ProvenanceResponse {
-                entity_kind: "run".into(),
-                entity_id: run_id,
-                direction: "forward".into(),
-                hops,
-                edges,
+            let events = db::get_trace_for_run(&d1, &run_id, limit).await?;
+            Response::from_json(&models::TraceResponse {
+                run_id,
+                events,
+                total: None,
+                truncated: None,
             })
         })
         // ── Provenance Chain (WS3) ──────────────────────────────
@@ -388,6 +390,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .get("direction")
                 .map(|s| s.as_str())
                 .unwrap_or("forward");
+            if direction != "forward" && direction != "backward" {
+                return Response::error("invalid direction: must be 'forward' or 'backward'", 400);
+            }
             let hops = params
                 .get("hops")
                 .and_then(|s| s.parse().ok())
@@ -466,13 +471,8 @@ pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Conte
             Ok(evt) => {
                 let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
 
-                // Silver promotion
-                let bronze_id = generate_id()?;
-                let silver_id = generate_id()?;
-                let silver_events = vec![(silver_id, bronze_id.clone(), &evt, now.clone())];
-                if let Err(e) = db::insert_events_silver(&d1, &silver_events, &now).await {
-                    worker::console_log!("[queue {}] silver promotion error: {}", queue_name, e);
-                }
+                // Note: silver promotion is done synchronously in POST /v1/graph-events.
+                // The queue consumer handles only causality edges and gold layer summaries.
 
                 // Causality edges
                 if let Err(e) = db::insert_causality_from_event(&d1, &evt).await {
