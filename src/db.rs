@@ -328,6 +328,90 @@ pub async fn insert_events_bronze(
     Ok(())
 }
 
+/// Default max events per trace query (avoids unbounded result sets).
+pub const TRACE_DEFAULT_LIMIT: u32 = 1000;
+
+/// Fetch trace slice for a run (ordered by created_at). WS3 provenance. Limited by `limit` (default TRACE_DEFAULT_LIMIT).
+pub async fn get_trace_for_run(
+    db: &D1Database,
+    run_id: &str,
+    limit: u32,
+) -> Result<Vec<models::TraceEvent>> {
+    let result: D1Result = db
+        .prepare(
+            "SELECT id, run_id, thread_id, event_type, node_id, actor, payload, created_at
+             FROM events_bronze WHERE run_id = ?1 ORDER BY created_at ASC LIMIT ?2",
+        )
+        .bind(&[JsValue::from_str(run_id), JsValue::from(limit)])?
+        .all()
+        .await?;
+
+    let rows: Vec<TraceEventRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_trace_event()).collect())
+}
+
+/// Insert into silver layer (sync promotion). Each row has its own id, bronze_id FK, entity_refs from event.
+pub async fn insert_events_silver(
+    db: &D1Database,
+    events: &[(String, String, &models::GraphEvent, String)], // (silver_id, bronze_id, evt, created_at)
+    normalized_at: &str,
+) -> Result<()> {
+    let mut stmts = Vec::with_capacity(events.len());
+    for (silver_id, bronze_id, evt, created_at) in events {
+        let payload_json = evt
+            .payload
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap());
+        let entity_refs_json = build_entity_refs(evt);
+
+        let stmt = db
+            .prepare(
+                "INSERT INTO events_silver (id, bronze_id, run_id, thread_id, event_type, node_id, actor, payload, created_at, normalized_at, entity_refs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )
+            .bind(&[
+                JsValue::from_str(silver_id),
+                JsValue::from_str(bronze_id),
+                opt_str(&evt.run_id),
+                opt_str(&evt.thread_id),
+                JsValue::from_str(&evt.event_type),
+                opt_str(&evt.node_id),
+                opt_str(&evt.actor),
+                match &payload_json {
+                    Some(s) => JsValue::from_str(s),
+                    None => JsValue::NULL,
+                },
+                JsValue::from_str(created_at),
+                JsValue::from_str(normalized_at),
+                match &entity_refs_json {
+                    Some(s) => JsValue::from_str(s),
+                    None => JsValue::NULL,
+                },
+            ])?;
+        stmts.push(stmt);
+    }
+
+    db.batch(stmts).await?;
+    Ok(())
+}
+
+fn build_entity_refs(evt: &models::GraphEvent) -> Option<String> {
+    let mut obj = serde_json::Map::new();
+    if let Some(ref r) = evt.run_id {
+        obj.insert("run_id".into(), serde_json::Value::String(r.clone()));
+    }
+    if let Some(ref t) = evt.thread_id {
+        obj.insert("thread_id".into(), serde_json::Value::String(t.clone()));
+    }
+    if let Some(ref n) = evt.node_id {
+        obj.insert("node_id".into(), serde_json::Value::String(n.clone()));
+    }
+    if obj.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&serde_json::Value::Object(obj)).ok()
+}
+
 // ── Internal row types ──────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -405,6 +489,33 @@ impl AgentRow {
             last_heartbeat: self.last_heartbeat,
             status: self.status,
             metadata: self.metadata.and_then(|s| serde_json::from_str(&s).ok()),
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TraceEventRow {
+    id: String,
+    run_id: Option<String>,
+    thread_id: Option<String>,
+    event_type: String,
+    node_id: Option<String>,
+    actor: Option<String>,
+    payload: Option<String>,
+    created_at: String,
+}
+
+impl TraceEventRow {
+    fn into_trace_event(self) -> models::TraceEvent {
+        models::TraceEvent {
+            id: self.id,
+            run_id: self.run_id,
+            thread_id: self.thread_id,
+            event_type: self.event_type,
+            node_id: self.node_id,
+            actor: self.actor,
+            payload: self.payload.and_then(|s| serde_json::from_str(&s).ok()),
+            created_at: self.created_at,
         }
     }
 }

@@ -132,3 +132,25 @@ pub struct GraphEventAck {
 pub struct ErrorResponse {
     pub error: String,
 }
+
+// ── Trace / Provenance (WS3: issue #43) ───────────────────────
+
+/// Single event in a trace slice (reconstructed execution narrative).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct TraceEvent {
+    pub id: String,
+    pub run_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub event_type: String,
+    pub node_id: Option<String>,
+    pub actor: Option<String>,
+    pub payload: Option<serde_json::Value>,
+    pub created_at: String,
+}
+
+/// Trace slice for a run: ordered events for debugging and replay.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct TraceResponse {
+    pub run_id: String,
+    pub events: Vec<TraceEvent>,
+}
