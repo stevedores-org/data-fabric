@@ -327,12 +327,96 @@ fn event_ack_response() {
 #[test]
 fn policy_check_response() {
     let resp = PolicyCheckResponse {
+        id: "pd1".into(),
         action: "deploy".into(),
         decision: "allow".into(),
         reason: "no restrictions".into(),
+        risk_level: "write".into(),
+        matched_rule: Some("rule1".into()),
     };
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["decision"], "allow");
+    assert_eq!(json["risk_level"], "write");
+    assert_eq!(json["matched_rule"], "rule1");
+}
+
+// ── WS4 Policy Rules ────────────────────────────────────────────
+
+#[test]
+fn create_policy_rule_defaults() {
+    let input = r#"{"name":"test","verdict":"allow"}"#;
+    let parsed: CreatePolicyRule = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.action_pattern, "*");
+    assert_eq!(parsed.resource_pattern, "*");
+    assert_eq!(parsed.actor_pattern, "*");
+    assert_eq!(parsed.risk_level, "read");
+    assert_eq!(parsed.priority, 0);
+}
+
+#[test]
+fn create_policy_rule_full() {
+    let input = r#"{
+        "name": "block prod deploys",
+        "action_pattern": "deploy",
+        "resource_pattern": "prod",
+        "actor_pattern": "*",
+        "risk_level": "irreversible",
+        "verdict": "deny",
+        "reason": "prod deploys require approval",
+        "priority": 100
+    }"#;
+    let parsed: CreatePolicyRule = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.name, "block prod deploys");
+    assert_eq!(parsed.verdict, "deny");
+    assert_eq!(parsed.priority, 100);
+}
+
+#[test]
+fn update_policy_rule_partial() {
+    let input = r#"{"verdict":"deny","enabled":false}"#;
+    let parsed: UpdatePolicyRule = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.verdict.as_deref(), Some("deny"));
+    assert_eq!(parsed.enabled, Some(false));
+    assert!(parsed.name.is_none());
+    assert!(parsed.action_pattern.is_none());
+}
+
+#[test]
+fn policy_rule_response_round_trip() {
+    let resp = PolicyRuleResponse {
+        id: "r1".into(),
+        name: "test rule".into(),
+        action_pattern: "deploy:*".into(),
+        resource_pattern: "prod".into(),
+        actor_pattern: "*".into(),
+        risk_level: "destructive".into(),
+        verdict: "escalate".into(),
+        reason: "needs approval".into(),
+        priority: 10,
+        enabled: true,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: PolicyRuleResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
+
+#[test]
+fn policy_decision_response_round_trip() {
+    let resp = PolicyDecisionResponse {
+        id: "d1".into(),
+        action: "deploy".into(),
+        actor: "agent-1".into(),
+        resource: Some("staging".into()),
+        decision: "allow".into(),
+        reason: "matched rule".into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        context: Some(serde_json::json!({"env": "staging"})),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: PolicyDecisionResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
 }
 
 // ── Orchestration types (M1-M3) ────────────────────────────────
@@ -501,4 +585,56 @@ fn trace_response_with_metadata_serializes() {
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["total"], 100);
     assert_eq!(json["truncated"], true);
+// ── WS5: Retrieval & Memory ────────────────────────────────────
+
+#[test]
+fn upsert_memory_item_round_trip() {
+    let input = r#"{
+        "repo":"stevedores-org/data-fabric",
+        "kind":"checkpoint",
+        "run_id":"r1",
+        "thread_id":"th-1",
+        "summary":"checkpoint after codegen",
+        "tags":["ci","checkpoint"],
+        "success_rate":0.9,
+        "ttl_seconds":3600
+    }"#;
+    let parsed: UpsertMemoryItemRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.repo, "stevedores-org/data-fabric");
+    assert_eq!(parsed.kind, MemoryKind::Checkpoint);
+    assert_eq!(parsed.tags.len(), 2);
+}
+
+#[test]
+fn retrieve_memory_defaults_apply() {
+    let input = r#"{"repo":"stevedores-org/data-fabric","query":"fix failing checks"}"#;
+    let parsed: RetrieveMemoryRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.top_k, 8);
+    assert!(!parsed.include_stale);
+    assert!(!parsed.include_unsafe);
+    assert!(!parsed.include_conflicted);
+}
+
+#[test]
+fn context_pack_request_defaults_budget() {
+    let input =
+        r#"{"repo":"stevedores-org/data-fabric","query":"orchestrator retry loop","top_k":5}"#;
+    let parsed: ContextPackRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.token_budget, 4096);
+    assert_eq!(parsed.retrieval.top_k, 5);
+}
+
+#[test]
+fn retrieval_feedback_round_trip() {
+    let input = r#"{
+        "query_id":"q1",
+        "success":true,
+        "first_pass_success":false,
+        "cache_hit":true,
+        "latency_ms":120
+    }"#;
+    let parsed: RetrievalFeedback = serde_json::from_str(input).unwrap();
+    assert!(parsed.success);
+    assert!(parsed.cache_hit);
+    assert_eq!(parsed.latency_ms, Some(120));
 }
