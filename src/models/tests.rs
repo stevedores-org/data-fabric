@@ -334,3 +334,55 @@ fn policy_check_response() {
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["decision"], "allow");
 }
+
+// ── Orchestration types (M1-M3) ────────────────────────────────
+
+#[test]
+fn create_agent_task_round_trip() {
+    let input = r#"{"job_id":"j1","task_type":"build","priority":5,"params":{"repo":"test"}}"#;
+    let parsed: CreateAgentTask = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.job_id, "j1");
+    assert_eq!(parsed.task_type, "build");
+    assert_eq!(parsed.priority, 5);
+    let json = serde_json::to_string(&parsed).unwrap();
+    let reparsed: CreateAgentTask = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, reparsed);
+}
+
+#[test]
+fn create_agent_task_minimal() {
+    let input = r#"{"job_id":"j1","task_type":"build"}"#;
+    let parsed: CreateAgentTask = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.priority, 0);
+    assert!(parsed.params.is_none());
+    assert!(parsed.graph_ref.is_none());
+}
+
+#[test]
+fn register_agent_round_trip() {
+    let input = r#"{"name":"build-agent","capabilities":["build","test"],"endpoint":"https://agent.example.com"}"#;
+    let parsed: RegisterAgent = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.name, "build-agent");
+    assert_eq!(parsed.capabilities, vec!["build", "test"]);
+    assert_eq!(
+        parsed.endpoint.as_deref(),
+        Some("https://agent.example.com")
+    );
+}
+
+#[test]
+fn create_checkpoint_round_trip() {
+    let input = r#"{"thread_id":"t1","node_id":"n1","state":{"messages":[]}}"#;
+    let parsed: CreateCheckpoint = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.thread_id, "t1");
+    assert_eq!(parsed.node_id, "n1");
+    assert!(parsed.parent_id.is_none());
+}
+
+#[test]
+fn graph_event_batch_round_trip() {
+    let input = r#"{"events":[{"event_type":"node.start","node_id":"n1","thread_id":"t1"}]}"#;
+    let parsed: GraphEventBatch = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.events.len(), 1);
+    assert_eq!(parsed.events[0].event_type, "node.start");
+}
