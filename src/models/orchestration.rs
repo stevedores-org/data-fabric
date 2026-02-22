@@ -153,4 +153,47 @@ pub struct TraceEvent {
 pub struct TraceResponse {
     pub run_id: String,
     pub events: Vec<TraceEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+}
+
+// ── Provenance Links (WS3: causality chain) ─────────────────────
+
+/// Single edge in a provenance/causality chain.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProvenanceEdge {
+    pub depth: i32,
+    pub rel_type: String,
+    pub from_kind: String,
+    pub from_id: String,
+    pub to_kind: String,
+    pub to_id: String,
+    pub relation: Option<String>,
+    pub created_at: Option<String>,
+}
+
+/// Response for provenance chain query.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProvenanceResponse {
+    pub entity_kind: String,
+    pub entity_id: String,
+    pub direction: String,
+    pub hops: u32,
+    pub edges: Vec<ProvenanceEdge>,
+}
+
+// ── Gold Layer: Run Summaries (WS3) ─────────────────────────────
+
+/// Materialized run summary (gold layer).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct RunSummary {
+    pub run_id: String,
+    pub event_count: i32,
+    pub first_event_at: Option<String>,
+    pub last_event_at: Option<String>,
+    pub actors: Vec<String>,
+    pub event_types: Vec<String>,
+    pub updated_at: String,
 }

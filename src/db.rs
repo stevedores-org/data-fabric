@@ -1838,6 +1838,232 @@ pub struct Ws2TaskResponse {
     pub metadata: Option<serde_json::Value>,
 }
 
+// ── Provenance Links (WS3: causality chain) ─────────────────────
+
+pub async fn insert_relationship(
+    db: &D1Database,
+    rel_type: &str,
+    from_kind: &str,
+    from_id: &str,
+    to_kind: &str,
+    to_id: &str,
+    relation: Option<&str>,
+) -> Result<()> {
+    let now = now_iso();
+    db.prepare(
+        "INSERT OR IGNORE INTO relationships (rel_type, from_kind, from_id, to_kind, to_id, relation, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(&[
+        JsValue::from_str(rel_type),
+        JsValue::from_str(from_kind),
+        JsValue::from_str(from_id),
+        JsValue::from_str(to_kind),
+        JsValue::from_str(to_id),
+        match relation {
+            Some(r) => JsValue::from_str(r),
+            None => JsValue::NULL,
+        },
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// Walk the provenance chain from an entity. Direction "forward" follows from→to; "backward" follows to→from.
+pub async fn get_provenance_chain(
+    db: &D1Database,
+    kind: &str,
+    id: &str,
+    direction: &str,
+    max_hops: u32,
+) -> Result<Vec<models::ProvenanceEdge>> {
+    let query = if direction == "backward" {
+        "WITH RECURSIVE chain(depth, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at) AS (
+           SELECT 0, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at
+             FROM relationships WHERE to_kind = ?1 AND to_id = ?2
+           UNION
+           SELECT c.depth + 1, r.rel_type, r.from_kind, r.from_id, r.to_kind, r.to_id, r.relation, r.created_at
+             FROM relationships r JOIN chain c ON r.to_kind = c.from_kind AND r.to_id = c.from_id
+             WHERE c.depth < ?3
+         ) SELECT * FROM chain ORDER BY depth"
+    } else {
+        "WITH RECURSIVE chain(depth, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at) AS (
+           SELECT 0, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at
+             FROM relationships WHERE from_kind = ?1 AND from_id = ?2
+           UNION
+           SELECT c.depth + 1, r.rel_type, r.from_kind, r.from_id, r.to_kind, r.to_id, r.relation, r.created_at
+             FROM relationships r JOIN chain c ON r.from_kind = c.to_kind AND r.from_id = c.to_id
+             WHERE c.depth < ?3
+         ) SELECT * FROM chain ORDER BY depth"
+    };
+
+    let result: D1Result = db
+        .prepare(query)
+        .bind(&[
+            JsValue::from_str(kind),
+            JsValue::from_str(id),
+            JsValue::from(max_hops),
+        ])?
+        .all()
+        .await?;
+
+    let rows: Vec<ProvenanceEdgeRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_edge()).collect())
+}
+
+/// Extract implicit causality edges from a GraphEvent and insert them.
+pub async fn insert_causality_from_event(db: &D1Database, evt: &models::GraphEvent) -> Result<()> {
+    // run → task causality
+    if let (Some(ref run_id), Some(ref node_id)) = (&evt.run_id, &evt.node_id) {
+        insert_relationship(
+            db,
+            "causality",
+            "run",
+            run_id,
+            "node",
+            node_id,
+            Some("executed"),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// ── Gold Layer: Run Summaries (WS3) ─────────────────────────────
+
+pub async fn upsert_run_summary(
+    db: &D1Database,
+    run_id: &str,
+    actor: Option<&str>,
+    event_type: &str,
+    created_at: &str,
+) -> Result<()> {
+    let now = now_iso();
+    let actor_json: Vec<&str> = actor.into_iter().collect();
+    let event_type_json = vec![event_type];
+
+    // Atomic upsert: INSERT on first event, ON CONFLICT merge arrays + update counts.
+    // json_group_array(DISTINCT ...) via subquery deduplicates actors/event_types.
+    db.prepare(
+        "INSERT INTO run_summaries (run_id, event_count, first_event_at, last_event_at, actors, event_types, updated_at)
+         VALUES (?1, 1, ?2, ?2, ?3, ?4, ?5)
+         ON CONFLICT(run_id) DO UPDATE SET
+           event_count = event_count + 1,
+           first_event_at = MIN(first_event_at, excluded.first_event_at),
+           last_event_at = MAX(last_event_at, excluded.last_event_at),
+           actors = (
+             SELECT json_group_array(value) FROM (
+               SELECT DISTINCT value FROM (
+                 SELECT value FROM json_each(run_summaries.actors)
+                 UNION ALL
+                 SELECT value FROM json_each(excluded.actors)
+               )
+             )
+           ),
+           event_types = (
+             SELECT json_group_array(value) FROM (
+               SELECT DISTINCT value FROM (
+                 SELECT value FROM json_each(run_summaries.event_types)
+                 UNION ALL
+                 SELECT value FROM json_each(excluded.event_types)
+               )
+             )
+           ),
+           updated_at = excluded.updated_at",
+    )
+    .bind(&[
+        JsValue::from_str(run_id),
+        JsValue::from_str(created_at),
+        JsValue::from_str(&serde_json::to_string(&actor_json).unwrap()),
+        JsValue::from_str(&serde_json::to_string(&event_type_json).unwrap()),
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn get_run_summary(db: &D1Database, run_id: &str) -> Result<Option<models::RunSummary>> {
+    let row: Option<RunSummaryRow> = db
+        .prepare("SELECT * FROM run_summaries WHERE run_id = ?1")
+        .bind(&[JsValue::from_str(run_id)])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.into_summary()))
+}
+
+pub async fn list_run_summaries(db: &D1Database, limit: u32) -> Result<Vec<models::RunSummary>> {
+    let result: D1Result = db
+        .prepare("SELECT * FROM run_summaries ORDER BY updated_at DESC LIMIT ?1")
+        .bind(&[JsValue::from(limit)])?
+        .all()
+        .await?;
+    let rows: Vec<RunSummaryRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_summary()).collect())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProvenanceEdgeRow {
+    depth: i32,
+    rel_type: String,
+    from_kind: String,
+    from_id: String,
+    to_kind: String,
+    to_id: String,
+    relation: Option<String>,
+    created_at: Option<String>,
+}
+
+impl ProvenanceEdgeRow {
+    fn into_edge(self) -> models::ProvenanceEdge {
+        models::ProvenanceEdge {
+            depth: self.depth,
+            rel_type: self.rel_type,
+            from_kind: self.from_kind,
+            from_id: self.from_id,
+            to_kind: self.to_kind,
+            to_id: self.to_id,
+            relation: self.relation,
+            created_at: self.created_at,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RunSummaryRow {
+    run_id: String,
+    event_count: i32,
+    first_event_at: Option<String>,
+    last_event_at: Option<String>,
+    actors: Option<String>,
+    event_types: Option<String>,
+    updated_at: String,
+}
+
+impl RunSummaryRow {
+    fn into_summary(self) -> models::RunSummary {
+        models::RunSummary {
+            run_id: self.run_id,
+            event_count: self.event_count,
+            first_event_at: self.first_event_at,
+            last_event_at: self.last_event_at,
+            actors: self
+                .actors
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default(),
+            event_types: self
+                .event_types
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default(),
+            updated_at: self.updated_at,
+        }
+    }
+}
+
 // ── WS4 Policy row types ────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]

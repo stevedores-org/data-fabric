@@ -535,6 +535,91 @@ fn error_response_serializes() {
 // ── WS3 Trace / Provenance (#43) ──────────────────────────────
 
 #[test]
+fn trace_response_with_total_truncated() {
+    let resp = TraceResponse {
+        run_id: "r1".into(),
+        events: vec![],
+        total: Some(100),
+        truncated: Some(true),
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["total"], 100);
+    assert_eq!(json["truncated"], true);
+}
+
+#[test]
+fn trace_response_omits_none_total() {
+    let resp = TraceResponse {
+        run_id: "r1".into(),
+        events: vec![],
+        total: None,
+        truncated: None,
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert!(json.get("total").is_none());
+    assert!(json.get("truncated").is_none());
+}
+
+#[test]
+fn provenance_edge_round_trip() {
+    let edge = ProvenanceEdge {
+        depth: 0,
+        rel_type: "causality".into(),
+        from_kind: "run".into(),
+        from_id: "r1".into(),
+        to_kind: "node".into(),
+        to_id: "n1".into(),
+        relation: Some("executed".into()),
+        created_at: Some("2026-02-22T12:00:00Z".into()),
+    };
+    let json = serde_json::to_string(&edge).unwrap();
+    let parsed: ProvenanceEdge = serde_json::from_str(&json).unwrap();
+    assert_eq!(edge, parsed);
+}
+
+#[test]
+fn provenance_response_serializes() {
+    let resp = ProvenanceResponse {
+        entity_kind: "run".into(),
+        entity_id: "r1".into(),
+        direction: "forward".into(),
+        hops: 5,
+        edges: vec![ProvenanceEdge {
+            depth: 0,
+            rel_type: "causality".into(),
+            from_kind: "run".into(),
+            from_id: "r1".into(),
+            to_kind: "node".into(),
+            to_id: "n1".into(),
+            relation: None,
+            created_at: None,
+        }],
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["direction"], "forward");
+    assert_eq!(json["hops"], 5);
+    assert_eq!(json["edges"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn run_summary_round_trip() {
+    let summary = RunSummary {
+        run_id: "r1".into(),
+        event_count: 42,
+        first_event_at: Some("2026-02-22T10:00:00Z".into()),
+        last_event_at: Some("2026-02-22T12:00:00Z".into()),
+        actors: vec!["agent-1".into(), "ci-bot".into()],
+        event_types: vec!["node.start".into(), "node.end".into()],
+        updated_at: "2026-02-22T12:00:00Z".into(),
+    };
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: RunSummary = serde_json::from_str(&json).unwrap();
+    assert_eq!(summary, parsed);
+    assert_eq!(parsed.event_count, 42);
+    assert_eq!(parsed.actors.len(), 2);
+}
+
+#[test]
 fn trace_event_round_trip() {
     let evt = TraceEvent {
         id: "ev1".into(),
@@ -566,10 +651,13 @@ fn trace_response_serializes() {
             payload: None,
             created_at: "2026-02-22T12:00:00Z".into(),
         }],
+        total: Some(1),
+        truncated: Some(false),
     };
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["run_id"], "r1");
     assert_eq!(json["events"].as_array().unwrap().len(), 1);
+    assert_eq!(json["total"], 1);
 }
 
 // ── WS5 Memory (#45) ───────────────────────────────────────────

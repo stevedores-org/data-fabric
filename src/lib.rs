@@ -549,18 +549,87 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let limit =
                 parse_limit_query(req.url().ok(), "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
             let d1 = ctx.env.d1("DB")?;
-            let events = db::get_trace_for_run(&d1, &run_id, limit).await?;
-            Response::from_json(&models::TraceResponse { run_id, events })
+            // Fetch limit+1 to detect truncation without a separate COUNT query
+            let mut events = db::get_trace_for_run(&d1, &run_id, limit + 1).await?;
+            let truncated = events.len() > limit as usize;
+            if truncated {
+                events.truncate(limit as usize);
+            }
+            Response::from_json(&models::TraceResponse {
+                run_id,
+                events,
+                total: None,
+                truncated: Some(truncated),
+            })
         })
         .get_async("/v1/traces/:run_id/lineage", |req, ctx| async move {
             let run_id = match ctx.param("run_id") {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
             };
-            let hops = parse_limit_query(req.url().ok(), "hops").unwrap_or(100);
+            let limit = parse_limit_query(req.url().ok(), "hops").unwrap_or(100);
             let d1 = ctx.env.d1("DB")?;
-            let events = db::get_trace_for_run(&d1, &run_id, hops).await?;
-            Response::from_json(&models::TraceResponse { run_id, events })
+            let events = db::get_trace_for_run(&d1, &run_id, limit).await?;
+            Response::from_json(&models::TraceResponse {
+                run_id,
+                events,
+                total: None,
+                truncated: None,
+            })
+        })
+        // ── Provenance Chain (WS3) ──────────────────────────────
+        .get_async("/v1/provenance/:kind/:id", |req, ctx| async move {
+            let kind = match ctx.param("kind") {
+                Some(k) => k.to_string(),
+                None => return Response::error("missing kind", 400),
+            };
+            let id = match ctx.param("id") {
+                Some(i) => i.to_string(),
+                None => return Response::error("missing id", 400),
+            };
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let direction = params
+                .get("direction")
+                .map(|s| s.as_str())
+                .unwrap_or("forward");
+            if direction != "forward" && direction != "backward" {
+                return Response::error("invalid direction: must be 'forward' or 'backward'", 400);
+            }
+            let hops = params
+                .get("hops")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5u32)
+                .min(100);
+            let d1 = ctx.env.d1("DB")?;
+            let edges = db::get_provenance_chain(&d1, &kind, &id, direction, hops).await?;
+            Response::from_json(&models::ProvenanceResponse {
+                entity_kind: kind,
+                entity_id: id,
+                direction: direction.into(),
+                hops,
+                edges,
+            })
+        })
+        // ── Gold Layer: Run Summaries (WS3) ─────────────────────
+        .get_async("/v1/runs/:run_id/summary", |_req, ctx| async move {
+            let run_id = ctx.param("run_id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            match db::get_run_summary(&d1, &run_id).await? {
+                Some(summary) => Response::from_json(&summary),
+                None => Response::error("run summary not found", 404),
+            }
+        })
+        .get_async("/v1/gold/run-summaries", |req, ctx| async move {
+            let limit = parse_limit_query(req.url().ok(), "limit")
+                .unwrap_or(50)
+                .min(200);
+            let d1 = ctx.env.d1("DB")?;
+            let summaries = db::list_run_summaries(&d1, limit).await?;
+            Response::from_json(&serde_json::json!({ "summaries": summaries }))
         })
         // ── Graph Events (M3) ─────────────────────────────────
         .post_async("/v1/graph-events", |mut req, ctx| async move {
@@ -595,17 +664,58 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .await
 }
 
-/// Queue consumer: processes enrichment jobs from the events queue.
-/// Ack all on success; on error retry the batch.
+/// Queue consumer: enriches events — silver promotion, causality edges, gold summaries.
 #[event(queue)]
-pub async fn queue(batch: MessageBatch<serde_json::Value>, _env: Env, _ctx: Context) -> Result<()> {
+pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
     let queue_name = batch.queue();
+    let d1 = env.d1("DB")?;
     let messages = batch.messages()?;
-    for msg in messages {
-        let _body = msg.body();
-        worker::console_log!("[queue {}] processing message", queue_name);
+
+    for msg in &messages {
+        let body = msg.body();
+        match serde_json::from_value::<models::GraphEvent>(body.clone()) {
+            Ok(evt) => {
+                let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
+
+                // Note: silver promotion is done synchronously in POST /v1/graph-events.
+                // The queue consumer handles only causality edges and gold layer summaries.
+
+                // Causality edges
+                if let Err(e) = db::insert_causality_from_event(&d1, &evt).await {
+                    worker::console_log!("[queue {}] causality insert error: {}", queue_name, e);
+                }
+
+                // Gold layer summary
+                if let Some(ref run_id) = evt.run_id {
+                    if let Err(e) = db::upsert_run_summary(
+                        &d1,
+                        run_id,
+                        evt.actor.as_deref(),
+                        &evt.event_type,
+                        &now,
+                    )
+                    .await
+                    {
+                        worker::console_log!(
+                            "[queue {}] run summary upsert error: {}",
+                            queue_name,
+                            e
+                        );
+                    }
+                }
+
+                msg.ack();
+            }
+            Err(e) => {
+                worker::console_log!(
+                    "[queue {}] failed to deserialize message: {}",
+                    queue_name,
+                    e
+                );
+                msg.retry();
+            }
+        }
     }
-    batch.ack_all();
     Ok(())
 }
 
