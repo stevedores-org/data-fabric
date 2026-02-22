@@ -136,7 +136,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             };
             match bucket.get(&key).execute().await? {
                 Some(obj) => {
-                    let body = obj.body().ok_or_else(|| Error::RustError("no body".into()))?;
+                    let body = obj
+                        .body()
+                        .ok_or_else(|| Error::RustError("no body".into()))?;
                     let bytes = body.bytes().await?;
                     Response::from_bytes(bytes)
                 }
@@ -160,11 +162,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// Queue consumer: processes enrichment jobs from the events queue.
 /// Ack all on success; on error retry the batch.
 #[event(queue)]
-pub async fn queue(
-    batch: MessageBatch<serde_json::Value>,
-    _env: Env,
-    _ctx: Context,
-) -> Result<()> {
+pub async fn queue(batch: MessageBatch<serde_json::Value>, _env: Env, _ctx: Context) -> Result<()> {
     let queue_name = batch.queue();
     let messages = batch.messages()?;
     for msg in messages {
