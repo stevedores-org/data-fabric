@@ -30,49 +30,100 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 mission: "velocity-for-autonomous-agent-builders",
             })
         })
-        // ── Runs (WS2) ────────────────────────────────────────
-        .post_async("/v1/runs", |mut req, _ctx| async move {
+        // ── Runs (WS2, D1-backed) ────────────────────────────
+        .post_async("/v1/runs", |mut req, ctx| async move {
             let body: models::CreateRun = req.json().await?;
-            let _ = (&body.trigger, &body.actor, &body.metadata);
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            db::create_run(&d1, &id, &body).await?;
             Response::from_json(&models::Created {
-                id: generate_id()?,
+                id,
                 status: "created".into(),
             })
         })
-        .get("/v1/runs", |_, _| {
-            Response::from_json(&serde_json::json!({ "runs": [] }))
+        .get_async("/v1/runs", |req, ctx| async move {
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let repo = params.get("repo").map(|s| s.as_str());
+            let limit = params
+                .get("limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50u32)
+                .min(200);
+            let d1 = ctx.env.d1("DB")?;
+            let runs = db::list_runs(&d1, repo, limit).await?;
+            Response::from_json(&serde_json::json!({ "runs": runs }))
         })
-        // ── WS2 domain stubs (plans, tool-calls, releases) ────
-        .post_async("/v1/plans", |mut req, _ctx| async move {
+        .get_async("/v1/runs/:id", |_req, ctx| async move {
+            let id = ctx.param("id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            match db::get_run(&d1, &id).await? {
+                Some(run) => Response::from_json(&run),
+                None => Response::error("run not found", 404),
+            }
+        })
+        // ── WS2 Tasks (run-scoped, D1-backed) ───────────────
+        .post_async("/v1/runs/:run_id/tasks", |mut req, ctx| async move {
+            let run_id = ctx.param("run_id").unwrap().to_string();
+            let body: models::CreateTask = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            db::create_ws2_task(&d1, &id, &run_id, &body).await?;
+            Response::from_json(&models::Created {
+                id,
+                status: "created".into(),
+            })
+        })
+        .get_async("/v1/runs/:run_id/tasks", |_req, ctx| async move {
+            let run_id = ctx.param("run_id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            let tasks = db::list_ws2_tasks(&d1, &run_id).await?;
+            Response::from_json(&serde_json::json!({ "tasks": tasks }))
+        })
+        // ── Plans (WS2, D1-backed) ──────────────────────────
+        .post_async("/v1/plans", |mut req, ctx| async move {
             let body: models::CreatePlan = req.json().await?;
-            let _ = (&body.run_id, &body.task_ids, &body.metadata);
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            db::create_plan(&d1, &id, &body).await?;
             Response::from_json(&models::Created {
-                id: generate_id()?,
+                id,
                 status: "created".into(),
             })
         })
-        .post_async("/v1/tool-calls", |mut req, _ctx| async move {
+        // ── Tool Calls (WS2, D1-backed) ─────────────────────
+        .post_async("/v1/tool-calls", |mut req, ctx| async move {
             let body: models::RecordToolCall = req.json().await?;
-            let _ = (&body.run_id, &body.task_id, &body.output, &body.duration_ms);
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            db::record_tool_call(&d1, &id, &body).await?;
             Response::from_json(&models::Created {
-                id: generate_id()?,
+                id,
                 status: "recorded".into(),
             })
         })
-        .post_async("/v1/releases", |mut req, _ctx| async move {
+        // ── Releases (WS2, D1-backed) ───────────────────────
+        .post_async("/v1/releases", |mut req, ctx| async move {
             let body: models::CreateRelease = req.json().await?;
-            let _ = (&body.run_id, &body.artifact_ids, &body.metadata);
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            db::create_release(&d1, &id, &body).await?;
             Response::from_json(&models::Created {
-                id: generate_id()?,
+                id,
                 status: "created".into(),
             })
         })
-        // ── Provenance Events (WS3) ───────────────────────────
-        .post_async("/v1/events", |mut req, _ctx| async move {
+        // ── Provenance Events (WS3, D1-backed) ──────────────
+        .post_async("/v1/events", |mut req, ctx| async move {
             let body: models::IngestEvent = req.json().await?;
-            let _ = (&body.run_id, &body.actor, &body.payload);
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            db::ingest_event(&d1, &id, &body).await?;
             Response::from_json(&models::EventAck {
-                id: generate_id()?,
+                id,
                 event_type: body.event_type,
                 accepted: true,
             })
@@ -110,14 +161,18 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => Response::error("not found", 404),
             }
         })
-        // ── Policy Check (WS4) ────────────────────────────────
-        .post_async("/v1/policies/check", |mut req, _ctx| async move {
+        // ── Policy Check (WS4, D1-backed) ──────────────────────
+        .post_async("/v1/policies/check", |mut req, ctx| async move {
             let body: models::PolicyCheckRequest = req.json().await?;
-            let _ = (&body.actor, &body.resource, &body.context);
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            let decision = "allow";
+            let reason = "no policy restrictions configured";
+            db::record_policy_check(&d1, &id, &body, decision, reason).await?;
             Response::from_json(&models::PolicyCheckResponse {
                 action: body.action,
-                decision: "allow".into(),
-                reason: "no policy restrictions configured".into(),
+                decision: decision.into(),
+                reason: reason.into(),
             })
         })
         // ── Agent Tasks (M1) ──────────────────────────────────

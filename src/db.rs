@@ -27,7 +27,7 @@ pub async fn create_task(db: &D1Database, id: &str, body: &models::CreateAgentTa
     let max_retries = body.max_retries.unwrap_or(3);
 
     db.prepare(
-        "INSERT INTO tasks (id, job_id, task_type, priority, status, params, graph_ref, play_id, parent_task_id, max_retries, created_at)
+        "INSERT INTO mcp_tasks (id, job_id, task_type, priority, status, params, graph_ref, play_id, parent_task_id, max_retries, created_at)
          VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?10)",
     )
     .bind(&[
@@ -56,27 +56,25 @@ pub async fn claim_next_task(
     let now = now_iso();
     let lease = lease_time(300);
 
-    // Capability filter with parameterized placeholders (no SQL injection)
-    let (where_caps, bind_caps): (String, Vec<JsValue>) = if capabilities.is_empty() {
-        ("1=1".to_string(), vec![])
+    // Build capability filter using parameterized placeholders (no string interpolation)
+    let result: Option<TaskIdRow> = if capabilities.is_empty() {
+        db.prepare(
+            "SELECT id FROM mcp_tasks WHERE status = 'pending' ORDER BY priority DESC, created_at ASC LIMIT 1",
+        )
+        .bind(&[])?
+        .first(None)
+        .await?
     } else {
-        let placeholders = (1..=capabilities.len())
-            .map(|i| format!("task_type = ?{i}"))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        let values = capabilities
-            .iter()
-            .map(|c| JsValue::from_str(c))
-            .collect::<Vec<_>>();
-        (placeholders, values)
+        let placeholders: Vec<String> = (1..=capabilities.len())
+            .map(|i| format!("?{}", i))
+            .collect();
+        let query = format!(
+            "SELECT id FROM mcp_tasks WHERE status = 'pending' AND task_type IN ({}) ORDER BY priority DESC, created_at ASC LIMIT 1",
+            placeholders.join(", ")
+        );
+        let bindings: Vec<JsValue> = capabilities.iter().map(|c| JsValue::from_str(c)).collect();
+        db.prepare(&query).bind(&bindings)?.first(None).await?
     };
-
-    let query = format!(
-        "SELECT id FROM tasks WHERE status = 'pending' AND ({where_caps}) ORDER BY priority DESC, created_at ASC LIMIT 1"
-    );
-
-    let result: Option<TaskIdRow> = db.prepare(&query).bind(&bind_caps)?.first(None).await?;
-
     let task_id = match result {
         Some(row) => row.id,
         None => return Ok(None),
@@ -84,7 +82,7 @@ pub async fn claim_next_task(
 
     // Claim it atomically: only succeeds if still pending
     db.prepare(
-        "UPDATE tasks SET status = 'running', agent_id = ?1, lease_expires_at = ?2 WHERE id = ?3 AND status = 'pending'",
+        "UPDATE mcp_tasks SET status = 'running', agent_id = ?1, lease_expires_at = ?2 WHERE id = ?3 AND status = 'pending'",
     )
     .bind(&[
         JsValue::from_str(agent_id),
@@ -102,7 +100,7 @@ pub async fn claim_next_task(
 
     // Fetch full task
     let task: Option<TaskRow> = db
-        .prepare("SELECT * FROM tasks WHERE id = ?1 AND agent_id = ?2")
+        .prepare("SELECT * FROM mcp_tasks WHERE id = ?1 AND agent_id = ?2")
         .bind(&[JsValue::from_str(&task_id), JsValue::from_str(agent_id)])?
         .first(None)
         .await?;
@@ -114,7 +112,7 @@ pub async fn heartbeat_task(db: &D1Database, task_id: &str, agent_id: &str) -> R
     let lease = lease_time(300);
     let result: D1Result = db
         .prepare(
-            "UPDATE tasks SET lease_expires_at = ?1 WHERE id = ?2 AND agent_id = ?3 AND status = 'running'",
+            "UPDATE mcp_tasks SET lease_expires_at = ?1 WHERE id = ?2 AND agent_id = ?3 AND status = 'running'",
         )
         .bind(&[
             JsValue::from_str(&lease),
@@ -140,7 +138,7 @@ pub async fn complete_task(
     let result_json = result_val.map(|v| serde_json::to_string(v).unwrap());
     let res: D1Result = db
         .prepare(
-            "UPDATE tasks SET status = 'completed', result = ?1, completed_at = ?2 WHERE id = ?3 AND status = 'running'",
+            "UPDATE mcp_tasks SET status = 'completed', result = ?1, completed_at = ?2 WHERE id = ?3 AND status = 'running'",
         )
         .bind(&[
             match &result_json {
@@ -165,7 +163,9 @@ pub async fn fail_task(db: &D1Database, task_id: &str, error: &str) -> Result<St
 
     // Check retry eligibility
     let task: Option<RetryRow> = db
-        .prepare("SELECT retry_count, max_retries FROM tasks WHERE id = ?1 AND status = 'running'")
+        .prepare(
+            "SELECT retry_count, max_retries FROM mcp_tasks WHERE id = ?1 AND status = 'running'",
+        )
         .bind(&[JsValue::from_str(task_id)])?
         .first(None)
         .await?;
@@ -178,7 +178,7 @@ pub async fn fail_task(db: &D1Database, task_id: &str, error: &str) -> Result<St
     let result_json = serde_json::json!({ "error": error }).to_string();
 
     db.prepare(
-        "UPDATE tasks SET status = ?1, retry_count = CASE WHEN ?1 = 'pending' THEN ?2 ELSE retry_count END, result = ?3, agent_id = CASE WHEN ?1 = 'pending' THEN NULL ELSE agent_id END, lease_expires_at = NULL, completed_at = CASE WHEN ?1 = 'failed' THEN ?4 ELSE NULL END WHERE id = ?5",
+        "UPDATE mcp_tasks SET status = ?1, retry_count = CASE WHEN ?1 = 'pending' THEN ?2 ELSE retry_count END, result = ?3, agent_id = CASE WHEN ?1 = 'pending' THEN NULL ELSE agent_id END, lease_expires_at = NULL, completed_at = CASE WHEN ?1 = 'failed' THEN ?4 ELSE NULL END WHERE id = ?5",
     )
     .bind(&[
         JsValue::from_str(new_status),
@@ -412,6 +412,234 @@ fn build_entity_refs(evt: &models::GraphEvent) -> Option<String> {
     serde_json::to_string(&serde_json::Value::Object(obj)).ok()
 }
 
+// ── WS2 Domain: Runs ─────────────────────────────────────────────
+
+pub async fn create_run(db: &D1Database, id: &str, body: &models::CreateRun) -> Result<()> {
+    let now = now_iso();
+    db.prepare(
+        "INSERT INTO runs (id, repo, status, trigger, actor, created_at, updated_at, metadata)
+         VALUES (?1, ?2, 'created', ?3, ?4, ?5, ?5, ?6)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(&body.repo),
+        opt_str(&body.trigger),
+        JsValue::from_str(body.actor.as_deref().unwrap_or("unknown")),
+        JsValue::from_str(&now),
+        opt_json(&body.metadata),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn list_runs(
+    db: &D1Database,
+    repo: Option<&str>,
+    limit: u32,
+) -> Result<Vec<RunResponse>> {
+    let (query, bindings): (String, Vec<JsValue>) = match repo {
+        Some(r) => (
+            "SELECT * FROM runs WHERE repo = ?1 ORDER BY created_at DESC LIMIT ?2".into(),
+            vec![JsValue::from_str(r), JsValue::from(limit)],
+        ),
+        None => (
+            "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?1".into(),
+            vec![JsValue::from(limit)],
+        ),
+    };
+    let result: D1Result = db.prepare(&query).bind(&bindings)?.all().await?;
+    let rows: Vec<RunRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_run_response()).collect())
+}
+
+pub async fn get_run(db: &D1Database, id: &str) -> Result<Option<RunResponse>> {
+    let row: Option<RunRow> = db
+        .prepare("SELECT * FROM runs WHERE id = ?1")
+        .bind(&[JsValue::from_str(id)])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.into_run_response()))
+}
+
+// ── WS2 Domain: Tasks (run-scoped) ──────────────────────────────
+
+pub async fn create_ws2_task(
+    db: &D1Database,
+    id: &str,
+    run_id: &str,
+    body: &models::CreateTask,
+) -> Result<()> {
+    let now = now_iso();
+    db.prepare(
+        "INSERT INTO tasks (id, run_id, plan_id, name, status, actor, created_at, updated_at, metadata)
+         VALUES (?1, ?2, ?3, ?4, 'created', ?5, ?6, ?6, ?7)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(run_id),
+        opt_str(&body.plan_id),
+        JsValue::from_str(&body.name),
+        opt_str(&body.actor),
+        JsValue::from_str(&now),
+        opt_json(&body.metadata),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn list_ws2_tasks(db: &D1Database, run_id: &str) -> Result<Vec<Ws2TaskResponse>> {
+    let result: D1Result = db
+        .prepare("SELECT * FROM tasks WHERE run_id = ?1 ORDER BY created_at ASC")
+        .bind(&[JsValue::from_str(run_id)])?
+        .all()
+        .await?;
+    let rows: Vec<Ws2TaskRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_task_response()).collect())
+}
+
+// ── WS2 Domain: Plans ────────────────────────────────────────────
+
+pub async fn create_plan(db: &D1Database, id: &str, body: &models::CreatePlan) -> Result<()> {
+    let now = now_iso();
+    let task_ids_json = body
+        .task_ids
+        .as_ref()
+        .map(|ids| serde_json::to_string(ids).unwrap())
+        .unwrap_or_else(|| "[]".into());
+
+    db.prepare(
+        "INSERT INTO plans (id, run_id, name, status, task_ids, created_at, updated_at, metadata)
+         VALUES (?1, ?2, ?3, 'created', ?4, ?5, ?5, ?6)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(&body.run_id),
+        JsValue::from_str(&body.name),
+        JsValue::from_str(&task_ids_json),
+        JsValue::from_str(&now),
+        opt_json(&body.metadata),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+// ── WS2 Domain: Tool Calls ──────────────────────────────────────
+
+pub async fn record_tool_call(
+    db: &D1Database,
+    id: &str,
+    body: &models::RecordToolCall,
+) -> Result<()> {
+    let now = now_iso();
+    let input_json = serde_json::to_string(&body.input).unwrap();
+
+    db.prepare(
+        "INSERT INTO tool_calls (id, run_id, task_id, tool_name, input, output, status, duration_ms, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(&body.run_id),
+        opt_str(&body.task_id),
+        JsValue::from_str(&body.tool_name),
+        JsValue::from_str(&input_json),
+        opt_json(&body.output),
+        match body.duration_ms {
+            Some(ms) => JsValue::from(ms as f64),
+            None => JsValue::NULL,
+        },
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+// ── WS2 Domain: Releases ────────────────────────────────────────
+
+pub async fn create_release(db: &D1Database, id: &str, body: &models::CreateRelease) -> Result<()> {
+    let now = now_iso();
+    let artifact_ids_json = body
+        .artifact_ids
+        .as_ref()
+        .map(|ids| serde_json::to_string(ids).unwrap())
+        .unwrap_or_else(|| "[]".into());
+
+    db.prepare(
+        "INSERT INTO releases (id, repo, version, run_id, artifact_ids, status, created_at, metadata)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'created', ?6, ?7)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(&body.repo),
+        JsValue::from_str(&body.version),
+        JsValue::from_str(&body.run_id),
+        JsValue::from_str(&artifact_ids_json),
+        JsValue::from_str(&now),
+        opt_json(&body.metadata),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+// ── WS2 Domain: Events (provenance) ─────────────────────────────
+
+pub async fn ingest_event(db: &D1Database, id: &str, body: &models::IngestEvent) -> Result<()> {
+    let now = now_iso();
+    let entity_kind = body.entity_kind.as_deref().unwrap_or("event");
+    let entity_id = body.entity_id.as_deref().unwrap_or(id);
+    db.prepare(
+        "INSERT INTO events (id, run_id, entity_kind, entity_id, event_type, actor, created_at, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(&body.run_id),
+        JsValue::from_str(entity_kind),
+        JsValue::from_str(entity_id),
+        JsValue::from_str(&body.event_type),
+        JsValue::from_str(&body.actor),
+        JsValue::from_str(&now),
+        opt_json(&body.payload),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+// ── WS2 Domain: Policy Decisions ────────────────────────────────
+
+pub async fn record_policy_check(
+    db: &D1Database,
+    id: &str,
+    body: &models::PolicyCheckRequest,
+    decision: &str,
+    reason: &str,
+) -> Result<()> {
+    let now = now_iso();
+    db.prepare(
+        "INSERT INTO policy_decisions (id, action, actor, resource, decision, reason, created_at, context)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(&body.action),
+        JsValue::from_str(&body.actor),
+        opt_str(&body.resource),
+        JsValue::from_str(decision),
+        JsValue::from_str(reason),
+        JsValue::from_str(&now),
+        opt_json(&body.context),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
 // ── Internal row types ──────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -545,6 +773,89 @@ impl CheckpointRow {
             created_at: self.created_at,
         }
     }
+}
+
+// ── WS2 row types ───────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RunRow {
+    pub id: String,
+    pub repo: String,
+    pub status: String,
+    pub trigger: Option<String>,
+    pub actor: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: Option<String>,
+}
+
+impl RunRow {
+    pub fn into_run_response(self) -> RunResponse {
+        RunResponse {
+            id: self.id,
+            repo: self.repo,
+            status: self.status,
+            trigger: self.trigger,
+            actor: self.actor,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            metadata: self.metadata.and_then(|s| serde_json::from_str(&s).ok()),
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RunResponse {
+    pub id: String,
+    pub repo: String,
+    pub status: String,
+    pub trigger: Option<String>,
+    pub actor: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct Ws2TaskRow {
+    pub id: String,
+    pub run_id: String,
+    pub plan_id: Option<String>,
+    pub name: String,
+    pub status: String,
+    pub actor: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: Option<String>,
+}
+
+impl Ws2TaskRow {
+    pub fn into_task_response(self) -> Ws2TaskResponse {
+        Ws2TaskResponse {
+            id: self.id,
+            run_id: self.run_id,
+            plan_id: self.plan_id,
+            name: self.name,
+            status: self.status,
+            actor: self.actor,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            metadata: self.metadata.and_then(|s| serde_json::from_str(&s).ok()),
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct Ws2TaskResponse {
+    pub id: String,
+    pub run_id: String,
+    pub plan_id: Option<String>,
+    pub name: String,
+    pub status: String,
+    pub actor: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: Option<serde_json::Value>,
 }
 
 fn lease_time(seconds: u64) -> String {
