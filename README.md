@@ -21,3 +21,4 @@ cargo test
 - `docs/ARCHITECTURE.md`
 - `docs/MISSION_PLAN.md`
 - `docs/CONTRIBUTING_WORKFLOW.md`
+- `docs/ws1/README.md`
