@@ -20,13 +20,12 @@ jobs:
           target: wasm32-unknown-unknown
 
       - name: Install worker-build
-        run: cargo install worker-build
+        run: cargo install worker-build --locked
 
       - name: Build worker
         run: worker-build --release
 
       - name: Deploy to Cloudflare
-        run: npx wrangler deploy
+        run: npx wrangler@3 deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
