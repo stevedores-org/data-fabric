@@ -4,14 +4,15 @@ on:
   pull_request:
     branches: [main, develop]
   push:
-    branches: [develop]
+    branches: ["**"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  local-ci:
-    name: local-ci (fmt, clippy, check, test)
+  cargo-ci:
+    name: cargo-ci (fmt, clippy, check, test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,12 +23,14 @@ jobs:
           target: wasm32-unknown-unknown
           components: rustfmt, clippy
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
+      - name: Run fmt
+        run: cargo fmt --all -- --check
 
-      - name: Install local-ci
-        run: go install github.com/stevedores-org/local-ci@latest
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
 
-      - name: Run local-ci
-        run: local-ci fmt clippy check test --no-cache --json
+      - name: Run wasm check
+        run: cargo check --target wasm32-unknown-unknown
+
+      - name: Run tests
+        run: cargo test

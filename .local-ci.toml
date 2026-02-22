@@ -1,0 +1,33 @@
+# local-ci configuration for data-fabric
+# See: https://github.com/stevedores-org/local-ci
+
+[cache]
+enabled = true
+dir = ".local-ci-cache"
+
+[stages.fmt]
+enabled = true
+
+[stages.clippy]
+enabled = true
+
+[stages.check]
+enabled = true
+# wasm32 target check
+cmd = ["cargo", "check", "--target", "wasm32-unknown-unknown"]
+
+[stages.test]
+enabled = true
+
+# Optional cargo tools — disabled until installed
+[stages.deny]
+enabled = false
+
+[stages.audit]
+enabled = false
+
+[stages.machete]
+enabled = false
+
+[stages.taplo]
+enabled = false
