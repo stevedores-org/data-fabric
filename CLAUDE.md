@@ -13,8 +13,9 @@
 
 ## Task Shorthand
 
-- `crr`: code review requested (findings-first, severity-ordered).
+- `crr`: code review requested (findings-first; severity-ordered as `HIGH`/`MEDIUM`/`LOW`).
 - `acr`: address code review feedback in the target PR.
 - `ffc`: fix failing checks in the target PR.
 - `fmc`: fix merge conflicts in the target PR.
 - `btf`: build the requested feature end-to-end and open a PR.
+- `sm`: squash merge when approved and no follow-up changes are needed.
