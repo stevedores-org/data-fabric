@@ -280,22 +280,25 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         // ── Traces / Provenance (WS3: issue #43) ──────────────
-        .get_async("/v1/traces/:run_id", |_req, ctx| async move {
+        .get_async("/v1/traces/:run_id", |req, ctx| async move {
             let run_id = match ctx.param("run_id") {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
             };
+            let limit =
+                parse_limit_query(req.url().ok(), "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
             let d1 = ctx.env.d1("DB")?;
-            let events = db::get_trace_for_run(&d1, &run_id).await?;
+            let events = db::get_trace_for_run(&d1, &run_id, limit).await?;
             Response::from_json(&models::TraceResponse { run_id, events })
         })
-        .get_async("/v1/traces/:run_id/lineage", |_req, ctx| async move {
+        .get_async("/v1/traces/:run_id/lineage", |req, ctx| async move {
             let run_id = match ctx.param("run_id") {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
             };
+            let hops = parse_limit_query(req.url().ok(), "hops").unwrap_or(100);
             let d1 = ctx.env.d1("DB")?;
-            let events = db::get_trace_for_run(&d1, &run_id).await?;
+            let events = db::get_trace_for_run(&d1, &run_id, hops).await?;
             Response::from_json(&models::TraceResponse { run_id, events })
         })
         // ── Graph Events (M3) ─────────────────────────────────
@@ -313,7 +316,14 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let count = events.len();
             db::insert_events_bronze(&d1, &events).await?;
-            db::insert_events_silver(&d1, &events, &now).await?;
+
+            let mut silver_events: Vec<(String, String, &models::GraphEvent, String)> =
+                Vec::with_capacity(events.len());
+            for (bronze_id, evt, created_at) in &events {
+                let silver_id = generate_id()?;
+                silver_events.push((silver_id, bronze_id.clone(), evt, created_at.clone()));
+            }
+            db::insert_events_silver(&d1, &silver_events, &now).await?;
 
             Response::from_json(&models::GraphEventAck {
                 accepted: count,
@@ -343,4 +353,11 @@ fn generate_id() -> Result<String> {
     getrandom::getrandom(&mut buf)
         .map_err(|err| Error::RustError(format!("failed to generate id: {err}")))?;
     Ok(hex::encode(buf))
+}
+
+/// Parse a numeric query param (e.g. limit, hops). Returns None if URL is None or param missing/invalid.
+fn parse_limit_query(url: Option<worker::Url>, param: &str) -> Option<u32> {
+    let url = url?;
+    let value = url.query_pairs().find(|(k, _)| k == param)?.1;
+    value.parse().ok().filter(|&n| n > 0 && n <= 10_000)
 }
