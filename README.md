@@ -23,3 +23,4 @@ cargo test
 - `docs/CONTRIBUTING_WORKFLOW.md`
 - `docs/ws1/README.md`
 - `docs/WS5_RETRIEVAL_MEMORY.md`
+- `docs/WS4_POLICY_GOVERNANCE.md`

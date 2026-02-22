@@ -331,8 +331,11 @@ fn policy_check_response() {
         action: "deploy".into(),
         decision: "allow".into(),
         reason: "no restrictions".into(),
-        risk_level: "write".into(),
+        risk_level: Some("write".into()),
+        policy_version: Some("v1".into()),
         matched_rule: Some("rule1".into()),
+        escalation_id: None,
+        rate_limited: Some(false),
     };
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["decision"], "allow");
@@ -417,6 +420,26 @@ fn policy_decision_response_round_trip() {
     let json = serde_json::to_string(&resp).unwrap();
     let parsed: PolicyDecisionResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(resp, parsed);
+}
+
+#[test]
+fn put_policy_definition_request_round_trip() {
+    let input = r#"{
+        "bundle":{"version":"v1","rules":[],"rate_limits":[]},
+        "activate":true
+    }"#;
+    let parsed: PutPolicyDefinitionRequest = serde_json::from_str(input).unwrap();
+    assert!(parsed.activate);
+    assert_eq!(parsed.bundle["version"], "v1");
+}
+
+#[test]
+fn retention_run_request_defaults() {
+    let parsed: RetentionRunRequest = serde_json::from_str("{}").unwrap();
+    assert_eq!(parsed.events_ttl_days, 30);
+    assert_eq!(parsed.artifacts_ttl_days, 30);
+    assert_eq!(parsed.checkpoints_ttl_days, 30);
+    assert_eq!(parsed.policy_ttl_days, 90);
 }
 
 // ── Orchestration types (M1-M3) ────────────────────────────────
