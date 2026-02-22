@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use serde::Serialize;
 use worker::*;
 
@@ -9,6 +10,8 @@ struct HealthResponse<'a> {
     status: &'a str,
     mission: &'a str,
 }
+
+const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -51,16 +54,42 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         // artifacts (WS2/WS5)
         .put_async("/v1/artifacts/:key", |mut req, ctx| async move {
-            let key = ctx.param("key").unwrap().to_string();
-            let data = req.bytes().await?;
+            let Some(key) = ctx.param("key").map(ToString::to_string) else {
+                return Response::error("missing artifact key", 400);
+            };
+
+            if let Some(value) = req.headers().get("content-length")? {
+                let content_length = match value.parse::<usize>() {
+                    Ok(parsed) => parsed,
+                    Err(_) => return Response::error("invalid content-length header", 400),
+                };
+                if content_length > MAX_ARTIFACT_BYTES {
+                    return Response::error("artifact exceeds max size", 413);
+                }
+            }
+
+            let mut stream = req.stream()?;
+            let mut size = 0usize;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                size = size
+                    .checked_add(chunk.len())
+                    .ok_or_else(|| Error::RustError("artifact size overflow".into()))?;
+                if size > MAX_ARTIFACT_BYTES {
+                    return Response::error("artifact exceeds max size", 413);
+                }
+            }
+
             Response::from_json(&serde_json::json!({
                 "key": key,
-                "size": data.len(),
+                "size": size,
                 "stored": true,
             }))
         })
         .get_async("/v1/artifacts/:key", |_req, ctx| async move {
-            let _key = ctx.param("key").unwrap().to_string();
+            let Some(_key) = ctx.param("key").map(ToString::to_string) else {
+                return Response::error("missing artifact key", 400);
+            };
             Response::error("not found", 404)
         })
         // policy check (WS4)
@@ -79,6 +108,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 fn generate_id() -> Result<String> {
     let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).map_err(|e| Error::RustError(e.to_string()))?;
+    getrandom::getrandom(&mut buf)
+        .map_err(|err| Error::RustError(format!("failed to generate id: {err}")))?;
     Ok(hex::encode(buf))
 }
