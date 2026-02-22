@@ -157,3 +157,22 @@ pub struct PolicyDecisionResponse {
     pub created_at: String,
     pub context: Option<serde_json::Value>,
 }
+
+// ── WS8: Multi-tenant provisioning ─────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct TenantProvisionRequest {
+    pub tenant_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub plan: String,
+    #[serde(default)]
+    pub quota_runs_per_minute: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct TenantProvisionResponse {
+    pub tenant_id: String,
+    pub status: String,
+    pub provisioned_in_ms: i64,
+}

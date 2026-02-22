@@ -22,15 +22,21 @@ fn opt_json(v: &Option<serde_json::Value>) -> JsValue {
 
 // ── Tasks ───────────────────────────────────────────────────────
 
-pub async fn create_task(db: &D1Database, id: &str, body: &models::CreateAgentTask) -> Result<()> {
+pub async fn create_task(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::CreateAgentTask,
+) -> Result<()> {
     let now = now_iso();
     let max_retries = body.max_retries.unwrap_or(3);
 
     db.prepare(
-        "INSERT INTO mcp_tasks (id, job_id, task_type, priority, status, params, graph_ref, play_id, parent_task_id, max_retries, created_at)
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO mcp_tasks (tenant_id, id, job_id, task_type, priority, status, params, graph_ref, play_id, parent_task_id, max_retries, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8, ?9, ?10, ?11)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         JsValue::from_str(&body.job_id),
         JsValue::from_str(&body.task_type),
@@ -50,6 +56,7 @@ pub async fn create_task(db: &D1Database, id: &str, body: &models::CreateAgentTa
 
 pub async fn claim_next_task(
     db: &D1Database,
+    tenant_id: &str,
     agent_id: &str,
     capabilities: &[&str],
 ) -> Result<Option<models::AgentTask>> {
@@ -59,20 +66,21 @@ pub async fn claim_next_task(
     // Build capability filter using parameterized placeholders (no string interpolation)
     let result: Option<TaskIdRow> = if capabilities.is_empty() {
         db.prepare(
-            "SELECT id FROM mcp_tasks WHERE status = 'pending' ORDER BY priority DESC, created_at ASC LIMIT 1",
+            "SELECT id FROM mcp_tasks WHERE tenant_id = ?1 AND status = 'pending' ORDER BY priority DESC, created_at ASC LIMIT 1",
         )
-        .bind(&[])?
+        .bind(&[JsValue::from_str(tenant_id)])?
         .first(None)
         .await?
     } else {
-        let placeholders: Vec<String> = (1..=capabilities.len())
+        let placeholders: Vec<String> = (2..=capabilities.len() + 1)
             .map(|i| format!("?{}", i))
             .collect();
         let query = format!(
-            "SELECT id FROM mcp_tasks WHERE status = 'pending' AND task_type IN ({}) ORDER BY priority DESC, created_at ASC LIMIT 1",
+            "SELECT id FROM mcp_tasks WHERE tenant_id = ?1 AND status = 'pending' AND task_type IN ({}) ORDER BY priority DESC, created_at ASC LIMIT 1",
             placeholders.join(", ")
         );
-        let bindings: Vec<JsValue> = capabilities.iter().map(|c| JsValue::from_str(c)).collect();
+        let mut bindings: Vec<JsValue> = vec![JsValue::from_str(tenant_id)];
+        bindings.extend(capabilities.iter().map(|c| JsValue::from_str(c)));
         db.prepare(&query).bind(&bindings)?.first(None).await?
     };
     let task_id = match result {
@@ -82,40 +90,55 @@ pub async fn claim_next_task(
 
     // Claim it atomically: only succeeds if still pending
     db.prepare(
-        "UPDATE mcp_tasks SET status = 'running', agent_id = ?1, lease_expires_at = ?2 WHERE id = ?3 AND status = 'pending'",
+        "UPDATE mcp_tasks SET status = 'running', agent_id = ?1, lease_expires_at = ?2 WHERE tenant_id = ?3 AND id = ?4 AND status = 'pending'",
     )
     .bind(&[
         JsValue::from_str(agent_id),
         JsValue::from_str(&lease),
+        JsValue::from_str(tenant_id),
         JsValue::from_str(&task_id),
     ])?
     .run()
     .await?;
 
     // Update agent heartbeat
-    db.prepare("UPDATE agents SET last_heartbeat = ?1 WHERE id = ?2")
-        .bind(&[JsValue::from_str(&now), JsValue::from_str(agent_id)])?
+    db.prepare("UPDATE agents SET last_heartbeat = ?1 WHERE tenant_id = ?2 AND id = ?3")
+        .bind(&[
+            JsValue::from_str(&now),
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(agent_id),
+        ])?
         .run()
         .await?;
 
     // Fetch full task
     let task: Option<TaskRow> = db
-        .prepare("SELECT * FROM mcp_tasks WHERE id = ?1 AND agent_id = ?2")
-        .bind(&[JsValue::from_str(&task_id), JsValue::from_str(agent_id)])?
+        .prepare("SELECT * FROM mcp_tasks WHERE tenant_id = ?1 AND id = ?2 AND agent_id = ?3")
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&task_id),
+            JsValue::from_str(agent_id),
+        ])?
         .first(None)
         .await?;
 
     Ok(task.map(|r| r.into_agent_task()))
 }
 
-pub async fn heartbeat_task(db: &D1Database, task_id: &str, agent_id: &str) -> Result<bool> {
+pub async fn heartbeat_task(
+    db: &D1Database,
+    tenant_id: &str,
+    task_id: &str,
+    agent_id: &str,
+) -> Result<bool> {
     let lease = lease_time(300);
     let result: D1Result = db
         .prepare(
-            "UPDATE mcp_tasks SET lease_expires_at = ?1 WHERE id = ?2 AND agent_id = ?3 AND status = 'running'",
+            "UPDATE mcp_tasks SET lease_expires_at = ?1 WHERE tenant_id = ?2 AND id = ?3 AND agent_id = ?4 AND status = 'running'",
         )
         .bind(&[
             JsValue::from_str(&lease),
+            JsValue::from_str(tenant_id),
             JsValue::from_str(task_id),
             JsValue::from_str(agent_id),
         ])?
@@ -131,6 +154,7 @@ pub async fn heartbeat_task(db: &D1Database, task_id: &str, agent_id: &str) -> R
 
 pub async fn complete_task(
     db: &D1Database,
+    tenant_id: &str,
     task_id: &str,
     result_val: Option<&serde_json::Value>,
 ) -> Result<bool> {
@@ -138,7 +162,7 @@ pub async fn complete_task(
     let result_json = result_val.map(|v| serde_json::to_string(v).unwrap());
     let res: D1Result = db
         .prepare(
-            "UPDATE mcp_tasks SET status = 'completed', result = ?1, completed_at = ?2 WHERE id = ?3 AND status = 'running'",
+            "UPDATE mcp_tasks SET status = 'completed', result = ?1, completed_at = ?2 WHERE tenant_id = ?3 AND id = ?4 AND status = 'running'",
         )
         .bind(&[
             match &result_json {
@@ -146,6 +170,7 @@ pub async fn complete_task(
                 None => JsValue::NULL,
             },
             JsValue::from_str(&now),
+            JsValue::from_str(tenant_id),
             JsValue::from_str(task_id),
         ])?
         .run()
@@ -158,15 +183,20 @@ pub async fn complete_task(
     Ok(changed)
 }
 
-pub async fn fail_task(db: &D1Database, task_id: &str, error: &str) -> Result<String> {
+pub async fn fail_task(
+    db: &D1Database,
+    tenant_id: &str,
+    task_id: &str,
+    error: &str,
+) -> Result<String> {
     let now = now_iso();
 
     // Check retry eligibility
     let task: Option<RetryRow> = db
         .prepare(
-            "SELECT retry_count, max_retries FROM mcp_tasks WHERE id = ?1 AND status = 'running'",
+            "SELECT retry_count, max_retries FROM mcp_tasks WHERE tenant_id = ?1 AND id = ?2 AND status = 'running'",
         )
-        .bind(&[JsValue::from_str(task_id)])?
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(task_id)])?
         .first(None)
         .await?;
 
@@ -178,13 +208,14 @@ pub async fn fail_task(db: &D1Database, task_id: &str, error: &str) -> Result<St
     let result_json = serde_json::json!({ "error": error }).to_string();
 
     db.prepare(
-        "UPDATE mcp_tasks SET status = ?1, retry_count = CASE WHEN ?1 = 'pending' THEN ?2 ELSE retry_count END, result = ?3, agent_id = CASE WHEN ?1 = 'pending' THEN NULL ELSE agent_id END, lease_expires_at = NULL, completed_at = CASE WHEN ?1 = 'failed' THEN ?4 ELSE NULL END WHERE id = ?5",
+        "UPDATE mcp_tasks SET status = ?1, retry_count = CASE WHEN ?1 = 'pending' THEN ?2 ELSE retry_count END, result = ?3, agent_id = CASE WHEN ?1 = 'pending' THEN NULL ELSE agent_id END, lease_expires_at = NULL, completed_at = CASE WHEN ?1 = 'failed' THEN ?4 ELSE NULL END WHERE tenant_id = ?5 AND id = ?6",
     )
     .bind(&[
         JsValue::from_str(new_status),
         JsValue::from(new_retry),
         JsValue::from_str(&result_json),
         JsValue::from_str(&now),
+        JsValue::from_str(tenant_id),
         JsValue::from_str(task_id),
     ])?
     .run()
@@ -195,15 +226,21 @@ pub async fn fail_task(db: &D1Database, task_id: &str, error: &str) -> Result<St
 
 // ── Agents ──────────────────────────────────────────────────────
 
-pub async fn register_agent(db: &D1Database, id: &str, body: &models::RegisterAgent) -> Result<()> {
+pub async fn register_agent(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::RegisterAgent,
+) -> Result<()> {
     let now = now_iso();
     let caps_json = serde_json::to_string(&body.capabilities).unwrap();
 
     db.prepare(
-        "INSERT INTO agents (id, name, capabilities, endpoint, last_heartbeat, status, metadata)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
+        "INSERT INTO agents (tenant_id, id, name, capabilities, endpoint, last_heartbeat, status, metadata)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         JsValue::from_str(&body.name),
         JsValue::from_str(&caps_json),
@@ -217,10 +254,10 @@ pub async fn register_agent(db: &D1Database, id: &str, body: &models::RegisterAg
     Ok(())
 }
 
-pub async fn list_agents(db: &D1Database) -> Result<Vec<models::Agent>> {
+pub async fn list_agents(db: &D1Database, tenant_id: &str) -> Result<Vec<models::Agent>> {
     let result: D1Result = db
-        .prepare("SELECT * FROM agents WHERE status = 'active' ORDER BY name")
-        .bind(&[])?
+        .prepare("SELECT * FROM agents WHERE tenant_id = ?1 AND status = 'active' ORDER BY name")
+        .bind(&[JsValue::from_str(tenant_id)])?
         .all()
         .await?;
 
@@ -232,6 +269,7 @@ pub async fn list_agents(db: &D1Database) -> Result<Vec<models::Agent>> {
 
 pub async fn create_checkpoint(
     db: &D1Database,
+    tenant_id: &str,
     id: &str,
     body: &models::CreateCheckpoint,
     r2_key: &str,
@@ -240,10 +278,11 @@ pub async fn create_checkpoint(
     let now = now_iso();
 
     db.prepare(
-        "INSERT INTO checkpoints (id, thread_id, node_id, parent_id, state_r2_key, state_size_bytes, metadata, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO checkpoints (tenant_id, id, thread_id, node_id, parent_id, state_r2_key, state_size_bytes, metadata, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         JsValue::from_str(&body.thread_id),
         JsValue::from_str(&body.node_id),
@@ -261,25 +300,32 @@ pub async fn create_checkpoint(
 
 pub async fn get_latest_checkpoint(
     db: &D1Database,
+    tenant_id: &str,
     thread_id: &str,
 ) -> Result<Option<CheckpointRow>> {
-    db.prepare("SELECT * FROM checkpoints WHERE thread_id = ?1 ORDER BY created_at DESC LIMIT 1")
-        .bind(&[JsValue::from_str(thread_id)])?
+    db.prepare(
+        "SELECT * FROM checkpoints WHERE tenant_id = ?1 AND thread_id = ?2 ORDER BY created_at DESC LIMIT 1",
+    )
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(thread_id)])?
         .first(None)
         .await
 }
 
-pub async fn get_checkpoint_by_id(db: &D1Database, id: &str) -> Result<Option<CheckpointRow>> {
-    db.prepare("SELECT * FROM checkpoints WHERE id = ?1")
-        .bind(&[JsValue::from_str(id)])?
+pub async fn get_checkpoint_by_id(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<CheckpointRow>> {
+    db.prepare("SELECT * FROM checkpoints WHERE tenant_id = ?1 AND id = ?2")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
         .first(None)
         .await
 }
 
-pub async fn delete_checkpoint(db: &D1Database, id: &str) -> Result<bool> {
+pub async fn delete_checkpoint(db: &D1Database, tenant_id: &str, id: &str) -> Result<bool> {
     let res: D1Result = db
-        .prepare("DELETE FROM checkpoints WHERE id = ?1")
-        .bind(&[JsValue::from_str(id)])?
+        .prepare("DELETE FROM checkpoints WHERE tenant_id = ?1 AND id = ?2")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
         .run()
         .await?;
 
@@ -294,6 +340,7 @@ pub async fn delete_checkpoint(db: &D1Database, id: &str) -> Result<bool> {
 
 pub async fn insert_events_bronze(
     db: &D1Database,
+    tenant_id: &str,
     events: &[(String, &models::GraphEvent, String)],
 ) -> Result<()> {
     let mut stmts = Vec::with_capacity(events.len());
@@ -305,10 +352,11 @@ pub async fn insert_events_bronze(
 
         let stmt = db
             .prepare(
-                "INSERT INTO events_bronze (id, run_id, thread_id, event_type, node_id, actor, payload, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO events_bronze (tenant_id, id, run_id, thread_id, event_type, node_id, actor, payload, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )
             .bind(&[
+                JsValue::from_str(tenant_id),
                 JsValue::from_str(id),
                 opt_str(&evt.run_id),
                 opt_str(&evt.thread_id),
@@ -334,15 +382,20 @@ pub const TRACE_DEFAULT_LIMIT: u32 = 1000;
 /// Fetch trace slice for a run (ordered by created_at). WS3 provenance. Limited by `limit` (default TRACE_DEFAULT_LIMIT).
 pub async fn get_trace_for_run(
     db: &D1Database,
+    tenant_id: &str,
     run_id: &str,
     limit: u32,
 ) -> Result<Vec<models::TraceEvent>> {
     let result: D1Result = db
         .prepare(
             "SELECT id, run_id, thread_id, event_type, node_id, actor, payload, created_at
-             FROM events_bronze WHERE run_id = ?1 ORDER BY created_at ASC LIMIT ?2",
+             FROM events_bronze WHERE tenant_id = ?1 AND run_id = ?2 ORDER BY created_at ASC LIMIT ?3",
         )
-        .bind(&[JsValue::from_str(run_id), JsValue::from(limit)])?
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(run_id),
+            JsValue::from(limit),
+        ])?
         .all()
         .await?;
 
@@ -353,6 +406,7 @@ pub async fn get_trace_for_run(
 /// Insert into silver layer (sync promotion). Each row has its own id, bronze_id FK, entity_refs from event.
 pub async fn insert_events_silver(
     db: &D1Database,
+    tenant_id: &str,
     events: &[(String, String, &models::GraphEvent, String)], // (silver_id, bronze_id, evt, created_at)
     normalized_at: &str,
 ) -> Result<()> {
@@ -366,10 +420,11 @@ pub async fn insert_events_silver(
 
         let stmt = db
             .prepare(
-                "INSERT INTO events_silver (id, bronze_id, run_id, thread_id, event_type, node_id, actor, payload, created_at, normalized_at, entity_refs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO events_silver (tenant_id, id, bronze_id, run_id, thread_id, event_type, node_id, actor, payload, created_at, normalized_at, entity_refs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )
             .bind(&[
+                JsValue::from_str(tenant_id),
                 JsValue::from_str(silver_id),
                 JsValue::from_str(bronze_id),
                 opt_str(&evt.run_id),
@@ -414,13 +469,19 @@ fn build_entity_refs(evt: &models::GraphEvent) -> Option<String> {
 
 // ── WS2 Domain: Runs ─────────────────────────────────────────────
 
-pub async fn create_run(db: &D1Database, id: &str, body: &models::CreateRun) -> Result<()> {
+pub async fn create_run(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::CreateRun,
+) -> Result<()> {
     let now = now_iso();
     db.prepare(
-        "INSERT INTO runs (id, repo, status, trigger, actor, created_at, updated_at, metadata)
-         VALUES (?1, ?2, 'created', ?3, ?4, ?5, ?5, ?6)",
+        "INSERT INTO runs (tenant_id, id, repo, status, trigger, actor, created_at, updated_at, metadata)
+         VALUES (?1, ?2, ?3, 'created', ?4, ?5, ?6, ?6, ?7)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         JsValue::from_str(&body.repo),
         opt_str(&body.trigger),
@@ -435,17 +496,22 @@ pub async fn create_run(db: &D1Database, id: &str, body: &models::CreateRun) -> 
 
 pub async fn list_runs(
     db: &D1Database,
+    tenant_id: &str,
     repo: Option<&str>,
     limit: u32,
 ) -> Result<Vec<RunResponse>> {
     let (query, bindings): (String, Vec<JsValue>) = match repo {
         Some(r) => (
-            "SELECT * FROM runs WHERE repo = ?1 ORDER BY created_at DESC LIMIT ?2".into(),
-            vec![JsValue::from_str(r), JsValue::from(limit)],
+            "SELECT * FROM runs WHERE tenant_id = ?1 AND repo = ?2 ORDER BY created_at DESC LIMIT ?3".into(),
+            vec![
+                JsValue::from_str(tenant_id),
+                JsValue::from_str(r),
+                JsValue::from(limit),
+            ],
         ),
         None => (
-            "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?1".into(),
-            vec![JsValue::from(limit)],
+            "SELECT * FROM runs WHERE tenant_id = ?1 ORDER BY created_at DESC LIMIT ?2".into(),
+            vec![JsValue::from_str(tenant_id), JsValue::from(limit)],
         ),
     };
     let result: D1Result = db.prepare(&query).bind(&bindings)?.all().await?;
@@ -453,10 +519,10 @@ pub async fn list_runs(
     Ok(rows.into_iter().map(|r| r.into_run_response()).collect())
 }
 
-pub async fn get_run(db: &D1Database, id: &str) -> Result<Option<RunResponse>> {
+pub async fn get_run(db: &D1Database, tenant_id: &str, id: &str) -> Result<Option<RunResponse>> {
     let row: Option<RunRow> = db
-        .prepare("SELECT * FROM runs WHERE id = ?1")
-        .bind(&[JsValue::from_str(id)])?
+        .prepare("SELECT * FROM runs WHERE tenant_id = ?1 AND id = ?2")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
         .first(None)
         .await?;
     Ok(row.map(|r| r.into_run_response()))
@@ -466,16 +532,18 @@ pub async fn get_run(db: &D1Database, id: &str) -> Result<Option<RunResponse>> {
 
 pub async fn create_ws2_task(
     db: &D1Database,
+    tenant_id: &str,
     id: &str,
     run_id: &str,
     body: &models::CreateTask,
 ) -> Result<()> {
     let now = now_iso();
     db.prepare(
-        "INSERT INTO tasks (id, run_id, plan_id, name, status, actor, created_at, updated_at, metadata)
-         VALUES (?1, ?2, ?3, ?4, 'created', ?5, ?6, ?6, ?7)",
+        "INSERT INTO tasks (tenant_id, id, run_id, plan_id, name, status, actor, created_at, updated_at, metadata)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'created', ?6, ?7, ?7, ?8)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         JsValue::from_str(run_id),
         opt_str(&body.plan_id),
@@ -489,10 +557,14 @@ pub async fn create_ws2_task(
     Ok(())
 }
 
-pub async fn list_ws2_tasks(db: &D1Database, run_id: &str) -> Result<Vec<Ws2TaskResponse>> {
+pub async fn list_ws2_tasks(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+) -> Result<Vec<Ws2TaskResponse>> {
     let result: D1Result = db
-        .prepare("SELECT * FROM tasks WHERE run_id = ?1 ORDER BY created_at ASC")
-        .bind(&[JsValue::from_str(run_id)])?
+        .prepare("SELECT * FROM tasks WHERE tenant_id = ?1 AND run_id = ?2 ORDER BY created_at ASC")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
         .all()
         .await?;
     let rows: Vec<Ws2TaskRow> = result.results()?;
@@ -501,7 +573,12 @@ pub async fn list_ws2_tasks(db: &D1Database, run_id: &str) -> Result<Vec<Ws2Task
 
 // ── WS2 Domain: Plans ────────────────────────────────────────────
 
-pub async fn create_plan(db: &D1Database, id: &str, body: &models::CreatePlan) -> Result<()> {
+pub async fn create_plan(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::CreatePlan,
+) -> Result<()> {
     let now = now_iso();
     let task_ids_json = body
         .task_ids
@@ -510,10 +587,11 @@ pub async fn create_plan(db: &D1Database, id: &str, body: &models::CreatePlan) -
         .unwrap_or_else(|| "[]".into());
 
     db.prepare(
-        "INSERT INTO plans (id, run_id, name, status, task_ids, created_at, updated_at, metadata)
-         VALUES (?1, ?2, ?3, 'created', ?4, ?5, ?5, ?6)",
+        "INSERT INTO plans (tenant_id, id, run_id, name, status, task_ids, created_at, updated_at, metadata)
+         VALUES (?1, ?2, ?3, ?4, 'created', ?5, ?6, ?6, ?7)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         JsValue::from_str(&body.run_id),
         JsValue::from_str(&body.name),
@@ -530,6 +608,7 @@ pub async fn create_plan(db: &D1Database, id: &str, body: &models::CreatePlan) -
 
 pub async fn record_tool_call(
     db: &D1Database,
+    tenant_id: &str,
     id: &str,
     body: &models::RecordToolCall,
 ) -> Result<()> {
@@ -537,10 +616,11 @@ pub async fn record_tool_call(
     let input_json = serde_json::to_string(&body.input).unwrap();
 
     db.prepare(
-        "INSERT INTO tool_calls (id, run_id, task_id, tool_name, input, output, status, duration_ms, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8)",
+        "INSERT INTO tool_calls (tenant_id, id, run_id, task_id, tool_name, input, output, status, duration_ms, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'created', ?8, ?9)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         JsValue::from_str(&body.run_id),
         opt_str(&body.task_id),
@@ -560,7 +640,12 @@ pub async fn record_tool_call(
 
 // ── WS2 Domain: Releases ────────────────────────────────────────
 
-pub async fn create_release(db: &D1Database, id: &str, body: &models::CreateRelease) -> Result<()> {
+pub async fn create_release(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::CreateRelease,
+) -> Result<()> {
     let now = now_iso();
     let artifact_ids_json = body
         .artifact_ids
@@ -569,10 +654,11 @@ pub async fn create_release(db: &D1Database, id: &str, body: &models::CreateRele
         .unwrap_or_else(|| "[]".into());
 
     db.prepare(
-        "INSERT INTO releases (id, repo, version, run_id, artifact_ids, status, created_at, metadata)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'created', ?6, ?7)",
+        "INSERT INTO releases (tenant_id, id, repo, version, run_id, artifact_ids, status, created_at, metadata)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         JsValue::from_str(&body.repo),
         JsValue::from_str(&body.version),
@@ -588,15 +674,21 @@ pub async fn create_release(db: &D1Database, id: &str, body: &models::CreateRele
 
 // ── WS2 Domain: Events (provenance) ─────────────────────────────
 
-pub async fn ingest_event(db: &D1Database, id: &str, body: &models::IngestEvent) -> Result<()> {
+pub async fn ingest_event(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::IngestEvent,
+) -> Result<()> {
     let now = now_iso();
     let entity_kind = body.entity_kind.as_deref().unwrap_or("event");
     let entity_id = body.entity_id.as_deref().unwrap_or(id);
     db.prepare(
-        "INSERT INTO events (id, run_id, entity_kind, entity_id, event_type, actor, created_at, payload)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO events (tenant_id, id, run_id, entity_kind, entity_id, event_type, actor, created_at, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         JsValue::from_str(&body.run_id),
         JsValue::from_str(entity_kind),
@@ -615,6 +707,7 @@ pub async fn ingest_event(db: &D1Database, id: &str, body: &models::IngestEvent)
 
 pub async fn record_policy_check(
     db: &D1Database,
+    tenant_id: &str,
     id: &str,
     body: &models::PolicyCheckRequest,
     decision: &str,
@@ -622,10 +715,11 @@ pub async fn record_policy_check(
 ) -> Result<()> {
     let now = now_iso();
     db.prepare(
-        "INSERT INTO policy_decisions (id, action, actor, resource, decision, reason, created_at, context)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO policy_decisions (tenant_id, id, action, actor, resource, decision, reason, created_at, context)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         JsValue::from_str(&body.action),
         JsValue::from_str(&body.actor),
@@ -644,15 +738,17 @@ pub async fn record_policy_check(
 
 pub async fn create_policy_rule(
     db: &D1Database,
+    tenant_id: &str,
     id: &str,
     body: &models::CreatePolicyRule,
 ) -> Result<()> {
     let now = now_iso();
     db.prepare(
-        "INSERT INTO policy_rules (id, name, action_pattern, resource_pattern, actor_pattern, risk_level, verdict, reason, priority, enabled, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)",
+        "INSERT INTO policy_rules (tenant_id, id, name, action_pattern, resource_pattern, actor_pattern, risk_level, verdict, reason, priority, enabled, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?11)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         JsValue::from_str(&body.name),
         JsValue::from_str(&body.action_pattern),
@@ -669,24 +765,31 @@ pub async fn create_policy_rule(
     Ok(())
 }
 
-pub async fn list_policy_rules(db: &D1Database) -> Result<Vec<PolicyRuleRow>> {
+pub async fn list_policy_rules(db: &D1Database, tenant_id: &str) -> Result<Vec<PolicyRuleRow>> {
     let result: D1Result = db
-        .prepare("SELECT * FROM policy_rules ORDER BY priority DESC, created_at ASC")
-        .bind(&[])?
+        .prepare(
+            "SELECT * FROM policy_rules WHERE tenant_id = ?1 ORDER BY priority DESC, created_at ASC",
+        )
+        .bind(&[JsValue::from_str(tenant_id)])?
         .all()
         .await?;
     result.results()
 }
 
-pub async fn get_policy_rule(db: &D1Database, id: &str) -> Result<Option<PolicyRuleRow>> {
-    db.prepare("SELECT * FROM policy_rules WHERE id = ?1")
-        .bind(&[JsValue::from_str(id)])?
+pub async fn get_policy_rule(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<PolicyRuleRow>> {
+    db.prepare("SELECT * FROM policy_rules WHERE tenant_id = ?1 AND id = ?2")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
         .first(None)
         .await
 }
 
 pub async fn update_policy_rule(
     db: &D1Database,
+    tenant_id: &str,
     id: &str,
     body: &models::UpdatePolicyRule,
 ) -> Result<bool> {
@@ -747,11 +850,13 @@ pub async fn update_policy_rule(
     param_idx += 1;
 
     // id goes last
+    bind_vals.push(JsValue::from_str(tenant_id));
     bind_vals.push(JsValue::from_str(id));
 
     let query = format!(
-        "UPDATE policy_rules SET {} WHERE id = ?{param_idx}",
-        set_parts.join(", ")
+        "UPDATE policy_rules SET {} WHERE tenant_id = ?{param_idx} AND id = ?{}",
+        set_parts.join(", "),
+        param_idx + 1
     );
 
     let res: D1Result = db.prepare(&query).bind(&bind_vals)?.run().await?;
@@ -762,10 +867,10 @@ pub async fn update_policy_rule(
     Ok(changed)
 }
 
-pub async fn delete_policy_rule(db: &D1Database, id: &str) -> Result<bool> {
+pub async fn delete_policy_rule(db: &D1Database, tenant_id: &str, id: &str) -> Result<bool> {
     let res: D1Result = db
-        .prepare("DELETE FROM policy_rules WHERE id = ?1")
-        .bind(&[JsValue::from_str(id)])?
+        .prepare("DELETE FROM policy_rules WHERE tenant_id = ?1 AND id = ?2")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
         .run()
         .await?;
     let changed = res
@@ -780,13 +885,14 @@ pub async fn delete_policy_rule(db: &D1Database, id: &str) -> Result<bool> {
 /// If no rule matches, returns default-allow for reads and default-deny for destructive/irreversible.
 pub async fn evaluate_policy(
     db: &D1Database,
+    tenant_id: &str,
     req: &models::PolicyCheckRequest,
 ) -> Result<(String, String, String, Option<String>)> {
     let result: D1Result = db
         .prepare(
-            "SELECT * FROM policy_rules WHERE enabled = 1 ORDER BY priority DESC, created_at ASC",
+            "SELECT * FROM policy_rules WHERE tenant_id = ?1 AND enabled = 1 ORDER BY priority DESC, created_at ASC",
         )
-        .bind(&[])?
+        .bind(&[JsValue::from_str(tenant_id)])?
         .all()
         .await?;
     let rules: Vec<PolicyRuleRow> = result.results()?;
@@ -895,6 +1001,7 @@ fn classify_action_risk(action: &str) -> String {
 
 pub async fn list_policy_decisions(
     db: &D1Database,
+    tenant_id: &str,
     action: Option<&str>,
     actor: Option<&str>,
     decision: Option<&str>,
@@ -903,7 +1010,7 @@ pub async fn list_policy_decisions(
     // Build dynamic WHERE
     let mut conditions: Vec<String> = Vec::new();
     let mut bindings: Vec<JsValue> = Vec::new();
-    let mut idx = 1u32;
+    let mut idx = 2u32;
 
     if let Some(a) = action {
         conditions.push(format!("action = ?{idx}"));
@@ -922,18 +1029,57 @@ pub async fn list_policy_decisions(
     }
 
     let where_clause = if conditions.is_empty() {
-        String::new()
+        "WHERE tenant_id = ?1".to_string()
     } else {
-        format!("WHERE {}", conditions.join(" AND "))
+        format!("WHERE tenant_id = ?1 AND {}", conditions.join(" AND "))
     };
 
     let query = format!(
         "SELECT * FROM policy_decisions {where_clause} ORDER BY created_at DESC LIMIT ?{idx}"
     );
+    bindings.insert(0, JsValue::from_str(tenant_id));
     bindings.push(JsValue::from(limit));
 
     let result: D1Result = db.prepare(&query).bind(&bindings)?.all().await?;
     result.results()
+}
+
+pub async fn provision_tenant(
+    db: &D1Database,
+    body: &models::TenantProvisionRequest,
+) -> Result<()> {
+    let now = now_iso();
+    let plan = if body.plan.trim().is_empty() {
+        "standard"
+    } else {
+        body.plan.as_str()
+    };
+    let quota_runs = if body.quota_runs_per_minute <= 0 {
+        120
+    } else {
+        body.quota_runs_per_minute
+    };
+
+    db.prepare(
+        "INSERT INTO tenants (tenant_id, display_name, plan, quota_runs_per_minute, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(tenant_id) DO UPDATE SET
+           display_name = excluded.display_name,
+           plan = excluded.plan,
+           quota_runs_per_minute = excluded.quota_runs_per_minute,
+           updated_at = excluded.updated_at",
+    )
+    .bind(&[
+        JsValue::from_str(&body.tenant_id),
+        JsValue::from_str(&body.display_name),
+        JsValue::from_str(plan),
+        JsValue::from(quota_runs as f64),
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
 }
 
 // ── Internal row types ──────────────────────────────────────────
