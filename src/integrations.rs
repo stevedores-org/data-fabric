@@ -29,6 +29,7 @@ impl IntegrationTarget {
 }
 
 /// Registration record for an active integration.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct Integration {
     pub id: String,
