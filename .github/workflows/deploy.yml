@@ -25,7 +25,11 @@ jobs:
       - name: Build worker
         run: worker-build --release
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2"
+
       - name: Deploy to Cloudflare
-        run: npx wrangler@3 deploy
+        run: bunx wrangler@3 deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
