@@ -161,19 +161,124 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => Response::error("not found", 404),
             }
         })
-        // ── Policy Check (WS4, D1-backed) ──────────────────────
+        // ── Policy Check (WS4, engine-backed) ──────────────────
         .post_async("/v1/policies/check", |mut req, ctx| async move {
             let body: models::PolicyCheckRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            let decision = "allow";
-            let reason = "no policy restrictions configured";
-            db::record_policy_check(&d1, &id, &body, decision, reason).await?;
+            let (decision, reason, risk_level, matched_rule) =
+                db::evaluate_policy(&d1, &body).await?;
+            db::record_policy_check(&d1, &id, &body, &decision, &reason).await?;
             Response::from_json(&models::PolicyCheckResponse {
+                id: id.clone(),
                 action: body.action,
-                decision: decision.into(),
-                reason: reason.into(),
+                decision,
+                reason,
+                risk_level,
+                matched_rule,
             })
+        })
+        // ── Policy Rules CRUD (WS4) ─────────────────────────────
+        .post_async("/v1/policies/rules", |mut req, ctx| async move {
+            let body: models::CreatePolicyRule = req.json().await?;
+            // Validate verdict
+            match body.verdict.as_str() {
+                "allow" | "deny" | "escalate" => {}
+                _ => return Response::error("verdict must be allow, deny, or escalate", 400),
+            }
+            // Validate risk_level
+            match body.risk_level.as_str() {
+                "read" | "write" | "destructive" | "irreversible" => {}
+                _ => {
+                    return Response::error(
+                        "risk_level must be read, write, destructive, or irreversible",
+                        400,
+                    )
+                }
+            }
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            db::create_policy_rule(&d1, &id, &body).await?;
+            Response::from_json(&models::Created {
+                id,
+                status: "created".into(),
+            })
+        })
+        .get_async("/v1/policies/rules", |_req, ctx| async move {
+            let d1 = ctx.env.d1("DB")?;
+            let rules = db::list_policy_rules(&d1).await?;
+            let responses: Vec<_> = rules.into_iter().map(|r| r.into_response()).collect();
+            Response::from_json(&serde_json::json!({ "rules": responses }))
+        })
+        .get_async("/v1/policies/rules/:id", |_req, ctx| async move {
+            let id = ctx.param("id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            match db::get_policy_rule(&d1, &id).await? {
+                Some(rule) => Response::from_json(&rule.into_response()),
+                None => Response::error("rule not found", 404),
+            }
+        })
+        .patch_async("/v1/policies/rules/:id", |mut req, ctx| async move {
+            let id = ctx.param("id").unwrap().to_string();
+            let body: models::UpdatePolicyRule = req.json().await?;
+            // Validate verdict if provided
+            if let Some(ref v) = body.verdict {
+                match v.as_str() {
+                    "allow" | "deny" | "escalate" => {}
+                    _ => return Response::error("verdict must be allow, deny, or escalate", 400),
+                }
+            }
+            if let Some(ref v) = body.risk_level {
+                match v.as_str() {
+                    "read" | "write" | "destructive" | "irreversible" => {}
+                    _ => {
+                        return Response::error(
+                            "risk_level must be read, write, destructive, or irreversible",
+                            400,
+                        )
+                    }
+                }
+            }
+            let d1 = ctx.env.d1("DB")?;
+            let updated = db::update_policy_rule(&d1, &id, &body).await?;
+            if updated {
+                match db::get_policy_rule(&d1, &id).await? {
+                    Some(rule) => Response::from_json(&rule.into_response()),
+                    None => Response::error("rule not found", 404),
+                }
+            } else {
+                Response::error("rule not found", 404)
+            }
+        })
+        .delete_async("/v1/policies/rules/:id", |_req, ctx| async move {
+            let id = ctx.param("id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            let deleted = db::delete_policy_rule(&d1, &id).await?;
+            if deleted {
+                Response::from_json(&serde_json::json!({ "deleted": true }))
+            } else {
+                Response::error("rule not found", 404)
+            }
+        })
+        // ── Policy Decision History (WS4) ────────────────────────
+        .get_async("/v1/policies/decisions", |req, ctx| async move {
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let action = params.get("action").map(|s| s.as_str());
+            let actor = params.get("actor").map(|s| s.as_str());
+            let decision = params.get("decision").map(|s| s.as_str());
+            let limit = params
+                .get("limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50u32)
+                .min(200);
+            let d1 = ctx.env.d1("DB")?;
+            let decisions = db::list_policy_decisions(&d1, action, actor, decision, limit).await?;
+            let responses: Vec<_> = decisions.into_iter().map(|d| d.into_response()).collect();
+            Response::from_json(&serde_json::json!({ "decisions": responses }))
         })
         // ── Agent Tasks (M1) ──────────────────────────────────
         .post_async("/v1/tasks", |mut req, ctx| async move {

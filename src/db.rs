@@ -640,6 +640,302 @@ pub async fn record_policy_check(
     Ok(())
 }
 
+// ── WS4 Policy Rules Engine ──────────────────────────────────────
+
+pub async fn create_policy_rule(
+    db: &D1Database,
+    id: &str,
+    body: &models::CreatePolicyRule,
+) -> Result<()> {
+    let now = now_iso();
+    db.prepare(
+        "INSERT INTO policy_rules (id, name, action_pattern, resource_pattern, actor_pattern, risk_level, verdict, reason, priority, enabled, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(&body.name),
+        JsValue::from_str(&body.action_pattern),
+        JsValue::from_str(&body.resource_pattern),
+        JsValue::from_str(&body.actor_pattern),
+        JsValue::from_str(&body.risk_level),
+        JsValue::from_str(&body.verdict),
+        JsValue::from_str(&body.reason),
+        JsValue::from(body.priority),
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn list_policy_rules(db: &D1Database) -> Result<Vec<PolicyRuleRow>> {
+    let result: D1Result = db
+        .prepare("SELECT * FROM policy_rules ORDER BY priority DESC, created_at ASC")
+        .bind(&[])?
+        .all()
+        .await?;
+    result.results()
+}
+
+pub async fn get_policy_rule(db: &D1Database, id: &str) -> Result<Option<PolicyRuleRow>> {
+    db.prepare("SELECT * FROM policy_rules WHERE id = ?1")
+        .bind(&[JsValue::from_str(id)])?
+        .first(None)
+        .await
+}
+
+pub async fn update_policy_rule(
+    db: &D1Database,
+    id: &str,
+    body: &models::UpdatePolicyRule,
+) -> Result<bool> {
+    let now = now_iso();
+    let mut set_parts: Vec<String> = Vec::new();
+    let mut bind_vals: Vec<JsValue> = Vec::new();
+    let mut param_idx = 1u32;
+
+    if let Some(ref v) = body.name {
+        set_parts.push(format!("name = ?{param_idx}"));
+        bind_vals.push(JsValue::from_str(v));
+        param_idx += 1;
+    }
+    if let Some(ref v) = body.action_pattern {
+        set_parts.push(format!("action_pattern = ?{param_idx}"));
+        bind_vals.push(JsValue::from_str(v));
+        param_idx += 1;
+    }
+    if let Some(ref v) = body.resource_pattern {
+        set_parts.push(format!("resource_pattern = ?{param_idx}"));
+        bind_vals.push(JsValue::from_str(v));
+        param_idx += 1;
+    }
+    if let Some(ref v) = body.actor_pattern {
+        set_parts.push(format!("actor_pattern = ?{param_idx}"));
+        bind_vals.push(JsValue::from_str(v));
+        param_idx += 1;
+    }
+    if let Some(ref v) = body.risk_level {
+        set_parts.push(format!("risk_level = ?{param_idx}"));
+        bind_vals.push(JsValue::from_str(v));
+        param_idx += 1;
+    }
+    if let Some(ref v) = body.verdict {
+        set_parts.push(format!("verdict = ?{param_idx}"));
+        bind_vals.push(JsValue::from_str(v));
+        param_idx += 1;
+    }
+    if let Some(ref v) = body.reason {
+        set_parts.push(format!("reason = ?{param_idx}"));
+        bind_vals.push(JsValue::from_str(v));
+        param_idx += 1;
+    }
+    if let Some(v) = body.priority {
+        set_parts.push(format!("priority = ?{param_idx}"));
+        bind_vals.push(JsValue::from(v));
+        param_idx += 1;
+    }
+    if let Some(v) = body.enabled {
+        set_parts.push(format!("enabled = ?{param_idx}"));
+        bind_vals.push(JsValue::from(if v { 1 } else { 0 }));
+        param_idx += 1;
+    }
+
+    // Always update timestamp
+    set_parts.push(format!("updated_at = ?{param_idx}"));
+    bind_vals.push(JsValue::from_str(&now));
+    param_idx += 1;
+
+    // id goes last
+    bind_vals.push(JsValue::from_str(id));
+
+    let query = format!(
+        "UPDATE policy_rules SET {} WHERE id = ?{param_idx}",
+        set_parts.join(", ")
+    );
+
+    let res: D1Result = db.prepare(&query).bind(&bind_vals)?.run().await?;
+    let changed = res
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+    Ok(changed)
+}
+
+pub async fn delete_policy_rule(db: &D1Database, id: &str) -> Result<bool> {
+    let res: D1Result = db
+        .prepare("DELETE FROM policy_rules WHERE id = ?1")
+        .bind(&[JsValue::from_str(id)])?
+        .run()
+        .await?;
+    let changed = res
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+    Ok(changed)
+}
+
+/// Evaluate a policy check against all enabled rules. Returns (verdict, reason, risk_level, matched_rule_id).
+/// Rules are matched by specificity: exact match > prefix/pattern > wildcard.
+/// If no rule matches, returns default-allow for reads and default-deny for destructive/irreversible.
+pub async fn evaluate_policy(
+    db: &D1Database,
+    req: &models::PolicyCheckRequest,
+) -> Result<(String, String, String, Option<String>)> {
+    let result: D1Result = db
+        .prepare(
+            "SELECT * FROM policy_rules WHERE enabled = 1 ORDER BY priority DESC, created_at ASC",
+        )
+        .bind(&[])?
+        .all()
+        .await?;
+    let rules: Vec<PolicyRuleRow> = result.results()?;
+
+    let resource = req.resource.as_deref().unwrap_or("");
+
+    // Find best matching rule by specificity score
+    let mut best: Option<(&PolicyRuleRow, u32)> = None;
+    for rule in &rules {
+        if !pattern_matches(&rule.action_pattern, &req.action) {
+            continue;
+        }
+        if !pattern_matches(&rule.resource_pattern, resource) {
+            continue;
+        }
+        if !pattern_matches(&rule.actor_pattern, &req.actor) {
+            continue;
+        }
+        let score = specificity_score(
+            &rule.action_pattern,
+            &rule.resource_pattern,
+            &rule.actor_pattern,
+        );
+        if best.is_none() || score > best.unwrap().1 {
+            best = Some((rule, score));
+        }
+    }
+
+    match best {
+        Some((rule, _)) => Ok((
+            rule.verdict.clone(),
+            rule.reason.clone(),
+            rule.risk_level.clone(),
+            Some(rule.id.clone()),
+        )),
+        None => {
+            // Default policy: infer risk from action name
+            let risk = classify_action_risk(&req.action);
+            let (verdict, reason) = match risk.as_str() {
+                "read" => ("allow", "no matching rule; read actions default-allowed"),
+                "write" => ("allow", "no matching rule; write actions default-allowed"),
+                "destructive" | "irreversible" => (
+                    "escalate",
+                    "no matching rule; high-risk action requires explicit policy",
+                ),
+                _ => ("allow", "no matching rule; default-allowed"),
+            };
+            Ok((verdict.into(), reason.into(), risk, None))
+        }
+    }
+}
+
+/// Simple pattern matching: '*' matches anything, 'prefix:*' matches prefix, exact otherwise.
+fn pattern_matches(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix(':') {
+        // "deploy:" matches "deploy:staging", "deploy:prod", etc.
+        return value.starts_with(prefix) || value == prefix.trim_end_matches(':');
+    }
+    if let Some(prefix) = pattern.strip_suffix(":*") {
+        return value.starts_with(&format!("{prefix}:")) || value == prefix;
+    }
+    pattern == value
+}
+
+/// Specificity: exact fields score higher than wildcards.
+fn specificity_score(action: &str, resource: &str, actor: &str) -> u32 {
+    let mut score = 0u32;
+    if action != "*" {
+        score += if action.contains('*') { 1 } else { 2 };
+    }
+    if resource != "*" {
+        score += if resource.contains('*') { 1 } else { 2 };
+    }
+    if actor != "*" {
+        score += if actor.contains('*') { 1 } else { 2 };
+    }
+    score
+}
+
+/// Classify action risk by naming convention.
+fn classify_action_risk(action: &str) -> String {
+    let a = action.to_lowercase();
+    if a.starts_with("read")
+        || a.starts_with("get")
+        || a.starts_with("list")
+        || a.starts_with("view")
+        || a.starts_with("describe")
+    {
+        return "read".into();
+    }
+    if a.starts_with("delete")
+        || a.starts_with("drop")
+        || a.starts_with("destroy")
+        || a.starts_with("purge")
+    {
+        return "destructive".into();
+    }
+    if a.starts_with("deploy:prod") || a.contains("irreversible") || a.starts_with("revoke") {
+        return "irreversible".into();
+    }
+    "write".into()
+}
+
+pub async fn list_policy_decisions(
+    db: &D1Database,
+    action: Option<&str>,
+    actor: Option<&str>,
+    decision: Option<&str>,
+    limit: u32,
+) -> Result<Vec<PolicyDecisionRow>> {
+    // Build dynamic WHERE
+    let mut conditions: Vec<String> = Vec::new();
+    let mut bindings: Vec<JsValue> = Vec::new();
+    let mut idx = 1u32;
+
+    if let Some(a) = action {
+        conditions.push(format!("action = ?{idx}"));
+        bindings.push(JsValue::from_str(a));
+        idx += 1;
+    }
+    if let Some(a) = actor {
+        conditions.push(format!("actor = ?{idx}"));
+        bindings.push(JsValue::from_str(a));
+        idx += 1;
+    }
+    if let Some(d) = decision {
+        conditions.push(format!("decision = ?{idx}"));
+        bindings.push(JsValue::from_str(d));
+        idx += 1;
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+
+    let query = format!(
+        "SELECT * FROM policy_decisions {where_clause} ORDER BY created_at DESC LIMIT ?{idx}"
+    );
+    bindings.push(JsValue::from(limit));
+
+    let result: D1Result = db.prepare(&query).bind(&bindings)?.all().await?;
+    result.results()
+}
+
 // ── Internal row types ──────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -858,8 +1154,159 @@ pub struct Ws2TaskResponse {
     pub metadata: Option<serde_json::Value>,
 }
 
+// ── WS4 Policy row types ────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PolicyRuleRow {
+    pub id: String,
+    pub name: String,
+    pub action_pattern: String,
+    pub resource_pattern: String,
+    pub actor_pattern: String,
+    pub risk_level: String,
+    pub verdict: String,
+    pub reason: String,
+    pub priority: i32,
+    pub enabled: i32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl PolicyRuleRow {
+    pub fn into_response(self) -> models::PolicyRuleResponse {
+        models::PolicyRuleResponse {
+            id: self.id,
+            name: self.name,
+            action_pattern: self.action_pattern,
+            resource_pattern: self.resource_pattern,
+            actor_pattern: self.actor_pattern,
+            risk_level: self.risk_level,
+            verdict: self.verdict,
+            reason: self.reason,
+            priority: self.priority,
+            enabled: self.enabled != 0,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PolicyDecisionRow {
+    pub id: String,
+    pub action: String,
+    pub actor: String,
+    pub resource: Option<String>,
+    pub decision: String,
+    pub reason: String,
+    pub created_at: String,
+    pub context: Option<String>,
+}
+
+impl PolicyDecisionRow {
+    pub fn into_response(self) -> models::PolicyDecisionResponse {
+        models::PolicyDecisionResponse {
+            id: self.id,
+            action: self.action,
+            actor: self.actor,
+            resource: self.resource,
+            decision: self.decision,
+            reason: self.reason,
+            created_at: self.created_at,
+            context: self.context.and_then(|s| serde_json::from_str(&s).ok()),
+        }
+    }
+}
+
 fn lease_time(seconds: u64) -> String {
     let now = js_sys::Date::now();
     let future = js_sys::Date::new(&JsValue::from_f64(now + (seconds as f64 * 1000.0)));
     future.to_iso_string().as_string().unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Pattern matching ────────────────────────────────────────
+
+    #[test]
+    fn wildcard_matches_anything() {
+        assert!(pattern_matches("*", "deploy"));
+        assert!(pattern_matches("*", ""));
+        assert!(pattern_matches("*", "anything:at:all"));
+    }
+
+    #[test]
+    fn exact_match() {
+        assert!(pattern_matches("deploy", "deploy"));
+        assert!(!pattern_matches("deploy", "delete"));
+        assert!(!pattern_matches("deploy", "deploy:staging"));
+    }
+
+    #[test]
+    fn prefix_wildcard_match() {
+        assert!(pattern_matches("deploy:*", "deploy:staging"));
+        assert!(pattern_matches("deploy:*", "deploy:prod"));
+        assert!(pattern_matches("deploy:*", "deploy"));
+        assert!(!pattern_matches("deploy:*", "delete:staging"));
+    }
+
+    // ── Specificity scoring ─────────────────────────────────────
+
+    #[test]
+    fn all_wildcards_score_zero() {
+        assert_eq!(specificity_score("*", "*", "*"), 0);
+    }
+
+    #[test]
+    fn exact_fields_score_higher() {
+        assert!(specificity_score("deploy", "*", "*") > specificity_score("*", "*", "*"));
+        assert!(specificity_score("deploy", "prod", "*") > specificity_score("deploy", "*", "*"));
+        assert!(
+            specificity_score("deploy", "prod", "agent-1")
+                > specificity_score("deploy", "prod", "*")
+        );
+    }
+
+    #[test]
+    fn prefix_scores_between_wildcard_and_exact() {
+        let prefix = specificity_score("deploy:*", "*", "*");
+        let exact = specificity_score("deploy", "*", "*");
+        let wildcard = specificity_score("*", "*", "*");
+        assert!(prefix > wildcard);
+        assert!(exact > prefix);
+    }
+
+    // ── Risk classification ─────────────────────────────────────
+
+    #[test]
+    fn read_actions_classified() {
+        assert_eq!(classify_action_risk("read:config"), "read");
+        assert_eq!(classify_action_risk("get:status"), "read");
+        assert_eq!(classify_action_risk("list:agents"), "read");
+        assert_eq!(classify_action_risk("view:logs"), "read");
+        assert_eq!(classify_action_risk("describe:resources"), "read");
+    }
+
+    #[test]
+    fn destructive_actions_classified() {
+        assert_eq!(classify_action_risk("delete:resource"), "destructive");
+        assert_eq!(classify_action_risk("drop:table"), "destructive");
+        assert_eq!(classify_action_risk("destroy:cluster"), "destructive");
+        assert_eq!(classify_action_risk("purge:cache"), "destructive");
+    }
+
+    #[test]
+    fn irreversible_actions_classified() {
+        assert_eq!(classify_action_risk("deploy:prod"), "irreversible");
+        assert_eq!(classify_action_risk("revoke:token"), "irreversible");
+    }
+
+    #[test]
+    fn write_is_default() {
+        assert_eq!(classify_action_risk("update:config"), "write");
+        assert_eq!(classify_action_risk("create:resource"), "write");
+        assert_eq!(classify_action_risk("deploy:staging"), "write");
+    }
 }
