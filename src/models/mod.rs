@@ -2,10 +2,9 @@
 //!
 //! Canonical entities: Run, Task, Plan, ToolCall, Artifact, PolicyDecision, Release.
 //! Relationships: Causality, Dependency, Ownership, Lineage.
-//! Orchestration: AgentTask, Agent, Checkpoint, GraphEvent (M1-M3).
+//! MCP infrastructure: AgentTask, Agent, Checkpoint, GraphEvent (M1-M3).
 
-// Entities and relationships are the canonical schema — used in tests now,
-// wired to D1 storage in M1.
+// WS2 domain ontology — canonical entities and relationships.
 #[allow(dead_code)]
 mod entities;
 pub mod orchestration;
@@ -13,7 +12,14 @@ pub mod orchestration;
 mod relationships;
 mod requests;
 
+// M1-M3 agent infrastructure — MCP task queue, agents, checkpoints, events. WS5 memory.
+#[allow(dead_code)]
+mod mcp;
+mod memory;
+
 pub use entities::*;
+pub use mcp::{CreateMemory, Memory, MemoryCreated};
+pub use memory::*;
 pub use orchestration::*;
 #[allow(unused_imports)]
 pub use relationships::*;

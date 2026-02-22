@@ -4,3 +4,4 @@
 /.wrangler
 node_modules
 .local-ci-cache
+result

@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-// ── Agent Task Queue (M1) ───────────────────────────────────────
+// ── MCP Task Queue (M1) ────────────────────────────────────────
 
+/// Request to create a new MCP task in the agent work queue.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct CreateAgentTask {
+pub struct CreateMcpTask {
     pub job_id: String,
     pub task_type: String,
     #[serde(default)]
@@ -15,8 +16,9 @@ pub struct CreateAgentTask {
     pub max_retries: Option<i32>,
 }
 
+/// A claimed MCP task with full lifecycle fields (lease, retry, agent).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct AgentTask {
+pub struct McpTask {
     pub id: String,
     pub job_id: String,
     pub task_type: String,
@@ -36,7 +38,7 @@ pub struct AgentTask {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct TaskCreated {
+pub struct McpTaskCreated {
     pub id: String,
     pub status: String,
 }
@@ -51,8 +53,9 @@ pub struct TaskFailRequest {
     pub error: String,
 }
 
-// ── Agent Registration (M1) ─────────────────────────────────────
+// ── Agents (M1) ────────────────────────────────────────────────
 
+/// Request to register a new agent.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct RegisterAgent {
     pub name: String,
@@ -61,6 +64,7 @@ pub struct RegisterAgent {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// A registered agent with heartbeat and status.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct Agent {
     pub id: String,
@@ -72,8 +76,9 @@ pub struct Agent {
     pub metadata: Option<serde_json::Value>,
 }
 
-// ── Checkpoints (M2: oxidizedgraph state) ───────────────────────
+// ── Checkpoints (M2) ──────────────────────────────────────────
 
+/// Request to create a checkpoint for oxidizedgraph state.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct CreateCheckpoint {
     pub thread_id: String,
@@ -83,6 +88,7 @@ pub struct CreateCheckpoint {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// A persisted checkpoint (state stored in R2, metadata in D1).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct Checkpoint {
     pub id: String,
@@ -102,8 +108,9 @@ pub struct CheckpointCreated {
     pub state_r2_key: String,
 }
 
-// ── Graph Events (M3: event pipeline) ───────────────────────────
+// ── Graph Events (M3) ─────────────────────────────────────────
 
+/// A single graph execution event (node start/end, edge traversal, etc).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct GraphEvent {
     pub run_id: Option<String>,
@@ -125,75 +132,46 @@ pub struct GraphEventAck {
     pub queued: bool,
 }
 
+// ── Memory (WS5: #45) ──────────────────────────────────────────
+
+/// Request to create a memory entry (index over runs/artifacts/checkpoints).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct CreateMemory {
+    pub thread_id: String,
+    pub scope: String,
+    pub key: String,
+    pub ref_type: String,
+    pub ref_id: String,
+    pub run_id: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+/// A memory entry for retrieval and context packing.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct Memory {
+    pub id: String,
+    pub run_id: Option<String>,
+    pub thread_id: String,
+    pub scope: String,
+    pub key: String,
+    pub ref_type: String,
+    pub ref_id: String,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct MemoryCreated {
+    pub id: String,
+    pub thread_id: String,
+    pub scope: String,
+    pub key: String,
+}
+
 // ── Common ─────────────────────────────────────────────────────
 
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
-}
-
-// ── Trace / Provenance (WS3: issue #43) ───────────────────────
-
-/// Single event in a trace slice (reconstructed execution narrative).
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct TraceEvent {
-    pub id: String,
-    pub run_id: Option<String>,
-    pub thread_id: Option<String>,
-    pub event_type: String,
-    pub node_id: Option<String>,
-    pub actor: Option<String>,
-    pub payload: Option<serde_json::Value>,
-    pub created_at: String,
-}
-
-/// Trace slice for a run: ordered events for debugging and replay.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct TraceResponse {
-    pub run_id: String,
-    pub events: Vec<TraceEvent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncated: Option<bool>,
-}
-
-// ── Provenance Links (WS3: causality chain) ─────────────────────
-
-/// Single edge in a provenance/causality chain.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct ProvenanceEdge {
-    pub depth: i32,
-    pub rel_type: String,
-    pub from_kind: String,
-    pub from_id: String,
-    pub to_kind: String,
-    pub to_id: String,
-    pub relation: Option<String>,
-    pub created_at: Option<String>,
-}
-
-/// Response for provenance chain query.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct ProvenanceResponse {
-    pub entity_kind: String,
-    pub entity_id: String,
-    pub direction: String,
-    pub hops: u32,
-    pub edges: Vec<ProvenanceEdge>,
-}
-
-// ── Gold Layer: Run Summaries (WS3) ─────────────────────────────
-
-/// Materialized run summary (gold layer).
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct RunSummary {
-    pub run_id: String,
-    pub event_count: i32,
-    pub first_event_at: Option<String>,
-    pub last_event_at: Option<String>,
-    pub actors: Vec<String>,
-    pub event_types: Vec<String>,
-    pub updated_at: String,
 }

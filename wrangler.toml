@@ -20,6 +20,8 @@ APP_ENV = "dev"
 SERVICE_NAME = "data-fabric"
 
 # ── D1: structured metadata, lineage, domain entities ───────────
+# Create DB: wrangler d1 create data-fabric
+# Apply migrations: wrangler d1 migrations apply data-fabric --remote
 [[d1_databases]]
 binding = "DB"
 database_name = "data-fabric"
@@ -27,22 +29,24 @@ database_id = "placeholder-provision-with-wrangler-d1-create"
 migrations_dir = "migrations"
 
 # ── R2: artifact / blob store ────────────────────────────────────
+# Create bucket: wrangler r2 bucket create data-fabric-artifacts
 [[r2_buckets]]
 binding = "ARTIFACTS"
 bucket_name = "data-fabric-artifacts"
 
 # ── KV: policies, config, fast context lookups ───────────────────
-# [[kv_namespaces]]
-# binding = "KV"
-# id = "<kv-namespace-id>"
-# preview_id = "<kv-preview-namespace-id>"
+[[kv_namespaces]]
+binding = "POLICY_KV"
+id = "placeholder-provision-with-wrangler-kv-namespace-create"
+preview_id = "placeholder-provision-with-wrangler-kv-namespace-create"
 
-# ── Queues: provenance event bus ─────────────────────────────────
+# ── Queues: provenance event bus, enrichment consumer ─────────────
+# Create queue: wrangler queues create data-fabric-events
 # [[queues.producers]]
 # binding = "EVENTS"
 # queue = "data-fabric-events"
 #
-# [[queues.consumers]]
-# queue = "data-fabric-events"
-# max_batch_size = 50
-# max_batch_timeout = 5
+[[queues.consumers]]
+queue = "data-fabric-events"
+max_batch_size = 50
+max_batch_timeout = 5
