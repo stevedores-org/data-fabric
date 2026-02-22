@@ -128,6 +128,66 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 accepted: true,
             })
         })
+        // ── Retrieval & Memory Federation (WS5) ───────────────
+        .post_async("/v1/memory/index", |mut req, ctx| async move {
+            let body: models::UpsertMemoryItemRequest = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            let expires_at = db::upsert_memory_item(&d1, &id, &body).await?;
+            Response::from_json(&models::MemoryItemCreated {
+                id,
+                status: "indexed".into(),
+                expires_at,
+            })
+        })
+        .post_async("/v1/memory/retrieve", |mut req, ctx| async move {
+            let body: models::RetrieveMemoryRequest = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            let response = db::retrieve_memory(&d1, &body).await?;
+            Response::from_json(&response)
+        })
+        .post_async("/v1/memory/context-pack", |mut req, ctx| async move {
+            let body: models::ContextPackRequest = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            let response = db::build_context_pack(&d1, &body).await?;
+            Response::from_json(&response)
+        })
+        .post_async("/v1/memory/:id/retire", |_req, ctx| async move {
+            let id = match ctx.param("id") {
+                Some(k) => k.to_string(),
+                None => return Response::error("missing memory id", 400),
+            };
+            let d1 = ctx.env.d1("DB")?;
+            let retired = db::retire_memory_item(&d1, &id).await?;
+            if retired {
+                Response::from_json(&models::RetireMemoryResponse {
+                    id,
+                    status: "retired".into(),
+                })
+            } else {
+                Response::error("memory item not found", 404)
+            }
+        })
+        .post_async("/v1/memory/gc", |mut req, ctx| async move {
+            let body: models::MemoryGcRequest = req
+                .json()
+                .await
+                .unwrap_or(models::MemoryGcRequest { limit: 1000 });
+            let d1 = ctx.env.d1("DB")?;
+            let response = db::run_memory_gc(&d1, &body).await?;
+            Response::from_json(&response)
+        })
+        .post_async("/v1/memory/retrieval-feedback", |mut req, ctx| async move {
+            let body: models::RetrievalFeedback = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            db::record_retrieval_feedback(&d1, &body).await?;
+            Response::from_json(&models::RetrievalFeedbackAck { recorded: true })
+        })
+        .get_async("/v1/memory/eval/summary", |_req, ctx| async move {
+            let d1 = ctx.env.d1("DB")?;
+            let summary = db::memory_eval_summary(&d1).await?;
+            Response::from_json(&summary)
+        })
         // ── Artifacts (R2-backed) ─────────────────────────────
         .put_async("/v1/artifacts/:key", |mut req, ctx| async move {
             let key = match ctx.param("key") {

@@ -15,12 +15,14 @@ mod requests;
 // M1-M3 agent infrastructure — MCP task queue, agents, checkpoints, events.
 #[allow(dead_code)]
 mod mcp;
+mod memory;
 
 pub use entities::*;
 pub use orchestration::*;
 #[allow(unused_imports)]
 pub use relationships::*;
 pub use requests::*;
+pub use memory::*;
 
 #[cfg(test)]
 mod tests;
