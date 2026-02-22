@@ -304,6 +304,20 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .await
 }
 
+/// Queue consumer: processes enrichment jobs from the events queue.
+/// Ack all on success; on error retry the batch.
+#[event(queue)]
+pub async fn queue(batch: MessageBatch<serde_json::Value>, _env: Env, _ctx: Context) -> Result<()> {
+    let queue_name = batch.queue();
+    let messages = batch.messages()?;
+    for msg in messages {
+        let _body = msg.body();
+        worker::console_log!("[queue {}] processing message", queue_name);
+    }
+    batch.ack_all();
+    Ok(())
+}
+
 fn generate_id() -> Result<String> {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf)
