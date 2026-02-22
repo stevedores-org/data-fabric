@@ -290,6 +290,52 @@ pub async fn delete_checkpoint(db: &D1Database, id: &str) -> Result<bool> {
     Ok(changed)
 }
 
+// ── Memory (WS5: #45) ──────────────────────────────────────────
+
+pub async fn create_memory(db: &D1Database, id: &str, body: &models::CreateMemory) -> Result<()> {
+    let now = now_iso();
+    db.prepare(
+        "INSERT INTO memory (id, run_id, thread_id, scope, key, ref_type, ref_id, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        opt_str(&body.run_id),
+        JsValue::from_str(&body.thread_id),
+        JsValue::from_str(&body.scope),
+        JsValue::from_str(&body.key),
+        JsValue::from_str(&body.ref_type),
+        JsValue::from_str(&body.ref_id),
+        JsValue::from_str(&now),
+        opt_str(&body.expires_at),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// List memories for a thread, recency-ordered. Limit applied (default 100). Excludes expired if expires_at < now.
+pub async fn list_memories_for_thread(
+    db: &D1Database,
+    thread_id: &str,
+    limit: u32,
+) -> Result<Vec<models::Memory>> {
+    let now = now_iso();
+    let result: D1Result = db
+        .prepare(
+            "SELECT * FROM memory WHERE thread_id = ?1 AND (expires_at IS NULL OR expires_at > ?2) ORDER BY created_at DESC LIMIT ?3",
+        )
+        .bind(&[
+            JsValue::from_str(thread_id),
+            JsValue::from_str(&now),
+            JsValue::from(limit),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<MemoryRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_memory()).collect())
+}
+
 // ── Events Bronze ───────────────────────────────────────────────
 
 pub async fn insert_events_bronze(
@@ -771,6 +817,35 @@ impl CheckpointRow {
             state_size_bytes: self.state_size_bytes,
             metadata: self.metadata.and_then(|s| serde_json::from_str(&s).ok()),
             created_at: self.created_at,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MemoryRow {
+    id: String,
+    run_id: Option<String>,
+    thread_id: String,
+    scope: String,
+    key: String,
+    ref_type: String,
+    ref_id: String,
+    created_at: String,
+    expires_at: Option<String>,
+}
+
+impl MemoryRow {
+    fn into_memory(self) -> models::Memory {
+        models::Memory {
+            id: self.id,
+            run_id: self.run_id,
+            thread_id: self.thread_id,
+            scope: self.scope,
+            key: self.key,
+            ref_type: self.ref_type,
+            ref_id: self.ref_id,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
         }
     }
 }

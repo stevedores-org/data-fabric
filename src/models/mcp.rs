@@ -132,6 +132,42 @@ pub struct GraphEventAck {
     pub queued: bool,
 }
 
+// ── Memory (WS5: #45) ──────────────────────────────────────────
+
+/// Request to create a memory entry (index over runs/artifacts/checkpoints).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct CreateMemory {
+    pub thread_id: String,
+    pub scope: String,
+    pub key: String,
+    pub ref_type: String,
+    pub ref_id: String,
+    pub run_id: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+/// A memory entry for retrieval and context packing.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct Memory {
+    pub id: String,
+    pub run_id: Option<String>,
+    pub thread_id: String,
+    pub scope: String,
+    pub key: String,
+    pub ref_type: String,
+    pub ref_id: String,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct MemoryCreated {
+    pub id: String,
+    pub thread_id: String,
+    pub scope: String,
+    pub key: String,
+}
+
 // ── Common ─────────────────────────────────────────────────────
 
 #[allow(dead_code)]

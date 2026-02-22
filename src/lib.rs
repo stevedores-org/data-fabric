@@ -334,6 +334,47 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Response::error("checkpoint not found", 404)
             }
         })
+        // ── Memory (WS5: #45) ─────────────────────────────────
+        .post_async("/v1/memory", |mut req, ctx| async move {
+            let body: models::CreateMemory = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            db::create_memory(&d1, &id, &body).await?;
+            Response::from_json(&models::MemoryCreated {
+                id,
+                thread_id: body.thread_id,
+                scope: body.scope,
+                key: body.key,
+            })
+        })
+        .get_async("/v1/memory/threads/:thread_id", |req, ctx| async move {
+            let thread_id = match ctx.param("thread_id") {
+                Some(t) => t.to_string(),
+                None => return Response::error("missing thread_id", 400),
+            };
+            let limit = parse_limit_query(req.url().ok(), "limit").unwrap_or(100);
+            let d1 = ctx.env.d1("DB")?;
+            let memories = db::list_memories_for_thread(&d1, &thread_id, limit).await?;
+            Response::from_json(&serde_json::json!({ "memories": memories }))
+        })
+        .get_async(
+            "/v1/context-pack/threads/:thread_id",
+            |req, ctx| async move {
+                let thread_id = match ctx.param("thread_id") {
+                    Some(t) => t.to_string(),
+                    None => return Response::error("missing thread_id", 400),
+                };
+                let max_items = parse_limit_query(req.url().ok(), "max_items").unwrap_or(50);
+                let d1 = ctx.env.d1("DB")?;
+                let checkpoint = db::get_latest_checkpoint(&d1, &thread_id).await?;
+                let memories = db::list_memories_for_thread(&d1, &thread_id, max_items).await?;
+                Response::from_json(&serde_json::json!({
+                    "thread_id": thread_id,
+                    "checkpoint": checkpoint.map(|r| r.into_checkpoint()),
+                    "memories": memories,
+                }))
+            },
+        )
         // ── Traces / Provenance (WS3: issue #43) ──────────────
         .get_async("/v1/traces/:run_id", |req, ctx| async move {
             let run_id = match ctx.param("run_id") {

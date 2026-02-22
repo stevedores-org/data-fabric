@@ -487,3 +487,29 @@ fn trace_response_serializes() {
     assert_eq!(json["run_id"], "r1");
     assert_eq!(json["events"].as_array().unwrap().len(), 1);
 }
+
+// ── WS5 Memory (#45) ───────────────────────────────────────────
+
+#[test]
+fn create_memory_round_trip() {
+    let input = r#"{"thread_id":"t1","scope":"run","key":"summary","ref_type":"artifact","ref_id":"a1","run_id":"r1"}"#;
+    let parsed: CreateMemory = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.thread_id, "t1");
+    assert_eq!(parsed.scope, "run");
+    assert_eq!(parsed.ref_type, "artifact");
+    assert_eq!(parsed.ref_id, "a1");
+    assert_eq!(parsed.run_id.as_deref(), Some("r1"));
+}
+
+#[test]
+fn memory_created_serializes() {
+    let mc = MemoryCreated {
+        id: "m1".into(),
+        thread_id: "t1".into(),
+        scope: "run".into(),
+        key: "summary".into(),
+    };
+    let json = serde_json::to_value(&mc).unwrap();
+    assert_eq!(json["thread_id"], "t1");
+    assert_eq!(json["key"], "summary");
+}
