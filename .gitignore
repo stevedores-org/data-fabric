@@ -3,3 +3,4 @@
 Cargo.lock
 .wrangler
 node_modules
+.local-ci-cache
