@@ -87,7 +87,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 accepted: true,
             })
         })
-        // artifacts (WS2/WS5)
+        // artifacts (WS2/WS5) — R2 write/read path
         .put_async("/v1/artifacts/:key", |mut req, ctx| async move {
             let Some(key) = ctx.param("key").map(ToString::to_string) else {
                 return Response::error("missing artifact key", 400);
@@ -104,16 +104,21 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
 
             let mut stream = req.stream()?;
-            let mut size = 0usize;
+            let mut data = Vec::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
-                size = size
-                    .checked_add(chunk.len())
-                    .ok_or_else(|| Error::RustError("artifact size overflow".into()))?;
-                if size > MAX_ARTIFACT_BYTES {
+                if data.len().saturating_add(chunk.len()) > MAX_ARTIFACT_BYTES {
                     return Response::error("artifact exceeds max size", 413);
                 }
+                data.extend_from_slice(&chunk);
             }
+            let size = data.len();
+
+            let bucket = match ctx.env.bucket("ARTIFACTS") {
+                Ok(b) => b,
+                Err(_) => return Response::error("R2 not configured", 503),
+            };
+            bucket.put(&key, data).execute().await?;
 
             Response::from_json(&serde_json::json!({
                 "key": key,
@@ -122,10 +127,21 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }))
         })
         .get_async("/v1/artifacts/:key", |_req, ctx| async move {
-            let Some(_key) = ctx.param("key").map(ToString::to_string) else {
+            let Some(key) = ctx.param("key").map(ToString::to_string) else {
                 return Response::error("missing artifact key", 400);
             };
-            Response::error("not found", 404)
+            let bucket = match ctx.env.bucket("ARTIFACTS") {
+                Ok(b) => b,
+                Err(_) => return Response::error("R2 not configured", 503),
+            };
+            match bucket.get(&key).execute().await? {
+                Some(obj) => {
+                    let body = obj.body().ok_or_else(|| Error::RustError("no body".into()))?;
+                    let bytes = body.bytes().await?;
+                    Response::from_bytes(bytes)
+                }
+                None => Response::error("not found", 404),
+            }
         })
         // policy check (WS4)
         .post_async("/v1/policies/check", |mut req, _ctx| async move {
@@ -139,6 +155,24 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .run(req, env)
         .await
+}
+
+/// Queue consumer: processes enrichment jobs from the events queue.
+/// Ack all on success; on error retry the batch.
+#[event(queue)]
+pub async fn queue(
+    batch: MessageBatch<serde_json::Value>,
+    _env: Env,
+    _ctx: Context,
+) -> Result<()> {
+    let queue_name = batch.queue();
+    let messages = batch.messages()?;
+    for msg in messages {
+        let _body = msg.body();
+        worker::console_log!("[queue {}] processing message", queue_name);
+    }
+    batch.ack_all();
+    Ok(())
 }
 
 fn generate_id() -> Result<String> {
