@@ -26,4 +26,4 @@ jobs:
         run: go install github.com/stevedores-org/local-ci@latest
 
       - name: Run local-ci
-        run: ~/go/bin/local-ci fmt clippy check --no-cache --json
+        run: ~/go/bin/local-ci --no-cache --json fmt clippy check test
