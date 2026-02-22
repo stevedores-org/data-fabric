@@ -23,7 +23,9 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install local-ci
-        run: go install github.com/stevedores-org/local-ci@latest
+        run: |
+          go install github.com/stevedores-org/local-ci@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run local-ci
         run: local-ci fmt clippy check --no-cache --json
