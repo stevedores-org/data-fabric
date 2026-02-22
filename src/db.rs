@@ -331,6 +331,20 @@ pub async fn insert_events_bronze(
 /// Default max events per trace query (avoids unbounded result sets).
 pub const TRACE_DEFAULT_LIMIT: u32 = 1000;
 
+/// Total number of events for a run (for trace metadata). Issue #61.
+pub async fn count_trace_events_for_run(db: &D1Database, run_id: &str) -> Result<u64> {
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        n: u64,
+    }
+    let row: Option<CountRow> = db
+        .prepare("SELECT COUNT(*) AS n FROM events_bronze WHERE run_id = ?1")
+        .bind(&[JsValue::from_str(run_id)])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.n).unwrap_or(0))
+}
+
 /// Fetch trace slice for a run (ordered by created_at). WS3 provenance. Limited by `limit` (default TRACE_DEFAULT_LIMIT).
 pub async fn get_trace_for_run(
     db: &D1Database,
@@ -405,6 +419,17 @@ fn build_entity_refs(evt: &models::GraphEvent) -> Option<String> {
     }
     if let Some(ref n) = evt.node_id {
         obj.insert("node_id".into(), serde_json::Value::String(n.clone()));
+    }
+    if let Some(ref p) = evt.payload {
+        if let Some(inner) = p.as_object() {
+            for key in &["task_id", "artifact_id", "plan_id"] {
+                if let Some(v) = inner.get(*key) {
+                    if let Some(s) = v.as_str() {
+                        obj.insert((*key).into(), serde_json::Value::String(s.to_string()));
+                    }
+                }
+            }
+        }
     }
     if obj.is_empty() {
         return None;

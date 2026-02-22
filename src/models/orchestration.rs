@@ -148,9 +148,15 @@ pub struct TraceEvent {
     pub created_at: String,
 }
 
-/// Trace slice for a run: ordered events for debugging and replay.
+/// Trace slice for a run: ordered events for debugging and replay. Issue #61: total and truncated when limit/hops applied.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct TraceResponse {
     pub run_id: String,
     pub events: Vec<TraceEvent>,
+    /// Total events for this run (present when limit/hops was used).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    /// True when returned events count equals the requested limit (more events may exist).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
 }

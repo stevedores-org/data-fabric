@@ -482,8 +482,23 @@ fn trace_response_serializes() {
             payload: None,
             created_at: "2026-02-22T12:00:00Z".into(),
         }],
+        total: None,
+        truncated: None,
     };
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["run_id"], "r1");
     assert_eq!(json["events"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn trace_response_with_metadata_serializes() {
+    let resp = TraceResponse {
+        run_id: "r1".into(),
+        events: vec![],
+        total: Some(100),
+        truncated: Some(true),
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["total"], 100);
+    assert_eq!(json["truncated"], true);
 }

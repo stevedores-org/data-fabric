@@ -288,8 +288,15 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let limit =
                 parse_limit_query(req.url().ok(), "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
             let d1 = ctx.env.d1("DB")?;
+            let total = db::count_trace_events_for_run(&d1, &run_id).await?;
             let events = db::get_trace_for_run(&d1, &run_id, limit).await?;
-            Response::from_json(&models::TraceResponse { run_id, events })
+            let truncated = events.len() == limit as usize;
+            Response::from_json(&models::TraceResponse {
+                run_id,
+                events,
+                total: Some(total),
+                truncated: Some(truncated),
+            })
         })
         .get_async("/v1/traces/:run_id/lineage", |req, ctx| async move {
             let run_id = match ctx.param("run_id") {
@@ -298,8 +305,15 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             };
             let hops = parse_limit_query(req.url().ok(), "hops").unwrap_or(100);
             let d1 = ctx.env.d1("DB")?;
+            let total = db::count_trace_events_for_run(&d1, &run_id).await?;
             let events = db::get_trace_for_run(&d1, &run_id, hops).await?;
-            Response::from_json(&models::TraceResponse { run_id, events })
+            let truncated = events.len() == hops as usize;
+            Response::from_json(&models::TraceResponse {
+                run_id,
+                events,
+                total: Some(total),
+                truncated: Some(truncated),
+            })
         })
         // ── Graph Events (M3) ─────────────────────────────────
         .post_async("/v1/graph-events", |mut req, ctx| async move {
