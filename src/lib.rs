@@ -51,7 +51,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let limit = params
                 .get("limit")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(50u32);
+                .unwrap_or(50u32)
+                .min(200);
             let d1 = ctx.env.d1("DB")?;
             let runs = db::list_runs(&d1, repo, limit).await?;
             Response::from_json(&serde_json::json!({ "runs": runs }))
@@ -67,11 +68,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── WS2 Tasks (run-scoped, D1-backed) ───────────────
         .post_async("/v1/runs/:run_id/tasks", |mut req, ctx| async move {
             let run_id = ctx.param("run_id").unwrap().to_string();
-            let mut body: models::CreateTask = req.json().await?;
-            body.run_id = run_id;
+            let body: models::CreateTask = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::create_ws2_task(&d1, &id, &body).await?;
+            db::create_ws2_task(&d1, &id, &run_id, &body).await?;
             Response::from_json(&models::Created {
                 id,
                 status: "created".into(),

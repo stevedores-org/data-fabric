@@ -42,6 +42,8 @@ pub struct IngestEvent {
     pub run_id: String,
     pub event_type: String,
     pub actor: String,
+    pub entity_kind: Option<String>,
+    pub entity_id: Option<String>,
     pub payload: Option<serde_json::Value>,
 }
 
