@@ -360,8 +360,7 @@ fn create_agent_task_minimal() {
 
 #[test]
 fn register_agent_round_trip() {
-    let input =
-        r#"{"name":"build-agent","capabilities":["build","test"],"endpoint":"https://agent.example.com"}"#;
+    let input = r#"{"name":"build-agent","capabilities":["build","test"],"endpoint":"https://agent.example.com"}"#;
     let parsed: RegisterAgent = serde_json::from_str(input).unwrap();
     assert_eq!(parsed.name, "build-agent");
     assert_eq!(parsed.capabilities, vec!["build", "test"]);

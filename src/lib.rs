@@ -149,8 +149,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/mcp/task/next", |req, ctx| async move {
             let url = req.url()?;
-            let params: std::collections::HashMap<String, String> =
-                url.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
 
             let agent_id = match params.get("agent_id") {
                 Some(id) => id.clone(),
@@ -172,8 +174,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/mcp/task/:id/heartbeat", |req, ctx| async move {
             let task_id = ctx.param("id").unwrap().to_string();
             let url = req.url()?;
-            let params: std::collections::HashMap<String, String> =
-                url.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
             let agent_id = match params.get("agent_id") {
                 Some(id) => id.clone(),
                 None => return Response::error("agent_id required", 400),
@@ -230,8 +234,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let id = generate_id()?;
             let r2_key = format!("checkpoints/{}/{}", body.thread_id, id);
 
-            let state_bytes = serde_json::to_vec(&body.state)
-                .map_err(|e| Error::RustError(e.to_string()))?;
+            let state_bytes =
+                serde_json::to_vec(&body.state).map_err(|e| Error::RustError(e.to_string()))?;
             let size = storage::put_blob(&bucket, &r2_key, state_bytes).await? as i64;
             db::create_checkpoint(&d1, &id, &body, &r2_key, size).await?;
 
@@ -241,14 +245,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 state_r2_key: r2_key,
             })
         })
-        .get_async("/v1/checkpoints/threads/:thread_id", |_req, ctx| async move {
-            let thread_id = ctx.param("thread_id").unwrap().to_string();
-            let d1 = ctx.env.d1("DB")?;
-            match db::get_latest_checkpoint(&d1, &thread_id).await? {
-                Some(row) => Response::from_json(&row.into_checkpoint()),
-                None => Response::error("no checkpoint found", 404),
-            }
-        })
+        .get_async(
+            "/v1/checkpoints/threads/:thread_id",
+            |_req, ctx| async move {
+                let thread_id = ctx.param("thread_id").unwrap().to_string();
+                let d1 = ctx.env.d1("DB")?;
+                match db::get_latest_checkpoint(&d1, &thread_id).await? {
+                    Some(row) => Response::from_json(&row.into_checkpoint()),
+                    None => Response::error("no checkpoint found", 404),
+                }
+            },
+        )
         .get_async("/v1/checkpoints/:id", |_req, ctx| async move {
             let id = ctx.param("id").unwrap().to_string();
             let d1 = ctx.env.d1("DB")?;

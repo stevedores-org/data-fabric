@@ -100,10 +100,7 @@ pub async fn claim_next_task(
     // Fetch full task
     let task: Option<TaskRow> = db
         .prepare("SELECT * FROM tasks WHERE id = ?1 AND agent_id = ?2")
-        .bind(&[
-            JsValue::from_str(&task_id),
-            JsValue::from_str(agent_id),
-        ])?
+        .bind(&[JsValue::from_str(&task_id), JsValue::from_str(agent_id)])?
         .first(None)
         .await?;
 
@@ -195,11 +192,7 @@ pub async fn fail_task(db: &D1Database, task_id: &str, error: &str) -> Result<St
 
 // ── Agents ──────────────────────────────────────────────────────
 
-pub async fn register_agent(
-    db: &D1Database,
-    id: &str,
-    body: &models::RegisterAgent,
-) -> Result<()> {
+pub async fn register_agent(db: &D1Database, id: &str, body: &models::RegisterAgent) -> Result<()> {
     let now = now_iso();
     let caps_json = serde_json::to_string(&body.capabilities).unwrap();
 
@@ -267,12 +260,10 @@ pub async fn get_latest_checkpoint(
     db: &D1Database,
     thread_id: &str,
 ) -> Result<Option<CheckpointRow>> {
-    db.prepare(
-        "SELECT * FROM checkpoints WHERE thread_id = ?1 ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(&[JsValue::from_str(thread_id)])?
-    .first(None)
-    .await
+    db.prepare("SELECT * FROM checkpoints WHERE thread_id = ?1 ORDER BY created_at DESC LIMIT 1")
+        .bind(&[JsValue::from_str(thread_id)])?
+        .first(None)
+        .await
 }
 
 pub async fn get_checkpoint_by_id(db: &D1Database, id: &str) -> Result<Option<CheckpointRow>> {
