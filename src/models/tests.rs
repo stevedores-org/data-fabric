@@ -334,3 +334,116 @@ fn policy_check_response() {
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["decision"], "allow");
 }
+
+// ── M1-M3: MCP Task Queue ──────────────────────────────────────
+
+#[test]
+fn create_mcp_task_round_trip() {
+    let input = r#"{"job_id":"j1","task_type":"build","priority":5,"params":{"repo":"test"}}"#;
+    let parsed: CreateMcpTask = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.job_id, "j1");
+    assert_eq!(parsed.task_type, "build");
+    assert_eq!(parsed.priority, 5);
+    let json = serde_json::to_string(&parsed).unwrap();
+    let reparsed: CreateMcpTask = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, reparsed);
+}
+
+#[test]
+fn create_mcp_task_minimal() {
+    let input = r#"{"job_id":"j1","task_type":"build"}"#;
+    let parsed: CreateMcpTask = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.priority, 0);
+    assert!(parsed.params.is_none());
+    assert!(parsed.graph_ref.is_none());
+}
+
+#[test]
+fn mcp_task_created_serializes() {
+    let tc = McpTaskCreated {
+        id: "abc".into(),
+        status: "pending".into(),
+    };
+    let json = serde_json::to_value(&tc).unwrap();
+    assert_eq!(json["status"], "pending");
+}
+
+#[test]
+fn task_complete_request_round_trip() {
+    let input = r#"{"result":{"output":"done"}}"#;
+    let parsed: TaskCompleteRequest = serde_json::from_str(input).unwrap();
+    assert!(parsed.result.is_some());
+}
+
+#[test]
+fn task_fail_request_round_trip() {
+    let input = r#"{"error":"timeout"}"#;
+    let parsed: TaskFailRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.error, "timeout");
+}
+
+// ── M1: Agents ──────────────────────────────────────────────────
+
+#[test]
+fn register_agent_round_trip() {
+    let input = r#"{"name":"build-agent","capabilities":["build","test"],"endpoint":"https://agent.example.com"}"#;
+    let parsed: RegisterAgent = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.name, "build-agent");
+    assert_eq!(parsed.capabilities, vec!["build", "test"]);
+    assert_eq!(
+        parsed.endpoint.as_deref(),
+        Some("https://agent.example.com")
+    );
+}
+
+// ── M2: Checkpoints ────────────────────────────────────────────
+
+#[test]
+fn create_checkpoint_round_trip() {
+    let input = r#"{"thread_id":"t1","node_id":"n1","state":{"messages":[]}}"#;
+    let parsed: CreateCheckpoint = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.thread_id, "t1");
+    assert_eq!(parsed.node_id, "n1");
+    assert!(parsed.parent_id.is_none());
+}
+
+#[test]
+fn checkpoint_created_serializes() {
+    let cc = CheckpointCreated {
+        id: "cp1".into(),
+        thread_id: "t1".into(),
+        state_r2_key: "checkpoints/t1/cp1".into(),
+    };
+    let json = serde_json::to_value(&cc).unwrap();
+    assert_eq!(json["thread_id"], "t1");
+}
+
+// ── M3: Graph Events ───────────────────────────────────────────
+
+#[test]
+fn graph_event_batch_round_trip() {
+    let input = r#"{"events":[{"event_type":"node.start","node_id":"n1","thread_id":"t1"}]}"#;
+    let parsed: GraphEventBatch = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.events.len(), 1);
+    assert_eq!(parsed.events[0].event_type, "node.start");
+}
+
+#[test]
+fn graph_event_ack_serializes() {
+    let ack = GraphEventAck {
+        accepted: 5,
+        queued: true,
+    };
+    let json = serde_json::to_value(&ack).unwrap();
+    assert_eq!(json["accepted"], 5);
+    assert_eq!(json["queued"], true);
+}
+
+#[test]
+fn error_response_serializes() {
+    let err = ErrorResponse {
+        error: "something went wrong".into(),
+    };
+    let json = serde_json::to_value(&err).unwrap();
+    assert_eq!(json["error"], "something went wrong");
+}
