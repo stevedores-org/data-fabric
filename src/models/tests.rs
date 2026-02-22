@@ -447,3 +447,43 @@ fn error_response_serializes() {
     let json = serde_json::to_value(&err).unwrap();
     assert_eq!(json["error"], "something went wrong");
 }
+
+// ── WS3 Trace / Provenance (#43) ──────────────────────────────
+
+#[test]
+fn trace_event_round_trip() {
+    let evt = TraceEvent {
+        id: "ev1".into(),
+        run_id: Some("r1".into()),
+        thread_id: Some("t1".into()),
+        event_type: "node.start".into(),
+        node_id: Some("n1".into()),
+        actor: Some("agent-1".into()),
+        payload: Some(serde_json::json!({"step": 1})),
+        created_at: "2026-02-22T12:00:00Z".into(),
+    };
+    let json = serde_json::to_value(&evt).unwrap();
+    assert_eq!(json["event_type"], "node.start");
+    let parsed: TraceEvent = serde_json::from_value(json).unwrap();
+    assert_eq!(parsed.id, evt.id);
+}
+
+#[test]
+fn trace_response_serializes() {
+    let resp = TraceResponse {
+        run_id: "r1".into(),
+        events: vec![TraceEvent {
+            id: "ev1".into(),
+            run_id: None,
+            thread_id: None,
+            event_type: "run.start".into(),
+            node_id: None,
+            actor: None,
+            payload: None,
+            created_at: "2026-02-22T12:00:00Z".into(),
+        }],
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["run_id"], "r1");
+    assert_eq!(json["events"].as_array().unwrap().len(), 1);
+}

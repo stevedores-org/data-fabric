@@ -279,6 +279,25 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Response::error("checkpoint not found", 404)
             }
         })
+        // ── Traces / Provenance (WS3: issue #43) ──────────────
+        .get_async("/v1/traces/:run_id", |_req, ctx| async move {
+            let run_id = match ctx.param("run_id") {
+                Some(r) => r.to_string(),
+                None => return Response::error("missing run_id", 400),
+            };
+            let d1 = ctx.env.d1("DB")?;
+            let events = db::get_trace_for_run(&d1, &run_id).await?;
+            Response::from_json(&models::TraceResponse { run_id, events })
+        })
+        .get_async("/v1/traces/:run_id/lineage", |_req, ctx| async move {
+            let run_id = match ctx.param("run_id") {
+                Some(r) => r.to_string(),
+                None => return Response::error("missing run_id", 400),
+            };
+            let d1 = ctx.env.d1("DB")?;
+            let events = db::get_trace_for_run(&d1, &run_id).await?;
+            Response::from_json(&models::TraceResponse { run_id, events })
+        })
         // ── Graph Events (M3) ─────────────────────────────────
         .post_async("/v1/graph-events", |mut req, ctx| async move {
             let body: models::GraphEventBatch = req.json().await?;
@@ -294,6 +313,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let count = events.len();
             db::insert_events_bronze(&d1, &events).await?;
+            db::insert_events_silver(&d1, &events, &now).await?;
 
             Response::from_json(&models::GraphEventAck {
                 accepted: count,

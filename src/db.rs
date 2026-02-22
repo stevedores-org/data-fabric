@@ -328,6 +328,60 @@ pub async fn insert_events_bronze(
     Ok(())
 }
 
+/// Fetch trace slice for a run (ordered by created_at). WS3 provenance.
+pub async fn get_trace_for_run(db: &D1Database, run_id: &str) -> Result<Vec<models::TraceEvent>> {
+    let result: D1Result = db
+        .prepare(
+            "SELECT id, run_id, thread_id, event_type, node_id, actor, payload, created_at
+             FROM events_bronze WHERE run_id = ?1 ORDER BY created_at ASC",
+        )
+        .bind(&[JsValue::from_str(run_id)])?
+        .all()
+        .await?;
+
+    let rows: Vec<TraceEventRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_trace_event()).collect())
+}
+
+/// Insert into silver layer (sync promotion). Normalized at = now, entity_refs = NULL.
+pub async fn insert_events_silver(
+    db: &D1Database,
+    events: &[(String, &models::GraphEvent, String)],
+    normalized_at: &str,
+) -> Result<()> {
+    let mut stmts = Vec::with_capacity(events.len());
+    for (id, evt, created_at) in events {
+        let payload_json = evt
+            .payload
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap());
+
+        let stmt = db
+            .prepare(
+                "INSERT INTO events_silver (id, run_id, thread_id, event_type, node_id, actor, payload, created_at, normalized_at, entity_refs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+            )
+            .bind(&[
+                JsValue::from_str(id),
+                opt_str(&evt.run_id),
+                opt_str(&evt.thread_id),
+                JsValue::from_str(&evt.event_type),
+                opt_str(&evt.node_id),
+                opt_str(&evt.actor),
+                match &payload_json {
+                    Some(s) => JsValue::from_str(s),
+                    None => JsValue::NULL,
+                },
+                JsValue::from_str(created_at),
+                JsValue::from_str(normalized_at),
+            ])?;
+        stmts.push(stmt);
+    }
+
+    db.batch(stmts).await?;
+    Ok(())
+}
+
 // ── Internal row types ──────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -405,6 +459,33 @@ impl AgentRow {
             last_heartbeat: self.last_heartbeat,
             status: self.status,
             metadata: self.metadata.and_then(|s| serde_json::from_str(&s).ok()),
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TraceEventRow {
+    id: String,
+    run_id: Option<String>,
+    thread_id: Option<String>,
+    event_type: String,
+    node_id: Option<String>,
+    actor: Option<String>,
+    payload: Option<String>,
+    created_at: String,
+}
+
+impl TraceEventRow {
+    fn into_trace_event(self) -> models::TraceEvent {
+        models::TraceEvent {
+            id: self.id,
+            run_id: self.run_id,
+            thread_id: self.thread_id,
+            event_type: self.event_type,
+            node_id: self.node_id,
+            actor: self.actor,
+            payload: self.payload.and_then(|s| serde_json::from_str(&s).ok()),
+            created_at: self.created_at,
         }
     }
 }
