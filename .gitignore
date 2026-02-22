@@ -2,3 +2,4 @@
 /build
 Cargo.lock
 .wrangler
+node_modules

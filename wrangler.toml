@@ -1,24 +1,39 @@
 name = "data-fabric-worker"
-main = "src/index.ts"
+main = "build/worker/shim.mjs"
 compatibility_date = "2026-02-22"
 account_id = "f1be33af27cf878e2e81cb29a0d886f7"
 workers_dev = true
+
+[build]
+command = "cargo install worker-build && worker-build --release"
 
 [vars]
 APP_ENV = "dev"
 SERVICE_NAME = "data-fabric"
 
-# Optional resources to add when needed:
-# [[kv_namespaces]]
-# binding = "CACHE"
-# id = "<kv-namespace-id>"
-# preview_id = "<kv-preview-namespace-id>"
-#
+# ── D1: structured metadata, lineage, domain entities ───────────
 # [[d1_databases]]
 # binding = "DB"
 # database_name = "data-fabric"
 # database_id = "<d1-database-id>"
-#
+
+# ── R2: artifact / blob store ────────────────────────────────────
 # [[r2_buckets]]
 # binding = "ARTIFACTS"
 # bucket_name = "data-fabric-artifacts"
+
+# ── KV: policies, config, fast context lookups ───────────────────
+# [[kv_namespaces]]
+# binding = "KV"
+# id = "<kv-namespace-id>"
+# preview_id = "<kv-preview-namespace-id>"
+
+# ── Queues: provenance event bus ─────────────────────────────────
+# [[queues.producers]]
+# binding = "EVENTS"
+# queue = "data-fabric-events"
+#
+# [[queues.consumers]]
+# queue = "data-fabric-events"
+# max_batch_size = 50
+# max_batch_timeout = 5
