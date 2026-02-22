@@ -31,6 +31,13 @@
 - replay slices and trace exports
 - risk-tiered controls and approvals
 
+## Phase WS4: Autonomous Guardrails
+- risk taxonomy and explicit high-risk escalation
+- configurable policy rules (KV + versioned definitions)
+- decision persistence and HITL escalation queue
+- per-actor action rate limiting
+- TTL retention cleanup for events, artifacts, checkpoints, and policy decisions
+
 ## Phase WS5: Retrieval and Memory Federation
 - memory indexing and ranked retrieval endpoints
 - context packing with token-budget constraints

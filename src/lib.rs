@@ -3,6 +3,7 @@ use worker::*;
 
 mod db;
 mod models;
+mod policy;
 mod storage;
 
 #[derive(Serialize)]
@@ -221,21 +222,21 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => Response::error("not found", 404),
             }
         })
-        // ── Policy Check (WS4, engine-backed) ──────────────────
+        // ── Policy & Governance (WS4) ──────────────────────────
         .post_async("/v1/policies/check", |mut req, ctx| async move {
             let body: models::PolicyCheckRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-            let id = generate_id()?;
-            let (decision, reason, risk_level, matched_rule) =
-                db::evaluate_policy(&d1, &body).await?;
-            db::record_policy_check(&d1, &id, &body, &decision, &reason).await?;
+            let evaluated = policy::evaluate_policy(&ctx.env, &d1, &body).await?;
             Response::from_json(&models::PolicyCheckResponse {
-                id: id.clone(),
+                id: evaluated.decision_id.clone(),
                 action: body.action,
-                decision,
-                reason,
-                risk_level,
-                matched_rule,
+                decision: evaluated.decision,
+                reason: evaluated.reason,
+                risk_level: Some(format!("{:?}", evaluated.risk_level).to_ascii_lowercase()),
+                policy_version: Some(evaluated.policy_version),
+                matched_rule: evaluated.matched_rule,
+                escalation_id: evaluated.escalation_id,
+                rate_limited: Some(evaluated.rate_limited),
             })
         })
         // ── Policy Rules CRUD (WS4) ─────────────────────────────
@@ -339,6 +340,38 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let decisions = db::list_policy_decisions(&d1, action, actor, decision, limit).await?;
             let responses: Vec<_> = decisions.into_iter().map(|d| d.into_response()).collect();
             Response::from_json(&serde_json::json!({ "decisions": responses }))
+        })
+        // ── Policy Definitions & Retention (WS4) ────────────────
+        .put_async("/v1/policies/definitions/:version", |mut req, ctx| async move {
+            let version = match ctx.param("version") {
+                Some(v) => v.to_string(),
+                None => return Response::error("missing policy version", 400),
+            };
+            let body: models::PutPolicyDefinitionRequest = req.json().await?;
+            let bucket = ctx.env.bucket("ARTIFACTS")?;
+            let resp = policy::put_policy_definition(&ctx.env, &bucket, &version, &body).await?;
+            Response::from_json(&resp)
+        })
+        .post_async("/v1/policies/activate/:version", |_req, ctx| async move {
+            let version = match ctx.param("version") {
+                Some(v) => v.to_string(),
+                None => return Response::error("missing policy version", 400),
+            };
+            match policy::activate_policy_version(&ctx.env, &version).await {
+                Ok(resp) => Response::from_json(&resp),
+                Err(err) => Response::error(format!("activation failed: {err}"), 500),
+            }
+        })
+        .get_async("/v1/policies/active", |_req, ctx| async move {
+            let resp = policy::active_policy_version(&ctx.env).await?;
+            Response::from_json(&resp)
+        })
+        .post_async("/v1/retention/run", |mut req, ctx| async move {
+            let body: models::RetentionRunRequest = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            let bucket = ctx.env.bucket("ARTIFACTS")?;
+            let deleted = db::run_retention_cleanup(&d1, &bucket, &body).await?;
+            Response::from_json(&deleted)
         })
         // ── Agent Tasks (M1) ──────────────────────────────────
         .post_async("/v1/tasks", |mut req, ctx| async move {

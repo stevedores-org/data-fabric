@@ -35,10 +35,10 @@ binding = "ARTIFACTS"
 bucket_name = "data-fabric-artifacts"
 
 # ── KV: policies, config, fast context lookups ───────────────────
-# [[kv_namespaces]]
-# binding = "KV"
-# id = "<kv-namespace-id>"
-# preview_id = "<kv-preview-namespace-id>"
+[[kv_namespaces]]
+binding = "POLICY_KV"
+id = "placeholder-provision-with-wrangler-kv-namespace-create"
+preview_id = "placeholder-provision-with-wrangler-kv-namespace-create"
 
 # ── Queues: provenance event bus, enrichment consumer ─────────────
 # Create queue: wrangler queues create data-fabric-events

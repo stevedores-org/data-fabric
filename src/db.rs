@@ -1,4 +1,5 @@
 use crate::models;
+use crate::policy::RiskLevel;
 use std::collections::{HashMap, HashSet};
 use wasm_bindgen::JsValue;
 use worker::*;
@@ -1003,29 +1004,86 @@ pub async fn ingest_event(db: &D1Database, id: &str, body: &models::IngestEvent)
     Ok(())
 }
 
-// ── WS2 Domain: Policy Decisions ────────────────────────────────
+// ── WS4 Domain: Policy Decisions ────────────────────────────────
 
-pub async fn record_policy_check(
+pub async fn record_policy_check_detailed(
     db: &D1Database,
     id: &str,
     body: &models::PolicyCheckRequest,
     decision: &str,
     reason: &str,
+    risk: RiskLevel,
+    policy_version: &str,
+    matched_rule: Option<&str>,
+    escalation_id: Option<&str>,
+    rate_limited: bool,
 ) -> Result<()> {
     let now = now_iso();
+    let mut merged = body.context.clone().unwrap_or_else(|| serde_json::json!({}));
+    if !merged.is_object() {
+        merged = serde_json::json!({ "context": merged });
+    }
+    if let Some(obj) = merged.as_object_mut() {
+        obj.insert(
+            "risk_level".into(),
+            serde_json::json!(format!("{:?}", risk).to_ascii_lowercase()),
+        );
+        obj.insert("policy_version".into(), serde_json::json!(policy_version));
+        obj.insert("matched_rule".into(), serde_json::json!(matched_rule));
+        obj.insert("escalation_id".into(), serde_json::json!(escalation_id));
+        obj.insert("rate_limited".into(), serde_json::json!(rate_limited));
+    }
+
     db.prepare(
-        "INSERT INTO policy_decisions (id, action, actor, resource, decision, reason, created_at, context)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO policy_decisions (id, run_id, action, actor, resource, decision, reason, created_at, context)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )
     .bind(&[
         JsValue::from_str(id),
+        opt_str(&body.run_id),
         JsValue::from_str(&body.action),
         JsValue::from_str(&body.actor),
         opt_str(&body.resource),
         JsValue::from_str(decision),
         JsValue::from_str(reason),
         JsValue::from_str(&now),
-        opt_json(&body.context),
+        JsValue::from_str(&serde_json::to_string(&merged).unwrap_or_else(|_| "{}".into())),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn create_policy_escalation(
+    db: &D1Database,
+    escalation_id: &str,
+    decision_id: &str,
+    action: &str,
+    actor: &str,
+    resource: Option<&str>,
+    risk: RiskLevel,
+    context: Option<&serde_json::Value>,
+) -> Result<()> {
+    let now = now_iso();
+    let payload = context
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
+        .unwrap_or_else(|| "{}".into());
+    db.prepare(
+        "INSERT INTO policy_escalations (id, decision_id, action, actor, resource, risk_level, status, context, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+    )
+    .bind(&[
+        JsValue::from_str(escalation_id),
+        JsValue::from_str(decision_id),
+        JsValue::from_str(action),
+        JsValue::from_str(actor),
+        match resource {
+            Some(r) => JsValue::from_str(r),
+            None => JsValue::NULL,
+        },
+        JsValue::from_str(&format!("{:?}", risk).to_ascii_lowercase()),
+        JsValue::from_str(&payload),
+        JsValue::from_str(&now),
     ])?
     .run()
     .await?;
@@ -1054,7 +1112,6 @@ pub async fn create_policy_rule(
         JsValue::from_str(&body.verdict),
         JsValue::from_str(&body.reason),
         JsValue::from(body.priority),
-        JsValue::from_str(&now),
         JsValue::from_str(&now),
     ])?
     .run()
@@ -1550,6 +1607,128 @@ fn random_hex_id() -> Result<String> {
     Ok(hex::encode(buf))
 }
 
+pub async fn check_and_increment_rate_limit(
+    db: &D1Database,
+    actor: &str,
+    action_class: &str,
+    window_seconds: i64,
+    max_requests: i64,
+) -> Result<bool> {
+    let now = js_sys::Date::now() as i64 / 1000;
+    let window_start = now - (now % window_seconds.max(1));
+    let counter_id = format!("{actor}|{action_class}|{window_start}|{window_seconds}");
+    let now_iso = now_iso();
+
+    db.prepare(
+        "INSERT INTO policy_rate_limit_counters (
+            id, actor, action_class, window_start_epoch, window_seconds, count, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
+         ON CONFLICT(id) DO UPDATE SET
+            count = count + 1,
+            updated_at = excluded.updated_at",
+    )
+    .bind(&[
+        JsValue::from_str(&counter_id),
+        JsValue::from_str(actor),
+        JsValue::from_str(action_class),
+        JsValue::from(window_start),
+        JsValue::from(window_seconds),
+        JsValue::from_str(&now_iso),
+    ])?
+    .run()
+    .await?;
+
+    let row: Option<RateCounterRow> = db
+        .prepare("SELECT count FROM policy_rate_limit_counters WHERE id = ?1")
+        .bind(&[JsValue::from_str(&counter_id)])?
+        .first(None)
+        .await?;
+
+    let current = row.map(|r| r.count).unwrap_or(0);
+    Ok(current > max_requests.max(1))
+}
+
+pub async fn run_retention_cleanup(
+    db: &D1Database,
+    bucket: &Bucket,
+    req: &models::RetentionRunRequest,
+) -> Result<models::RetentionRunResponse> {
+    let events_cutoff = days_ago_expr(req.events_ttl_days.max(1));
+    let policy_cutoff = days_ago_expr(req.policy_ttl_days.max(1));
+    let checkpoints_cutoff = days_ago_expr(req.checkpoints_ttl_days.max(1));
+    let artifacts_cutoff = days_ago_expr(req.artifacts_ttl_days.max(1));
+
+    let events_deleted = delete_older_than(db, "events_bronze", "created_at", &events_cutoff).await?;
+    let policy_decisions_deleted =
+        delete_older_than(db, "policy_decisions", "created_at", &policy_cutoff).await?;
+
+    let checkpoint_keys = list_old_keys(db, "checkpoints", "state_r2_key", "created_at", &checkpoints_cutoff).await?;
+    let checkpoints_deleted = delete_older_than(db, "checkpoints", "created_at", &checkpoints_cutoff).await?;
+    for key in checkpoint_keys {
+        let _ = bucket.delete(&key).await;
+    }
+
+    let artifact_keys = list_old_keys(db, "artifacts", "key", "created_at", &artifacts_cutoff).await?;
+    let artifacts_deleted = delete_older_than(db, "artifacts", "created_at", &artifacts_cutoff).await?;
+    for key in artifact_keys {
+        let _ = bucket.delete(&key).await;
+    }
+
+    Ok(models::RetentionRunResponse {
+        events_deleted,
+        artifacts_deleted,
+        checkpoints_deleted,
+        policy_decisions_deleted,
+    })
+}
+
+async fn delete_older_than(
+    db: &D1Database,
+    table: &str,
+    time_col: &str,
+    cutoff: &str,
+) -> Result<usize> {
+    let count_sql = format!(
+        "SELECT count(*) as count FROM {table} WHERE {time_col} < datetime('now', ?1)"
+    );
+    let count_row: Option<CountRow> = db
+        .prepare(&count_sql)
+        .bind(&[JsValue::from_str(cutoff)])?
+        .first(None)
+        .await?;
+    let count = count_row.map(|r| r.count as usize).unwrap_or(0);
+
+    let delete_sql = format!("DELETE FROM {table} WHERE {time_col} < datetime('now', ?1)");
+    db.prepare(&delete_sql)
+        .bind(&[JsValue::from_str(cutoff)])?
+        .run()
+        .await?;
+    Ok(count)
+}
+
+async fn list_old_keys(
+    db: &D1Database,
+    table: &str,
+    key_col: &str,
+    time_col: &str,
+    cutoff: &str,
+) -> Result<Vec<String>> {
+    let sql = format!(
+        "SELECT {key_col} as key FROM {table} WHERE {time_col} < datetime('now', ?1)"
+    );
+    let result: D1Result = db
+        .prepare(&sql)
+        .bind(&[JsValue::from_str(cutoff)])?
+        .all()
+        .await?;
+    let rows: Vec<KeyRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.key).collect())
+}
+
+fn days_ago_expr(days: i64) -> String {
+    format!("-{} days", days.max(1))
+}
+
 // ── Internal row types ──────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -1561,6 +1740,21 @@ struct TaskIdRow {
 struct RetryRow {
     retry_count: i32,
     max_retries: i32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CountRow {
+    count: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct KeyRow {
+    key: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RateCounterRow {
+    count: i64,
 }
 
 #[derive(Debug, serde::Deserialize)]
