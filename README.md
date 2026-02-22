@@ -20,3 +20,4 @@ cargo test
 ## Docs
 - `docs/ARCHITECTURE.md`
 - `docs/MISSION_PLAN.md`
+- `docs/CONTRIBUTING_WORKFLOW.md`
