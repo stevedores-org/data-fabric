@@ -18,11 +18,11 @@ mod mcp;
 mod memory;
 
 pub use entities::*;
+pub use memory::*;
 pub use orchestration::*;
 #[allow(unused_imports)]
 pub use relationships::*;
 pub use requests::*;
-pub use memory::*;
 
 #[cfg(test)]
 mod tests;

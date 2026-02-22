@@ -762,7 +762,7 @@ pub async fn retrieve_memory(
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let top_k = req.top_k.max(1).min(50);
+    let top_k = req.top_k.clamp(1, 50);
     let selected = candidates.into_iter().take(top_k).collect::<Vec<_>>();
 
     let elapsed = (js_sys::Date::now() - start).round() as i64;
@@ -837,7 +837,7 @@ pub async fn run_memory_gc(
     req: &models::MemoryGcRequest,
 ) -> Result<models::MemoryGcResponse> {
     let now = now_iso();
-    let limit = req.limit.max(1).min(10_000) as i32;
+    let limit = req.limit.clamp(1, 10_000) as i32;
 
     let rows: Vec<MemoryIdRow> = db
         .prepare(
@@ -1121,7 +1121,11 @@ fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
     }
     let inter = a.intersection(b).count() as f64;
     let union = a.union(b).count() as f64;
-    if union == 0.0 { 0.0 } else { inter / union }
+    if union == 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
 }
 
 fn latest_conflict_versions(rows: &[MemoryIndexRow]) -> HashMap<String, i64> {
@@ -1178,6 +1182,7 @@ async fn touch_memory_items(db: &D1Database, items: &[models::MemoryCandidate]) 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn log_retrieval_query(
     db: &D1Database,
     query_id: &str,
