@@ -10,8 +10,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  local-ci:
-    name: local-ci (fmt, clippy, check, test)
+  cargo-ci:
+    name: cargo-ci (fmt, clippy, check, test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
