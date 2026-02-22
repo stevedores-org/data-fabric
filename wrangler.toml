@@ -4,6 +4,11 @@ compatibility_date = "2026-02-22"
 account_id = "f1be33af27cf878e2e81cb29a0d886f7"
 workers_dev = true
 
+# ── Custom domain ────────────────────────────────────────────────
+[[routes]]
+pattern = "data-fabric.stevedores.org/*"
+zone_name = "stevedores.org"
+
 [build]
 command = "worker-build --release"
 
