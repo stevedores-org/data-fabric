@@ -327,12 +327,96 @@ fn event_ack_response() {
 #[test]
 fn policy_check_response() {
     let resp = PolicyCheckResponse {
+        id: "pd1".into(),
         action: "deploy".into(),
         decision: "allow".into(),
         reason: "no restrictions".into(),
+        risk_level: "write".into(),
+        matched_rule: Some("rule1".into()),
     };
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["decision"], "allow");
+    assert_eq!(json["risk_level"], "write");
+    assert_eq!(json["matched_rule"], "rule1");
+}
+
+// ── WS4 Policy Rules ────────────────────────────────────────────
+
+#[test]
+fn create_policy_rule_defaults() {
+    let input = r#"{"name":"test","verdict":"allow"}"#;
+    let parsed: CreatePolicyRule = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.action_pattern, "*");
+    assert_eq!(parsed.resource_pattern, "*");
+    assert_eq!(parsed.actor_pattern, "*");
+    assert_eq!(parsed.risk_level, "read");
+    assert_eq!(parsed.priority, 0);
+}
+
+#[test]
+fn create_policy_rule_full() {
+    let input = r#"{
+        "name": "block prod deploys",
+        "action_pattern": "deploy",
+        "resource_pattern": "prod",
+        "actor_pattern": "*",
+        "risk_level": "irreversible",
+        "verdict": "deny",
+        "reason": "prod deploys require approval",
+        "priority": 100
+    }"#;
+    let parsed: CreatePolicyRule = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.name, "block prod deploys");
+    assert_eq!(parsed.verdict, "deny");
+    assert_eq!(parsed.priority, 100);
+}
+
+#[test]
+fn update_policy_rule_partial() {
+    let input = r#"{"verdict":"deny","enabled":false}"#;
+    let parsed: UpdatePolicyRule = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.verdict.as_deref(), Some("deny"));
+    assert_eq!(parsed.enabled, Some(false));
+    assert!(parsed.name.is_none());
+    assert!(parsed.action_pattern.is_none());
+}
+
+#[test]
+fn policy_rule_response_round_trip() {
+    let resp = PolicyRuleResponse {
+        id: "r1".into(),
+        name: "test rule".into(),
+        action_pattern: "deploy:*".into(),
+        resource_pattern: "prod".into(),
+        actor_pattern: "*".into(),
+        risk_level: "destructive".into(),
+        verdict: "escalate".into(),
+        reason: "needs approval".into(),
+        priority: 10,
+        enabled: true,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: PolicyRuleResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
+
+#[test]
+fn policy_decision_response_round_trip() {
+    let resp = PolicyDecisionResponse {
+        id: "d1".into(),
+        action: "deploy".into(),
+        actor: "agent-1".into(),
+        resource: Some("staging".into()),
+        decision: "allow".into(),
+        reason: "matched rule".into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        context: Some(serde_json::json!({"env": "staging"})),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: PolicyDecisionResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
 }
 
 // ── Orchestration types (M1-M3) ────────────────────────────────
