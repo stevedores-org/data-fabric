@@ -31,7 +31,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let body: models::CreateRun = req.json().await?;
             let _ = (&body.trigger, &body.metadata);
             Response::from_json(&models::RunCreated {
-                id: generate_id(),
+                id: generate_id()?,
                 status: "created".into(),
                 repo: body.repo,
             })
@@ -44,7 +44,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let body: models::ProvenanceEvent = req.json().await?;
             let _ = (&body.run_id, &body.actor, &body.payload);
             Response::from_json(&models::EventAck {
-                id: generate_id(),
+                id: generate_id()?,
                 event_type: body.event_type,
                 accepted: true,
             })
@@ -77,8 +77,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .await
 }
 
-fn generate_id() -> String {
+fn generate_id() -> Result<String> {
     let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).unwrap();
-    hex::encode(buf)
+    getrandom::getrandom(&mut buf).map_err(|e| Error::RustError(e.to_string()))?;
+    Ok(hex::encode(buf))
 }
