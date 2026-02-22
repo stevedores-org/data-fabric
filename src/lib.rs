@@ -29,6 +29,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // runs (WS2 domain entity)
         .post_async("/v1/runs", |mut req, _ctx| async move {
             let body: models::CreateRun = req.json().await?;
+            let _ = (&body.trigger, &body.metadata);
             Response::from_json(&models::RunCreated {
                 id: generate_id(),
                 status: "created".into(),
@@ -41,6 +42,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // provenance events (WS3)
         .post_async("/v1/events", |mut req, _ctx| async move {
             let body: models::ProvenanceEvent = req.json().await?;
+            let _ = (&body.run_id, &body.actor, &body.payload);
             Response::from_json(&models::EventAck {
                 id: generate_id(),
                 event_type: body.event_type,
@@ -64,6 +66,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // policy check (WS4)
         .post_async("/v1/policies/check", |mut req, _ctx| async move {
             let body: models::PolicyCheckRequest = req.json().await?;
+            let _ = (&body.actor, &body.resource, &body.context);
             Response::from_json(&models::PolicyCheckResponse {
                 action: body.action,
                 decision: "allow".into(),
