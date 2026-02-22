@@ -2280,7 +2280,7 @@ pub async fn get_provenance_chain(
 
 /// Extract implicit causality edges from a GraphEvent and insert them.
 pub async fn insert_causality_from_event(db: &D1Database, evt: &models::GraphEvent) -> Result<()> {
-    // run → task causality
+    // run → node causality (original)
     if let (Some(ref run_id), Some(ref node_id)) = (&evt.run_id, &evt.node_id) {
         insert_relationship(
             db,
@@ -2292,6 +2292,70 @@ pub async fn insert_causality_from_event(db: &D1Database, evt: &models::GraphEve
             Some("executed"),
         )
         .await?;
+    }
+
+    // Extract richer causality from payload fields
+    if let Some(ref payload) = evt.payload {
+        let run_id = evt.run_id.as_deref();
+        let plan_id = payload.get("plan_id").and_then(|v| v.as_str());
+        let task_id = payload.get("task_id").and_then(|v| v.as_str());
+        let tool_call_id = payload.get("tool_call_id").and_then(|v| v.as_str());
+        let artifact_id = payload.get("artifact_id").and_then(|v| v.as_str());
+
+        // run → plan
+        if let (Some(rid), Some(pid)) = (run_id, plan_id) {
+            insert_relationship(db, "causality", "run", rid, "plan", pid, Some("planned")).await?;
+        }
+        // plan → task
+        if let (Some(pid), Some(tid)) = (plan_id, task_id) {
+            insert_relationship(db, "causality", "plan", pid, "task", tid, Some("scheduled"))
+                .await?;
+        }
+        // task → tool_call
+        if let (Some(tid), Some(tcid)) = (task_id, tool_call_id) {
+            insert_relationship(
+                db,
+                "causality",
+                "task",
+                tid,
+                "tool_call",
+                tcid,
+                Some("invoked"),
+            )
+            .await?;
+        }
+        // tool_call → artifact
+        if let (Some(tcid), Some(aid)) = (tool_call_id, artifact_id) {
+            insert_relationship(
+                db,
+                "causality",
+                "tool_call",
+                tcid,
+                "artifact",
+                aid,
+                Some("produced"),
+            )
+            .await?;
+        }
+        // task → task dependencies
+        if let Some(depends_on) = payload.get("depends_on").and_then(|v| v.as_array()) {
+            if let Some(tid) = task_id {
+                for dep in depends_on {
+                    if let Some(dep_id) = dep.as_str() {
+                        insert_relationship(
+                            db,
+                            "dependency",
+                            "task",
+                            tid,
+                            "task",
+                            dep_id,
+                            Some("depends_on"),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2367,6 +2431,107 @@ pub async fn list_run_summaries(db: &D1Database, limit: u32) -> Result<Vec<model
         .await?;
     let rows: Vec<RunSummaryRow> = result.results()?;
     Ok(rows.into_iter().map(|r| r.into_summary()).collect())
+}
+
+// ── Gold Layer: Task Dependencies (WS3: issue #58) ──────────────
+
+pub async fn upsert_task_dependency(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+    task_id: &str,
+    depends_on_task_id: &str,
+) -> Result<()> {
+    db.prepare(
+        "INSERT OR IGNORE INTO task_dependencies (tenant_id, run_id, task_id, depends_on_task_id)
+         VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(&[
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(run_id),
+        JsValue::from_str(task_id),
+        JsValue::from_str(depends_on_task_id),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn get_task_dependencies(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+) -> Result<Vec<models::TaskDependencyEdge>> {
+    let result: D1Result = db
+        .prepare(
+            "SELECT run_id, task_id, depends_on_task_id, created_at
+             FROM task_dependencies WHERE tenant_id = ?1 AND run_id = ?2
+             ORDER BY created_at ASC",
+        )
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
+        .all()
+        .await?;
+    let rows: Vec<TaskDependencyRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_edge()).collect())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TaskDependencyRow {
+    run_id: String,
+    task_id: String,
+    depends_on_task_id: String,
+    created_at: Option<String>,
+}
+
+impl TaskDependencyRow {
+    fn into_edge(self) -> models::TaskDependencyEdge {
+        models::TaskDependencyEdge {
+            run_id: self.run_id,
+            task_id: self.task_id,
+            depends_on_task_id: self.depends_on_task_id,
+            created_at: self.created_at,
+        }
+    }
+}
+
+// ── Replay Contract Stub (WS3: issue #58) ───────────────────────
+
+pub async fn build_replay_plan(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+    from_event_id: Option<&str>,
+    to_event_id: Option<&str>,
+) -> Result<Vec<models::ReplayStep>> {
+    // Fetch the full trace slice for this run
+    let events = get_trace_for_run(db, tenant_id, run_id, TRACE_DEFAULT_LIMIT).await?;
+
+    // Find the slice boundaries
+    let start_idx = match from_event_id {
+        Some(fid) => events.iter().position(|e| e.id == fid).unwrap_or(0),
+        None => 0,
+    };
+    let end_idx = match to_event_id {
+        Some(tid) => events
+            .iter()
+            .position(|e| e.id == tid)
+            .map(|i| i + 1)
+            .unwrap_or(events.len()),
+        None => events.len(),
+    };
+
+    let slice = &events[start_idx..end_idx.min(events.len())];
+    let steps: Vec<models::ReplayStep> = slice
+        .iter()
+        .enumerate()
+        .map(|(i, evt)| models::ReplayStep {
+            sequence: i + 1,
+            event_type: evt.event_type.clone(),
+            node_id: evt.node_id.clone(),
+            actor: evt.actor.clone(),
+        })
+        .collect();
+    Ok(steps)
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -674,6 +674,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         )
         // ── Traces / Provenance (WS3: issue #43) ──────────────
         .get_async("/v1/traces/:run_id", |req, ctx| async move {
+            let started = js_sys::Date::now();
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let run_id = match ctx.param("run_id") {
                 Some(r) => r.to_string(),
@@ -689,12 +690,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if truncated {
                 events.truncate(limit as usize);
             }
-            Response::from_json(&models::TraceResponse {
+            let mut resp = Response::from_json(&models::TraceResponse {
                 run_id,
                 events,
                 total: None,
                 truncated: Some(truncated),
-            })
+            })?;
+            let dur = js_sys::Date::now() - started;
+            resp.headers_mut()
+                .set("Server-Timing", &format!("total;dur={:.1}", dur))?;
+            Ok(resp)
         })
         .get_async("/v1/traces/:run_id/lineage", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
@@ -714,6 +719,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         // ── Provenance Chain (WS3) ──────────────────────────────
         .get_async("/v1/provenance/:kind/:id", |req, ctx| async move {
+            let started = js_sys::Date::now();
             let kind = match ctx.param("kind") {
                 Some(k) => k.to_string(),
                 None => return Response::error("missing kind", 400),
@@ -741,13 +747,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .min(100);
             let d1 = ctx.env.d1("DB")?;
             let edges = db::get_provenance_chain(&d1, &kind, &id, direction, hops).await?;
-            Response::from_json(&models::ProvenanceResponse {
+            let mut resp = Response::from_json(&models::ProvenanceResponse {
                 entity_kind: kind,
                 entity_id: id,
                 direction: direction.into(),
                 hops,
                 edges,
-            })
+            })?;
+            let dur = js_sys::Date::now() - started;
+            resp.headers_mut()
+                .set("Server-Timing", &format!("total;dur={:.1}", dur))?;
+            Ok(resp)
         })
         // ── Gold Layer: Run Summaries (WS3) ─────────────────────
         .get_async("/v1/runs/:run_id/summary", |_req, ctx| async move {
@@ -759,15 +769,59 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .get_async("/v1/gold/run-summaries", |req, ctx| async move {
+            let started = js_sys::Date::now();
             let limit = parse_limit_query(req.url().ok(), "limit")
                 .unwrap_or(50)
                 .min(200);
             let d1 = ctx.env.d1("DB")?;
             let summaries = db::list_run_summaries(&d1, limit).await?;
-            Response::from_json(&serde_json::json!({ "summaries": summaries }))
+            let mut resp = Response::from_json(&serde_json::json!({ "summaries": summaries }))?;
+            let dur = js_sys::Date::now() - started;
+            resp.headers_mut()
+                .set("Server-Timing", &format!("total;dur={:.1}", dur))?;
+            Ok(resp)
+        })
+        // ── Gold Layer: Task Dependency Graph (WS3: #58) ────────
+        .get_async("/v1/gold/runs/:run_id/task-graph", |req, ctx| async move {
+            let started = js_sys::Date::now();
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let run_id = ctx.param("run_id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            let edges = db::get_task_dependencies(&d1, &tenant_ctx.tenant_id, &run_id).await?;
+            let mut resp =
+                Response::from_json(&serde_json::json!({ "run_id": run_id, "edges": edges }))?;
+            let dur = js_sys::Date::now() - started;
+            resp.headers_mut()
+                .set("Server-Timing", &format!("total;dur={:.1}", dur))?;
+            Ok(resp)
+        })
+        // ── Replay Contract Stub (WS3: #58) ─────────────────────
+        .post_async("/v1/replay/plan", |mut req, ctx| async move {
+            let started = js_sys::Date::now();
+            let body: models::ReplayPlanRequest = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let d1 = ctx.env.d1("DB")?;
+            let steps = db::build_replay_plan(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &body.run_id,
+                body.from_event_id.as_deref(),
+                body.to_event_id.as_deref(),
+            )
+            .await?;
+            let mut resp = Response::from_json(&models::ReplayPlanResponse {
+                run_id: body.run_id,
+                steps,
+                status: "stub".into(),
+            })?;
+            let dur = js_sys::Date::now() - started;
+            resp.headers_mut()
+                .set("Server-Timing", &format!("total;dur={:.1}", dur))?;
+            Ok(resp)
         })
         // ── Graph Events (M3) ─────────────────────────────────
         .post_async("/v1/graph-events", |mut req, ctx| async move {
+            let started = js_sys::Date::now();
             let body: models::GraphEventBatch = req.json().await?;
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
@@ -791,16 +845,37 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
             db::insert_events_silver(&d1, &tenant_ctx.tenant_id, &silver_events, &now).await?;
 
-            Response::from_json(&models::GraphEventAck {
+            // Best-effort enqueue with tenant context
+            if let Ok(queue) = ctx.env.queue("EVENTS") {
+                for (_id, evt, _ts) in &events {
+                    let envelope = models::QueueEnvelope {
+                        tenant_id: tenant_ctx.tenant_id.clone(),
+                        event: (*evt).clone(),
+                    };
+                    if let Err(e) = queue
+                        .send(serde_json::to_value(&envelope).unwrap_or_default())
+                        .await
+                    {
+                        worker::console_log!("[graph-events] queue send error: {}", e);
+                    }
+                }
+            }
+
+            let duration_ms = js_sys::Date::now() - started;
+            let mut resp = Response::from_json(&models::GraphEventAck {
                 accepted: count,
                 queued: true,
-            })
+                duration_ms: Some(duration_ms),
+            })?;
+            resp.headers_mut()
+                .set("Server-Timing", &format!("total;dur={:.1}", duration_ms))?;
+            Ok(resp)
         })
         .run(req, env)
         .await
 }
 
-/// Queue consumer: enriches events — silver promotion, causality edges, gold summaries.
+/// Queue consumer: enriches events — causality edges, gold summaries, task deps.
 #[event(queue)]
 pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
     let queue_name = batch.queue();
@@ -809,48 +884,66 @@ pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Conte
 
     for msg in &messages {
         let body = msg.body();
-        match serde_json::from_value::<models::GraphEvent>(body.clone()) {
-            Ok(evt) => {
-                let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
 
-                // Note: silver promotion is done synchronously in POST /v1/graph-events.
-                // The queue consumer handles only causality edges and gold layer summaries.
-
-                // Causality edges
-                if let Err(e) = db::insert_causality_from_event(&d1, &evt).await {
-                    worker::console_log!("[queue {}] causality insert error: {}", queue_name, e);
-                }
-
-                // Gold layer summary
-                if let Some(ref run_id) = evt.run_id {
-                    if let Err(e) = db::upsert_run_summary(
-                        &d1,
-                        run_id,
-                        evt.actor.as_deref(),
-                        &evt.event_type,
-                        &now,
-                    )
-                    .await
-                    {
-                        worker::console_log!(
-                            "[queue {}] run summary upsert error: {}",
-                            queue_name,
-                            e
-                        );
-                    }
-                }
-
-                msg.ack();
-            }
-            Err(e) => {
+        // Try QueueEnvelope first, fall back to bare GraphEvent for compat
+        let (tenant_id, evt) =
+            if let Ok(envelope) = serde_json::from_value::<models::QueueEnvelope>(body.clone()) {
+                (envelope.tenant_id, envelope.event)
+            } else if let Ok(evt) = serde_json::from_value::<models::GraphEvent>(body.clone()) {
+                ("default".to_string(), evt)
+            } else {
                 worker::console_log!(
-                    "[queue {}] failed to deserialize message: {}",
+                    "[queue {}] failed to deserialize message: {:?}",
                     queue_name,
-                    e
+                    body
                 );
                 msg.retry();
+                continue;
+            };
+
+        let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
+
+        // Note: silver promotion is done synchronously in POST /v1/graph-events.
+        // The queue consumer handles only causality edges and gold layer summaries.
+
+        // Causality edges
+        if let Err(e) = db::insert_causality_from_event(&d1, &evt).await {
+            worker::console_log!("[queue {}] causality insert error: {}", queue_name, e);
+        }
+
+        // Materialize task dependencies from payload.depends_on
+        if let (Some(ref run_id), Some(ref payload)) = (&evt.run_id, &evt.payload) {
+            if let Some(task_id) = payload.get("task_id").and_then(|v| v.as_str()) {
+                if let Some(deps) = payload.get("depends_on").and_then(|v| v.as_array()) {
+                    for dep in deps {
+                        if let Some(dep_id) = dep.as_str() {
+                            if let Err(e) =
+                                db::upsert_task_dependency(&d1, &tenant_id, run_id, task_id, dep_id)
+                                    .await
+                            {
+                                worker::console_log!(
+                                    "[queue {}] task dep upsert error: {}",
+                                    queue_name,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        // Gold layer summary
+        if let Some(ref run_id) = evt.run_id {
+            if let Err(e) =
+                db::upsert_run_summary(&d1, run_id, evt.actor.as_deref(), &evt.event_type, &now)
+                    .await
+            {
+                worker::console_log!("[queue {}] run summary upsert error: {}", queue_name, e);
+            }
+        }
+
+        msg.ack();
     }
     Ok(())
 }
