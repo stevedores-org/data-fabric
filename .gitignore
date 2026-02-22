@@ -1,5 +1,5 @@
 /target
 /build
-Cargo.lock
-.wrangler
+/worker/generated
+/.wrangler
 node_modules
