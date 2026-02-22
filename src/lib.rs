@@ -342,16 +342,20 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             Response::from_json(&serde_json::json!({ "decisions": responses }))
         })
         // ── Policy Definitions & Retention (WS4) ────────────────
-        .put_async("/v1/policies/definitions/:version", |mut req, ctx| async move {
-            let version = match ctx.param("version") {
-                Some(v) => v.to_string(),
-                None => return Response::error("missing policy version", 400),
-            };
-            let body: models::PutPolicyDefinitionRequest = req.json().await?;
-            let bucket = ctx.env.bucket("ARTIFACTS")?;
-            let resp = policy::put_policy_definition(&ctx.env, &bucket, &version, &body).await?;
-            Response::from_json(&resp)
-        })
+        .put_async(
+            "/v1/policies/definitions/:version",
+            |mut req, ctx| async move {
+                let version = match ctx.param("version") {
+                    Some(v) => v.to_string(),
+                    None => return Response::error("missing policy version", 400),
+                };
+                let body: models::PutPolicyDefinitionRequest = req.json().await?;
+                let bucket = ctx.env.bucket("ARTIFACTS")?;
+                let resp =
+                    policy::put_policy_definition(&ctx.env, &bucket, &version, &body).await?;
+                Response::from_json(&resp)
+            },
+        )
         .post_async("/v1/policies/activate/:version", |_req, ctx| async move {
             let version = match ctx.param("version") {
                 Some(v) => v.to_string(),

@@ -70,7 +70,9 @@ pub async fn evaluate_policy(
     d1: &D1Database,
     req: &models::PolicyCheckRequest,
 ) -> Result<Decision> {
-    let bundle = load_policy_bundle(env).await.unwrap_or_else(|_| default_bundle());
+    let bundle = load_policy_bundle(env)
+        .await
+        .unwrap_or_else(|_| default_bundle());
     let risk = classify_risk(&req.action, req.resource.as_deref(), req.context.as_ref());
     let mut matched_rule: Option<String> = None;
     let mut rate_limited = false;
@@ -95,7 +97,11 @@ pub async fn evaluate_policy(
         rate_limited = true;
     }
 
-    let mut verdict = if exceeded { RuleEffect::Escalate } else { RuleEffect::Allow };
+    let mut verdict = if exceeded {
+        RuleEffect::Escalate
+    } else {
+        RuleEffect::Allow
+    };
     let mut reason = if exceeded {
         "rate limit exceeded for actor/action class".to_string()
     } else {
@@ -187,25 +193,43 @@ pub async fn put_policy_definition(
     bucket.put(&r2_key, payload).execute().await?;
 
     // Best effort KV write; if binding absent, still keep R2 as source of truth.
-    if let Ok(kv) = env.kv(POLICY_KV_BINDING) {
+    let activated = if let Ok(kv) = env.kv(POLICY_KV_BINDING) {
         let kv_key = format!("{POLICY_RULE_KEY_PREFIX}{version}");
         let text = serde_json::to_string(&bundle).unwrap_or_else(|_| "{}".to_string());
         kv.put(&kv_key, text)?.execute().await?;
         if req.activate {
-            kv.put(ACTIVE_POLICY_VERSION_KEY, version)?.execute().await?;
+            kv.put(ACTIVE_POLICY_VERSION_KEY, version)?
+                .execute()
+                .await?;
+            true
+        } else {
+            false
         }
-    }
+    } else {
+        if req.activate {
+            worker::console_log!(
+                "WARN: policy activation requested but POLICY_KV binding is absent; \
+                 stored to R2 only — use POST /v1/policies/activate/:version after provisioning KV"
+            );
+        }
+        false
+    };
 
     Ok(models::PolicyDefinitionResponse {
         version: version.to_string(),
         stored: true,
-        activated: req.activate,
+        activated,
     })
 }
 
-pub async fn activate_policy_version(env: &Env, version: &str) -> Result<models::PolicyActivationResponse> {
+pub async fn activate_policy_version(
+    env: &Env,
+    version: &str,
+) -> Result<models::PolicyActivationResponse> {
     let kv = env.kv(POLICY_KV_BINDING)?;
-    kv.put(ACTIVE_POLICY_VERSION_KEY, version)?.execute().await?;
+    kv.put(ACTIVE_POLICY_VERSION_KEY, version)?
+        .execute()
+        .await?;
     Ok(models::PolicyActivationResponse {
         version: version.to_string(),
         active: true,
@@ -215,7 +239,12 @@ pub async fn activate_policy_version(env: &Env, version: &str) -> Result<models:
 pub async fn active_policy_version(env: &Env) -> Result<models::ActivePolicyResponse> {
     match env.kv(POLICY_KV_BINDING) {
         Ok(kv) => {
-            let version = kv.get(ACTIVE_POLICY_VERSION_KEY).text().await.ok().flatten();
+            let version = kv
+                .get(ACTIVE_POLICY_VERSION_KEY)
+                .text()
+                .await
+                .ok()
+                .flatten();
             Ok(models::ActivePolicyResponse {
                 version,
                 source: "kv".into(),
@@ -272,7 +301,9 @@ pub fn classify_risk(
     }
     if has_any(
         &hay,
-        &["create", "update", "write", "put", "patch", "commit", "index"],
+        &[
+            "create", "update", "write", "put", "patch", "commit", "index",
+        ],
     ) {
         return RiskLevel::Medium;
     }
@@ -334,7 +365,11 @@ fn first_matching_rule<'a>(
     risk: RiskLevel,
 ) -> Option<&'a PolicyRule> {
     let action = req.action.to_ascii_lowercase();
-    let resource = req.resource.clone().unwrap_or_default().to_ascii_lowercase();
+    let resource = req
+        .resource
+        .clone()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let actor = req.actor.to_ascii_lowercase();
 
     rules.iter().find(|rule| {
@@ -371,18 +406,23 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 }
 
 async fn load_policy_bundle(env: &Env) -> Result<PolicyBundle> {
-    let kv = env.kv(POLICY_KV_BINDING)?;
-    let version = kv
-        .get(ACTIVE_POLICY_VERSION_KEY)
-        .text()
-        .await?
-        .unwrap_or_else(|| "builtin-2026-02-22".to_string());
-    let key = format!("{POLICY_RULE_KEY_PREFIX}{version}");
-    if let Some(text) = kv.get(&key).text().await? {
-        let bundle: PolicyBundle = serde_json::from_str(&text)
-            .map_err(|e| Error::RustError(format!("invalid policy json: {e}")))?;
-        return Ok(bundle);
+    // Try KV first (hot path).
+    if let Ok(kv) = env.kv(POLICY_KV_BINDING) {
+        let version = kv
+            .get(ACTIVE_POLICY_VERSION_KEY)
+            .text()
+            .await?
+            .unwrap_or_else(|| "builtin-2026-02-22".to_string());
+        let key = format!("{POLICY_RULE_KEY_PREFIX}{version}");
+        if let Some(text) = kv.get(&key).text().await? {
+            let bundle: PolicyBundle = serde_json::from_str(&text)
+                .map_err(|e| Error::RustError(format!("invalid policy json: {e}")))?;
+            return Ok(bundle);
+        }
     }
+    // KV absent or active version key missing — fall back to builtin defaults.
+    // R2 holds durable policy blobs but is not used for evaluation without a
+    // version pointer (which lives in KV). KV = hot-path read; R2 = archive.
     Ok(default_bundle())
 }
 
@@ -472,10 +512,7 @@ mod tests {
             classify_risk("update_config", Some("repo"), None),
             RiskLevel::Medium
         );
-        assert_eq!(
-            classify_risk("deploy", Some("prod"), None),
-            RiskLevel::High
-        );
+        assert_eq!(classify_risk("deploy", Some("prod"), None), RiskLevel::High);
         assert_eq!(
             classify_risk("hard-delete", Some("prod"), None),
             RiskLevel::Critical

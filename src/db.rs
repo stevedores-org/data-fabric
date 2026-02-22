@@ -1019,7 +1019,10 @@ pub async fn record_policy_check_detailed(
     rate_limited: bool,
 ) -> Result<()> {
     let now = now_iso();
-    let mut merged = body.context.clone().unwrap_or_else(|| serde_json::json!({}));
+    let mut merged = body
+        .context
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
     if !merged.is_object() {
         merged = serde_json::json!({ "context": merged });
     }
@@ -1658,18 +1661,29 @@ pub async fn run_retention_cleanup(
     let checkpoints_cutoff = days_ago_expr(req.checkpoints_ttl_days.max(1));
     let artifacts_cutoff = days_ago_expr(req.artifacts_ttl_days.max(1));
 
-    let events_deleted = delete_older_than(db, "events_bronze", "created_at", &events_cutoff).await?;
+    let events_deleted =
+        delete_older_than(db, "events_bronze", "created_at", &events_cutoff).await?;
     let policy_decisions_deleted =
         delete_older_than(db, "policy_decisions", "created_at", &policy_cutoff).await?;
 
-    let checkpoint_keys = list_old_keys(db, "checkpoints", "state_r2_key", "created_at", &checkpoints_cutoff).await?;
-    let checkpoints_deleted = delete_older_than(db, "checkpoints", "created_at", &checkpoints_cutoff).await?;
+    let checkpoint_keys = list_old_keys(
+        db,
+        "checkpoints",
+        "state_r2_key",
+        "created_at",
+        &checkpoints_cutoff,
+    )
+    .await?;
+    let checkpoints_deleted =
+        delete_older_than(db, "checkpoints", "created_at", &checkpoints_cutoff).await?;
     for key in checkpoint_keys {
         let _ = bucket.delete(&key).await;
     }
 
-    let artifact_keys = list_old_keys(db, "artifacts", "key", "created_at", &artifacts_cutoff).await?;
-    let artifacts_deleted = delete_older_than(db, "artifacts", "created_at", &artifacts_cutoff).await?;
+    let artifact_keys =
+        list_old_keys(db, "artifacts", "key", "created_at", &artifacts_cutoff).await?;
+    let artifacts_deleted =
+        delete_older_than(db, "artifacts", "created_at", &artifacts_cutoff).await?;
     for key in artifact_keys {
         let _ = bucket.delete(&key).await;
     }
@@ -1689,7 +1703,7 @@ async fn delete_older_than(
     cutoff: &str,
 ) -> Result<usize> {
     let count_sql = format!(
-        "SELECT count(*) as count FROM {table} WHERE {time_col} < datetime('now', ?1)"
+        "SELECT count(*) as count FROM {table} WHERE datetime({time_col}) < datetime('now', ?1)"
     );
     let count_row: Option<CountRow> = db
         .prepare(&count_sql)
@@ -1698,7 +1712,8 @@ async fn delete_older_than(
         .await?;
     let count = count_row.map(|r| r.count as usize).unwrap_or(0);
 
-    let delete_sql = format!("DELETE FROM {table} WHERE {time_col} < datetime('now', ?1)");
+    let delete_sql =
+        format!("DELETE FROM {table} WHERE datetime({time_col}) < datetime('now', ?1)");
     db.prepare(&delete_sql)
         .bind(&[JsValue::from_str(cutoff)])?
         .run()
@@ -1714,7 +1729,7 @@ async fn list_old_keys(
     cutoff: &str,
 ) -> Result<Vec<String>> {
     let sql = format!(
-        "SELECT {key_col} as key FROM {table} WHERE {time_col} < datetime('now', ?1)"
+        "SELECT {key_col} as key FROM {table} WHERE datetime({time_col}) < datetime('now', ?1)"
     );
     let result: D1Result = db
         .prepare(&sql)
