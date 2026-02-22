@@ -22,10 +22,14 @@ jobs:
           target: wasm32-unknown-unknown
           components: rustfmt, clippy
 
-      - name: Install local-ci
-        run: |
-          go install github.com/stevedores-org/local-ci@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Run fmt
+        run: cargo fmt --all -- --check
 
-      - name: Run local-ci
-        run: local-ci fmt clippy check
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run wasm check
+        run: cargo check --target wasm32-unknown-unknown
+
+      - name: Run tests
+        run: cargo test
