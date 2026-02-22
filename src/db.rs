@@ -863,3 +863,55 @@ fn lease_time(seconds: u64) -> String {
     let future = js_sys::Date::new(&JsValue::from_f64(now + (seconds as f64 * 1000.0)));
     future.to_iso_string().as_string().unwrap()
 }
+
+// ── Integrations (WS6) ─────────────────────────────────────────
+
+pub async fn register_integration(
+    db: &D1Database,
+    id: &str,
+    body: &crate::integrations::RegisterIntegration,
+) -> Result<()> {
+    let now = now_iso();
+    let config_json = body
+        .config
+        .as_ref()
+        .map(|c| serde_json::to_string(c).unwrap());
+    let api_version = body.api_version.as_deref().unwrap_or("v1");
+
+    db.prepare(
+        "INSERT INTO integrations (id, target, name, endpoint, api_version, status, config, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(body.target.as_str()),
+        JsValue::from_str(&body.name),
+        opt_str(&body.endpoint),
+        JsValue::from_str(api_version),
+        match &config_json { Some(s) => JsValue::from_str(s), None => JsValue::NULL },
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
+}
+
+pub async fn list_integrations(db: &D1Database) -> Result<Vec<serde_json::Value>> {
+    let result: D1Result = db
+        .prepare("SELECT * FROM integrations WHERE status = 'active' ORDER BY created_at DESC")
+        .bind(&[])?
+        .all()
+        .await?;
+
+    let rows: Vec<serde_json::Value> = result.results()?;
+    Ok(rows)
+}
+
+pub async fn touch_integration(db: &D1Database, target: &str) -> Result<()> {
+    let now = now_iso();
+    db.prepare("UPDATE integrations SET last_seen_at = ?1 WHERE target = ?2 AND status = 'active'")
+        .bind(&[JsValue::from_str(&now), JsValue::from_str(target)])?
+        .run()
+        .await?;
+    Ok(())
+}

@@ -2,6 +2,7 @@ use serde::Serialize;
 use worker::*;
 
 mod db;
+mod integrations;
 mod models;
 mod storage;
 
@@ -356,6 +357,145 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let events = db::get_trace_for_run(&d1, &run_id, hops).await?;
             Response::from_json(&models::TraceResponse { run_id, events })
         })
+        // ── WS6: Integration Registry ────────────────────────
+        .post_async("/v1/integrations", |mut req, ctx| async move {
+            let body: integrations::RegisterIntegration = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            db::register_integration(&d1, &id, &body).await?;
+            Response::from_json(&serde_json::json!({
+                "id": id,
+                "target": body.target,
+                "name": body.name,
+                "status": "active",
+            }))
+        })
+        .get_async("/v1/integrations", |_req, ctx| async move {
+            let d1 = ctx.env.d1("DB")?;
+            let list = db::list_integrations(&d1).await?;
+            Response::from_json(&serde_json::json!({ "integrations": list }))
+        })
+        // ── WS6: oxidizedgraph intake ───────────────────────
+        .post_async(
+            "/v1/integrations/oxidizedgraph/events",
+            |mut req, ctx| async move {
+                let batch: integrations::oxidizedgraph::GraphExecBatch = req.json().await?;
+                let d1 = ctx.env.d1("DB")?;
+                let bucket = ctx.env.bucket("ARTIFACTS")?;
+                let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
+
+                let owned_events = integrations::oxidizedgraph::adapt_to_graph_events(&batch);
+                let mut event_refs: Vec<(String, models::GraphEvent, String)> = Vec::new();
+                for evt in owned_events {
+                    let id = generate_id()?;
+                    event_refs.push((id, evt, now.clone()));
+                }
+                let bronze_events: Vec<(String, &models::GraphEvent, String)> = event_refs
+                    .iter()
+                    .map(|(id, evt, ts)| (id.clone(), evt, ts.clone()))
+                    .collect();
+                let event_count = bronze_events.len();
+                if !bronze_events.is_empty() {
+                    db::insert_events_bronze(&d1, &bronze_events).await?;
+                }
+
+                let mut checkpoint_count = 0usize;
+                for evt in &batch.events {
+                    if let Some(cp) = integrations::oxidizedgraph::adapt_to_checkpoint(&batch, evt)
+                    {
+                        let id = generate_id()?;
+                        let r2_key = format!("checkpoints/{}/{}", cp.thread_id, id);
+                        let state_bytes = serde_json::to_vec(&cp.state)
+                            .map_err(|e| Error::RustError(e.to_string()))?;
+                        let size = storage::put_blob(&bucket, &r2_key, state_bytes).await? as i64;
+                        db::create_checkpoint(&d1, &id, &cp, &r2_key, size).await?;
+                        checkpoint_count += 1;
+                    }
+                }
+
+                let _ = db::touch_integration(&d1, "oxidizedgraph").await;
+
+                Response::from_json(&serde_json::json!({
+                    "source": "oxidizedgraph",
+                    "events_ingested": event_count,
+                    "checkpoints_created": checkpoint_count,
+                }))
+            },
+        )
+        // ── WS6: aivcs intake ───────────────────────────────
+        .post_async("/v1/integrations/aivcs/events", |mut req, ctx| async move {
+            let evt: integrations::aivcs::PipelineEvent = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+
+            let mut run_id = None;
+            if let Some(run) = integrations::aivcs::adapt_to_run(&evt) {
+                let id = generate_id()?;
+                db::create_run(&d1, &id, &run).await?;
+                run_id = Some(id);
+            }
+
+            let fabric_evt = integrations::aivcs::adapt_to_event(&evt);
+            let evt_id = generate_id()?;
+            db::ingest_event(&d1, &evt_id, &fabric_evt).await?;
+
+            let _ = db::touch_integration(&d1, "aivcs").await;
+
+            Response::from_json(&serde_json::json!({
+                "source": "aivcs",
+                "event_id": evt_id,
+                "run_id": run_id,
+            }))
+        })
+        // ── WS6: llama.rs intake ────────────────────────────
+        .post_async(
+            "/v1/integrations/llama-rs/inference",
+            |mut req, ctx| async move {
+                let body: integrations::llama_rs::InferenceRequest = req.json().await?;
+                let d1 = ctx.env.d1("DB")?;
+
+                let task = integrations::llama_rs::adapt_to_task(&body);
+                let id = generate_id()?;
+                db::create_task(&d1, &id, &task).await?;
+
+                let _ = db::touch_integration(&d1, "llama_rs").await;
+
+                Response::from_json(&serde_json::json!({
+                    "source": "llama_rs",
+                    "task_id": id,
+                    "status": "pending",
+                }))
+            },
+        )
+        .post_async(
+            "/v1/integrations/llama-rs/telemetry",
+            |mut req, ctx| async move {
+                let telemetry: integrations::llama_rs::InferenceTelemetry = req.json().await?;
+                let d1 = ctx.env.d1("DB")?;
+                let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
+
+                let graph_events = integrations::llama_rs::adapt_to_graph_events(&telemetry);
+                let mut event_refs: Vec<(String, models::GraphEvent, String)> = Vec::new();
+                for evt in graph_events {
+                    let id = generate_id()?;
+                    event_refs.push((id, evt, now.clone()));
+                }
+                let bronze_events: Vec<(String, &models::GraphEvent, String)> = event_refs
+                    .iter()
+                    .map(|(id, evt, ts)| (id.clone(), evt, ts.clone()))
+                    .collect();
+                let count = bronze_events.len();
+                if !bronze_events.is_empty() {
+                    db::insert_events_bronze(&d1, &bronze_events).await?;
+                }
+
+                let _ = db::touch_integration(&d1, "llama_rs").await;
+
+                Response::from_json(&serde_json::json!({
+                    "source": "llama_rs",
+                    "events_ingested": count,
+                }))
+            },
+        )
         // ── Graph Events (M3) ─────────────────────────────────
         .post_async("/v1/graph-events", |mut req, ctx| async move {
             let body: models::GraphEventBatch = req.json().await?;
