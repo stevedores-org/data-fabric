@@ -10,7 +10,6 @@ pub struct CreateRun {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct CreateTask {
     pub run_id: String,

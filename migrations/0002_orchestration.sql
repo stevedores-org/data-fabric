@@ -2,7 +2,7 @@
 -- tasks, agents, checkpoints, events_bronze
 
 -- ── Tasks: priority queue for agent work ─────────────────────────
-CREATE TABLE tasks (
+CREATE TABLE agent_tasks (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL,
     task_type TEXT NOT NULL,
@@ -20,9 +20,9 @@ CREATE TABLE tasks (
     created_at TEXT NOT NULL,
     completed_at TEXT
 );
-CREATE INDEX idx_tasks_claimable ON tasks(status, priority DESC, created_at ASC);
-CREATE INDEX idx_tasks_job ON tasks(job_id);
-CREATE INDEX idx_tasks_agent ON tasks(agent_id);
+CREATE INDEX idx_agent_tasks_claimable ON agent_tasks(status, priority DESC, created_at ASC);
+CREATE INDEX idx_agent_tasks_job ON agent_tasks(job_id);
+CREATE INDEX idx_agent_tasks_agent ON agent_tasks(agent_id);
 
 -- ── Agents: registration ─────────────────────────────────────────
 CREATE TABLE agents (
