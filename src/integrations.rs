@@ -229,15 +229,20 @@ pub mod aivcs {
             meta.insert("metadata".into(), user_meta.clone());
         }
 
+        let trigger_suffix = match evt.event_type {
+            PipelineEventType::PipelineStart => "pipeline_start",
+            PipelineEventType::PipelineEnd => "pipeline_end",
+            PipelineEventType::StageStart => "stage_start",
+            PipelineEventType::StageEnd => "stage_end",
+            PipelineEventType::TestResult => "test_result",
+            PipelineEventType::BuildComplete => "build_complete",
+            PipelineEventType::DeployStart => "deploy_start",
+            PipelineEventType::DeployEnd => "deploy_end",
+        };
+
         Some(crate::models::CreateRun {
             repo: evt.repo.clone(),
-            trigger: Some(format!(
-                "aivcs:{}",
-                serde_json::to_value(&evt.event_type)
-                    .unwrap()
-                    .as_str()
-                    .unwrap()
-            )),
+            trigger: Some(format!("aivcs:{trigger_suffix}")),
             actor: Some(evt.actor.clone()),
             metadata: Some(serde_json::Value::Object(meta)),
         })

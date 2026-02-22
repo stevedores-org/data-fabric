@@ -2,7 +2,7 @@ use crate::models;
 use wasm_bindgen::JsValue;
 use worker::*;
 
-fn now_iso() -> String {
+pub fn now_iso() -> String {
     js_sys::Date::new_0().to_iso_string().as_string().unwrap()
 }
 
@@ -906,19 +906,17 @@ pub async fn register_integration(
     Ok(())
 }
 
-pub async fn list_integrations(db: &D1Database) -> Result<Vec<serde_json::Value>> {
+pub async fn list_integrations(db: &D1Database, limit: u32) -> Result<Vec<serde_json::Value>> {
     let result: D1Result = db
-        .prepare("SELECT * FROM integrations WHERE status = 'active' ORDER BY created_at DESC")
-        .bind(&[])?
+        .prepare(
+            "SELECT * FROM integrations WHERE status = 'active' ORDER BY created_at DESC LIMIT ?1",
+        )
+        .bind(&[JsValue::from(limit)])?
         .all()
         .await?;
 
     let rows: Vec<serde_json::Value> = result.results()?;
     Ok(rows)
-}
-
-pub fn now_iso_pub() -> String {
-    now_iso()
 }
 
 pub async fn touch_integration(db: &D1Database, target: &str) -> Result<()> {
