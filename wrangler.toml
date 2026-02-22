@@ -20,15 +20,16 @@ APP_ENV = "dev"
 SERVICE_NAME = "data-fabric"
 
 # ── D1: structured metadata, lineage, domain entities ───────────
-# [[d1_databases]]
-# binding = "DB"
-# database_name = "data-fabric"
-# database_id = "<d1-database-id>"
+[[d1_databases]]
+binding = "DB"
+database_name = "data-fabric"
+database_id = "placeholder-provision-with-wrangler-d1-create"
+migrations_dir = "migrations"
 
 # ── R2: artifact / blob store ────────────────────────────────────
-# [[r2_buckets]]
-# binding = "ARTIFACTS"
-# bucket_name = "data-fabric-artifacts"
+[[r2_buckets]]
+binding = "ARTIFACTS"
+bucket_name = "data-fabric-artifacts"
 
 # ── KV: policies, config, fast context lookups ───────────────────
 # [[kv_namespaces]]

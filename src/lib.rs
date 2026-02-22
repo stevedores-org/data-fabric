@@ -32,19 +32,54 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // runs (WS2 domain entity)
         .post_async("/v1/runs", |mut req, _ctx| async move {
             let body: models::CreateRun = req.json().await?;
-            let _ = (&body.trigger, &body.metadata);
-            Response::from_json(&models::RunCreated {
+            let _ = (&body.trigger, &body.actor, &body.metadata);
+            Response::from_json(&models::Created {
                 id: generate_id()?,
                 status: "created".into(),
-                repo: body.repo,
             })
         })
         .get("/v1/runs", |_, _| {
             Response::from_json(&serde_json::json!({ "runs": [] }))
         })
+        // tasks (WS2)
+        .post_async("/v1/tasks", |mut req, _ctx| async move {
+            let body: models::CreateTask = req.json().await?;
+            let _ = (&body.run_id, &body.plan_id, &body.actor, &body.metadata);
+            Response::from_json(&models::Created {
+                id: generate_id()?,
+                status: "created".into(),
+            })
+        })
+        // plans (WS2)
+        .post_async("/v1/plans", |mut req, _ctx| async move {
+            let body: models::CreatePlan = req.json().await?;
+            let _ = (&body.run_id, &body.task_ids, &body.metadata);
+            Response::from_json(&models::Created {
+                id: generate_id()?,
+                status: "created".into(),
+            })
+        })
+        // tool calls (WS2)
+        .post_async("/v1/tool-calls", |mut req, _ctx| async move {
+            let body: models::RecordToolCall = req.json().await?;
+            let _ = (&body.run_id, &body.task_id, &body.output, &body.duration_ms);
+            Response::from_json(&models::Created {
+                id: generate_id()?,
+                status: "recorded".into(),
+            })
+        })
+        // releases (WS2)
+        .post_async("/v1/releases", |mut req, _ctx| async move {
+            let body: models::CreateRelease = req.json().await?;
+            let _ = (&body.run_id, &body.artifact_ids, &body.metadata);
+            Response::from_json(&models::Created {
+                id: generate_id()?,
+                status: "created".into(),
+            })
+        })
         // provenance events (WS3)
         .post_async("/v1/events", |mut req, _ctx| async move {
-            let body: models::ProvenanceEvent = req.json().await?;
+            let body: models::IngestEvent = req.json().await?;
             let _ = (&body.run_id, &body.actor, &body.payload);
             Response::from_json(&models::EventAck {
                 id: generate_id()?,
