@@ -20,18 +20,14 @@ fn opt_json(v: &Option<serde_json::Value>) -> JsValue {
     }
 }
 
-// ── MCP Tasks ──────────────────────────────────────────────────
+// ── Tasks ───────────────────────────────────────────────────────
 
-pub async fn create_mcp_task(
-    db: &D1Database,
-    id: &str,
-    body: &models::CreateMcpTask,
-) -> Result<()> {
+pub async fn create_task(db: &D1Database, id: &str, body: &models::CreateAgentTask) -> Result<()> {
     let now = now_iso();
     let max_retries = body.max_retries.unwrap_or(3);
 
     db.prepare(
-        "INSERT INTO mcp_tasks (id, job_id, task_type, priority, status, params, graph_ref, play_id, parent_task_id, max_retries, created_at)
+        "INSERT INTO tasks (id, job_id, task_type, priority, status, params, graph_ref, play_id, parent_task_id, max_retries, created_at)
          VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?10)",
     )
     .bind(&[
@@ -56,7 +52,7 @@ pub async fn claim_next_task(
     db: &D1Database,
     agent_id: &str,
     capabilities: &[&str],
-) -> Result<Option<models::McpTask>> {
+) -> Result<Option<models::AgentTask>> {
     let now = now_iso();
     let lease = lease_time(300);
 
@@ -76,7 +72,7 @@ pub async fn claim_next_task(
     };
 
     let query = format!(
-        "SELECT id FROM mcp_tasks WHERE status = 'pending' AND ({where_caps}) ORDER BY priority DESC, created_at ASC LIMIT 1"
+        "SELECT id FROM tasks WHERE status = 'pending' AND ({where_caps}) ORDER BY priority DESC, created_at ASC LIMIT 1"
     );
 
     let result: Option<TaskIdRow> = db.prepare(&query).bind(&bind_caps)?.first(None).await?;
@@ -88,7 +84,7 @@ pub async fn claim_next_task(
 
     // Claim it atomically: only succeeds if still pending
     db.prepare(
-        "UPDATE mcp_tasks SET status = 'running', agent_id = ?1, lease_expires_at = ?2 WHERE id = ?3 AND status = 'pending'",
+        "UPDATE tasks SET status = 'running', agent_id = ?1, lease_expires_at = ?2 WHERE id = ?3 AND status = 'pending'",
     )
     .bind(&[
         JsValue::from_str(agent_id),
@@ -105,20 +101,20 @@ pub async fn claim_next_task(
         .await?;
 
     // Fetch full task
-    let task: Option<McpTaskRow> = db
-        .prepare("SELECT * FROM mcp_tasks WHERE id = ?1 AND agent_id = ?2")
+    let task: Option<TaskRow> = db
+        .prepare("SELECT * FROM tasks WHERE id = ?1 AND agent_id = ?2")
         .bind(&[JsValue::from_str(&task_id), JsValue::from_str(agent_id)])?
         .first(None)
         .await?;
 
-    Ok(task.map(|r| r.into_mcp_task()))
+    Ok(task.map(|r| r.into_agent_task()))
 }
 
 pub async fn heartbeat_task(db: &D1Database, task_id: &str, agent_id: &str) -> Result<bool> {
     let lease = lease_time(300);
     let result: D1Result = db
         .prepare(
-            "UPDATE mcp_tasks SET lease_expires_at = ?1 WHERE id = ?2 AND agent_id = ?3 AND status = 'running'",
+            "UPDATE tasks SET lease_expires_at = ?1 WHERE id = ?2 AND agent_id = ?3 AND status = 'running'",
         )
         .bind(&[
             JsValue::from_str(&lease),
@@ -144,7 +140,7 @@ pub async fn complete_task(
     let result_json = result_val.map(|v| serde_json::to_string(v).unwrap());
     let res: D1Result = db
         .prepare(
-            "UPDATE mcp_tasks SET status = 'completed', result = ?1, completed_at = ?2 WHERE id = ?3 AND status = 'running'",
+            "UPDATE tasks SET status = 'completed', result = ?1, completed_at = ?2 WHERE id = ?3 AND status = 'running'",
         )
         .bind(&[
             match &result_json {
@@ -169,9 +165,7 @@ pub async fn fail_task(db: &D1Database, task_id: &str, error: &str) -> Result<St
 
     // Check retry eligibility
     let task: Option<RetryRow> = db
-        .prepare(
-            "SELECT retry_count, max_retries FROM mcp_tasks WHERE id = ?1 AND status = 'running'",
-        )
+        .prepare("SELECT retry_count, max_retries FROM tasks WHERE id = ?1 AND status = 'running'")
         .bind(&[JsValue::from_str(task_id)])?
         .first(None)
         .await?;
@@ -184,7 +178,7 @@ pub async fn fail_task(db: &D1Database, task_id: &str, error: &str) -> Result<St
     let result_json = serde_json::json!({ "error": error }).to_string();
 
     db.prepare(
-        "UPDATE mcp_tasks SET status = ?1, retry_count = CASE WHEN ?1 = 'pending' THEN ?2 ELSE retry_count END, result = ?3, agent_id = CASE WHEN ?1 = 'pending' THEN NULL ELSE agent_id END, lease_expires_at = NULL, completed_at = CASE WHEN ?1 = 'failed' THEN ?4 ELSE NULL END WHERE id = ?5",
+        "UPDATE tasks SET status = ?1, retry_count = CASE WHEN ?1 = 'pending' THEN ?2 ELSE retry_count END, result = ?3, agent_id = CASE WHEN ?1 = 'pending' THEN NULL ELSE agent_id END, lease_expires_at = NULL, completed_at = CASE WHEN ?1 = 'failed' THEN ?4 ELSE NULL END WHERE id = ?5",
     )
     .bind(&[
         JsValue::from_str(new_status),
@@ -348,7 +342,7 @@ struct RetryRow {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub struct McpTaskRow {
+pub struct TaskRow {
     pub id: String,
     pub job_id: String,
     pub task_type: String,
@@ -367,9 +361,9 @@ pub struct McpTaskRow {
     pub completed_at: Option<String>,
 }
 
-impl McpTaskRow {
-    pub fn into_mcp_task(self) -> models::McpTask {
-        models::McpTask {
+impl TaskRow {
+    pub fn into_agent_task(self) -> models::AgentTask {
+        models::AgentTask {
             id: self.id,
             job_id: self.job_id,
             task_type: self.task_type,

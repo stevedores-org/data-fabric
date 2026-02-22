@@ -42,16 +42,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .get("/v1/runs", |_, _| {
             Response::from_json(&serde_json::json!({ "runs": [] }))
         })
-        // ── Tasks — WS2 domain entity stubs ────────────────────
-        .post_async("/v1/tasks", |mut req, _ctx| async move {
-            let body: models::CreateTask = req.json().await?;
-            let _ = (&body.run_id, &body.plan_id, &body.actor, &body.metadata);
-            Response::from_json(&models::Created {
-                id: generate_id()?,
-                status: "created".into(),
-            })
-        })
-        // ── Plans (WS2) ───────────────────────────────────────
+        // ── WS2 domain stubs (plans, tool-calls, releases) ────
         .post_async("/v1/plans", |mut req, _ctx| async move {
             let body: models::CreatePlan = req.json().await?;
             let _ = (&body.run_id, &body.task_ids, &body.metadata);
@@ -60,7 +51,6 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 status: "created".into(),
             })
         })
-        // ── Tool Calls (WS2) ─────────────────────────────────
         .post_async("/v1/tool-calls", |mut req, _ctx| async move {
             let body: models::RecordToolCall = req.json().await?;
             let _ = (&body.run_id, &body.task_id, &body.output, &body.duration_ms);
@@ -69,7 +59,6 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 status: "recorded".into(),
             })
         })
-        // ── Releases (WS2) ──────────────────────────────────
         .post_async("/v1/releases", |mut req, _ctx| async move {
             let body: models::CreateRelease = req.json().await?;
             let _ = (&body.run_id, &body.artifact_ids, &body.metadata);
@@ -78,7 +67,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 status: "created".into(),
             })
         })
-        // ── Provenance Events (WS3) ──────────────────────────
+        // ── Provenance Events (WS3) ───────────────────────────
         .post_async("/v1/events", |mut req, _ctx| async move {
             let body: models::IngestEvent = req.json().await?;
             let _ = (&body.run_id, &body.actor, &body.payload);
@@ -89,7 +78,6 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             })
         })
         // ── Artifacts (R2-backed) ─────────────────────────────
-        // PUT buffers full body in memory; size limited by MAX_ARTIFACT_BYTES.
         .put_async("/v1/artifacts/:key", |mut req, ctx| async move {
             let key = match ctx.param("key") {
                 Some(k) => k.to_string(),
@@ -122,7 +110,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => Response::error("not found", 404),
             }
         })
-        // ── Policy Check (WS4) ──────────────────────────────
+        // ── Policy Check (WS4) ────────────────────────────────
         .post_async("/v1/policies/check", |mut req, _ctx| async move {
             let body: models::PolicyCheckRequest = req.json().await?;
             let _ = (&body.actor, &body.resource, &body.context);
@@ -132,13 +120,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 reason: "no policy restrictions configured".into(),
             })
         })
-        // ── MCP Tasks (M1: D1-backed) ────────────────────────
-        .post_async("/v1/mcp-tasks", |mut req, ctx| async move {
-            let body: models::CreateMcpTask = req.json().await?;
+        // ── Agent Tasks (M1) ──────────────────────────────────
+        .post_async("/v1/tasks", |mut req, ctx| async move {
+            let body: models::CreateAgentTask = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::create_mcp_task(&d1, &id, &body).await?;
-            Response::from_json(&models::McpTaskCreated {
+            db::create_task(&d1, &id, &body).await?;
+            Response::from_json(&models::TaskCreated {
                 id,
                 status: "pending".into(),
             })
@@ -214,7 +202,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let new_status = db::fail_task(&d1, &task_id, &body.error).await?;
             Response::from_json(&serde_json::json!({ "status": new_status }))
         })
-        // ── Agents (M1: D1-backed) ───────────────────────────
+        // ── Agents (M1) ───────────────────────────────────────
         .post_async("/v1/agents", |mut req, ctx| async move {
             let body: models::RegisterAgent = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
@@ -231,7 +219,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let agents = db::list_agents(&d1).await?;
             Response::from_json(&serde_json::json!({ "agents": agents }))
         })
-        // ── Checkpoints (M2: D1+R2-backed) ──────────────────
+        // ── Checkpoints (M2) ──────────────────────────────────
         .post_async("/v1/checkpoints", |mut req, ctx| async move {
             let body: models::CreateCheckpoint = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
@@ -291,7 +279,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Response::error("checkpoint not found", 404)
             }
         })
-        // ── Graph Events (M3: D1 bronze layer) ──────────────
+        // ── Graph Events (M3) ─────────────────────────────────
         .post_async("/v1/graph-events", |mut req, ctx| async move {
             let body: models::GraphEventBatch = req.json().await?;
             let d1 = ctx.env.d1("DB")?;

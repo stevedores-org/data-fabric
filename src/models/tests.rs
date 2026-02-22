@@ -335,32 +335,32 @@ fn policy_check_response() {
     assert_eq!(json["decision"], "allow");
 }
 
-// ── M1-M3: MCP Task Queue ──────────────────────────────────────
+// ── Orchestration types (M1-M3) ────────────────────────────────
 
 #[test]
-fn create_mcp_task_round_trip() {
+fn create_agent_task_round_trip() {
     let input = r#"{"job_id":"j1","task_type":"build","priority":5,"params":{"repo":"test"}}"#;
-    let parsed: CreateMcpTask = serde_json::from_str(input).unwrap();
+    let parsed: CreateAgentTask = serde_json::from_str(input).unwrap();
     assert_eq!(parsed.job_id, "j1");
     assert_eq!(parsed.task_type, "build");
     assert_eq!(parsed.priority, 5);
     let json = serde_json::to_string(&parsed).unwrap();
-    let reparsed: CreateMcpTask = serde_json::from_str(&json).unwrap();
+    let reparsed: CreateAgentTask = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, reparsed);
 }
 
 #[test]
-fn create_mcp_task_minimal() {
+fn create_agent_task_minimal() {
     let input = r#"{"job_id":"j1","task_type":"build"}"#;
-    let parsed: CreateMcpTask = serde_json::from_str(input).unwrap();
+    let parsed: CreateAgentTask = serde_json::from_str(input).unwrap();
     assert_eq!(parsed.priority, 0);
     assert!(parsed.params.is_none());
     assert!(parsed.graph_ref.is_none());
 }
 
 #[test]
-fn mcp_task_created_serializes() {
-    let tc = McpTaskCreated {
+fn agent_task_created_serializes() {
+    let tc = TaskCreated {
         id: "abc".into(),
         status: "pending".into(),
     };
