@@ -5,7 +5,7 @@ account_id = "f1be33af27cf878e2e81cb29a0d886f7"
 workers_dev = true
 
 [build]
-command = "cargo install worker-build && worker-build --release"
+command = "worker-build --release"
 
 [vars]
 APP_ENV = "dev"
