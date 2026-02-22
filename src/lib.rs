@@ -169,10 +169,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .post_async("/v1/memory/gc", |mut req, ctx| async move {
-            let body: models::MemoryGcRequest = req
-                .json()
-                .await
-                .unwrap_or(models::MemoryGcRequest { limit: 1000 });
+            let body: models::MemoryGcRequest = {
+                let text = req.text().await?;
+                if text.trim().is_empty() {
+                    models::MemoryGcRequest { limit: 1000 }
+                } else {
+                    match serde_json::from_str::<models::MemoryGcRequest>(&text) {
+                        Ok(v) => v,
+                        Err(_) => return Response::error("invalid JSON body", 400),
+                    }
+                }
+            };
             let d1 = ctx.env.d1("DB")?;
             let response = db::run_memory_gc(&d1, &body).await?;
             Response::from_json(&response)
