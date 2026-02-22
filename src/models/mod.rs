@@ -15,9 +15,11 @@ mod requests;
 // M1-M3 agent infrastructure — MCP task queue, agents, checkpoints, events. WS5 memory.
 #[allow(dead_code)]
 mod mcp;
+mod memory;
 
 pub use entities::*;
 pub use mcp::{CreateMemory, Memory, MemoryCreated};
+pub use memory::*;
 pub use orchestration::*;
 #[allow(unused_imports)]
 pub use relationships::*;

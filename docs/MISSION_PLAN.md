@@ -1,5 +1,11 @@
 # Mission Plan
 
+## Phase WS1: Source Extraction Baseline (Issue #42)
+- source inventory matrix completed: `docs/ws1/SOURCE_INVENTORY_MATRIX.md`
+- capability gap map completed: `docs/ws1/CAPABILITY_GAP_MAP.md`
+- migration risk register completed: `docs/ws1/MIGRATION_RISK_REGISTER.md`
+- architecture seed completed: `docs/ws1/ARCHITECTURE_SEED.md`
+
 ## Phase M0: Contracts and Skeleton
 - finalize canonical entities: task, memory, run_event, artifact, context_pack, policy_decision
 - lock API contracts for ingest/query/task-loop
@@ -24,6 +30,13 @@
 - policy decision API
 - replay slices and trace exports
 - risk-tiered controls and approvals
+
+## Phase WS5: Retrieval and Memory Federation
+- memory indexing and ranked retrieval endpoints
+- context packing with token-budget constraints
+- stale/unsafe/conflict-aware filtering
+- memory lifecycle retirement + GC
+- retrieval feedback and evaluation metrics
 
 ## Immediate Next Tasks
 1. ~~Add D1 schema migration for silver entities.~~ (done: `migrations/0001_silver_entities.sql`, D1 binding in wrangler)
