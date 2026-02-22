@@ -625,7 +625,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 };
                 let max_items = parse_limit_query(req.url().ok(), "max_items").unwrap_or(50);
                 let d1 = ctx.env.d1("DB")?;
-                let checkpoint = db::get_latest_checkpoint(&d1, &tenant_ctx.tenant_id, &thread_id).await?;
+                let checkpoint =
+                    db::get_latest_checkpoint(&d1, &tenant_ctx.tenant_id, &thread_id).await?;
                 let memories = db::list_memories_for_thread(&d1, &thread_id, max_items).await?;
                 Response::from_json(&serde_json::json!({
                     "thread_id": thread_id,
@@ -645,7 +646,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 parse_limit_query(req.url().ok(), "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
             let d1 = ctx.env.d1("DB")?;
             // Fetch limit+1 to detect truncation without a separate COUNT query
-            let mut events = db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
+            let mut events =
+                db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
             let truncated = events.len() > limit as usize;
             if truncated {
                 events.truncate(limit as usize);
