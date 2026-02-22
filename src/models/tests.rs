@@ -571,3 +571,57 @@ fn trace_response_serializes() {
     assert_eq!(json["run_id"], "r1");
     assert_eq!(json["events"].as_array().unwrap().len(), 1);
 }
+
+// ── WS5: Retrieval & Memory ────────────────────────────────────
+
+#[test]
+fn upsert_memory_item_round_trip() {
+    let input = r#"{
+        "repo":"stevedores-org/data-fabric",
+        "kind":"checkpoint",
+        "run_id":"r1",
+        "thread_id":"th-1",
+        "summary":"checkpoint after codegen",
+        "tags":["ci","checkpoint"],
+        "success_rate":0.9,
+        "ttl_seconds":3600
+    }"#;
+    let parsed: UpsertMemoryItemRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.repo, "stevedores-org/data-fabric");
+    assert_eq!(parsed.kind, MemoryKind::Checkpoint);
+    assert_eq!(parsed.tags.len(), 2);
+}
+
+#[test]
+fn retrieve_memory_defaults_apply() {
+    let input = r#"{"repo":"stevedores-org/data-fabric","query":"fix failing checks"}"#;
+    let parsed: RetrieveMemoryRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.top_k, 8);
+    assert!(!parsed.include_stale);
+    assert!(!parsed.include_unsafe);
+    assert!(!parsed.include_conflicted);
+}
+
+#[test]
+fn context_pack_request_defaults_budget() {
+    let input =
+        r#"{"repo":"stevedores-org/data-fabric","query":"orchestrator retry loop","top_k":5}"#;
+    let parsed: ContextPackRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.token_budget, 4096);
+    assert_eq!(parsed.retrieval.top_k, 5);
+}
+
+#[test]
+fn retrieval_feedback_round_trip() {
+    let input = r#"{
+        "query_id":"q1",
+        "success":true,
+        "first_pass_success":false,
+        "cache_hit":true,
+        "latency_ms":120
+    }"#;
+    let parsed: RetrievalFeedback = serde_json::from_str(input).unwrap();
+    assert!(parsed.success);
+    assert!(parsed.cache_hit);
+    assert_eq!(parsed.latency_ms, Some(120));
+}
