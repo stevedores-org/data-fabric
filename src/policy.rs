@@ -56,6 +56,7 @@ pub struct PolicyBundle {
 
 #[derive(Debug, Clone)]
 pub struct Decision {
+    pub decision_id: String,
     pub decision: String,
     pub reason: String,
     pub risk_level: RiskLevel,
@@ -68,6 +69,7 @@ pub struct Decision {
 pub async fn evaluate_policy(
     env: &Env,
     d1: &D1Database,
+    tenant_id: &str,
     req: &models::PolicyCheckRequest,
 ) -> Result<Decision> {
     let bundle = load_policy_bundle(env)
@@ -146,6 +148,7 @@ pub async fn evaluate_policy(
 
     db::record_policy_check_detailed(
         d1,
+        tenant_id,
         &decision_id,
         req,
         decision_str,
@@ -159,6 +162,7 @@ pub async fn evaluate_policy(
     .await?;
 
     Ok(Decision {
+        decision_id,
         decision: decision_str.into(),
         reason,
         risk_level: risk,

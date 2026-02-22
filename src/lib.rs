@@ -5,6 +5,7 @@ mod db;
 mod models;
 mod policy;
 mod storage;
+mod tenant;
 
 #[derive(Serialize)]
 struct HealthResponse<'a> {
@@ -15,9 +16,28 @@ struct HealthResponse<'a> {
 
 const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 
+fn is_public_path(path: &str) -> bool {
+    path == "/" || path == "/health"
+}
+
+fn request_path(req: &Request) -> Result<String> {
+    Ok(req.url()?.path().to_string())
+}
+
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
+
+    let path = request_path(&req)?;
+    if !is_public_path(&path) {
+        let tenant_ctx = match tenant::tenant_from_request(&req) {
+            Ok(ctx) => ctx,
+            Err(_) => return Response::error("missing or invalid tenant context", 401),
+        };
+        if tenant::authorize(&tenant_ctx, req.method(), &path).is_err() {
+            return Response::error("forbidden by tenant role policy", 403);
+        }
+    }
 
     let router = Router::new();
 
@@ -31,18 +51,36 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 mission: "velocity-for-autonomous-agent-builders",
             })
         })
+        // ── Tenants (WS8) ─────────────────────────────────────
+        .post_async("/v1/tenants/provision", |mut req, ctx| async move {
+            let body: models::TenantProvisionRequest = req.json().await?;
+            if body.tenant_id.trim().is_empty() || body.display_name.trim().is_empty() {
+                return Response::error("tenant_id and display_name are required", 400);
+            }
+            let d1 = ctx.env.d1("DB")?;
+            let started = js_sys::Date::now();
+            db::provision_tenant(&d1, &body).await?;
+            let elapsed = (js_sys::Date::now() - started) as i64;
+            Response::from_json(&models::TenantProvisionResponse {
+                tenant_id: body.tenant_id,
+                status: "provisioned".to_string(),
+                provisioned_in_ms: elapsed,
+            })
+        })
         // ── Runs (WS2, D1-backed) ────────────────────────────
         .post_async("/v1/runs", |mut req, ctx| async move {
             let body: models::CreateRun = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::create_run(&d1, &id, &body).await?;
+            db::create_run(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&models::Created {
                 id,
                 status: "created".into(),
             })
         })
         .get_async("/v1/runs", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let url = req.url()?;
             let params: std::collections::HashMap<String, String> = url
                 .query_pairs()
@@ -55,13 +93,14 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .unwrap_or(50u32)
                 .min(200);
             let d1 = ctx.env.d1("DB")?;
-            let runs = db::list_runs(&d1, repo, limit).await?;
+            let runs = db::list_runs(&d1, &tenant_ctx.tenant_id, repo, limit).await?;
             Response::from_json(&serde_json::json!({ "runs": runs }))
         })
-        .get_async("/v1/runs/:id", |_req, ctx| async move {
+        .get_async("/v1/runs/:id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let id = ctx.param("id").unwrap().to_string();
             let d1 = ctx.env.d1("DB")?;
-            match db::get_run(&d1, &id).await? {
+            match db::get_run(&d1, &tenant_ctx.tenant_id, &id).await? {
                 Some(run) => Response::from_json(&run),
                 None => Response::error("run not found", 404),
             }
@@ -70,26 +109,29 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/v1/runs/:run_id/tasks", |mut req, ctx| async move {
             let run_id = ctx.param("run_id").unwrap().to_string();
             let body: models::CreateTask = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::create_ws2_task(&d1, &id, &run_id, &body).await?;
+            db::create_ws2_task(&d1, &tenant_ctx.tenant_id, &id, &run_id, &body).await?;
             Response::from_json(&models::Created {
                 id,
                 status: "created".into(),
             })
         })
-        .get_async("/v1/runs/:run_id/tasks", |_req, ctx| async move {
+        .get_async("/v1/runs/:run_id/tasks", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let run_id = ctx.param("run_id").unwrap().to_string();
             let d1 = ctx.env.d1("DB")?;
-            let tasks = db::list_ws2_tasks(&d1, &run_id).await?;
+            let tasks = db::list_ws2_tasks(&d1, &tenant_ctx.tenant_id, &run_id).await?;
             Response::from_json(&serde_json::json!({ "tasks": tasks }))
         })
         // ── Plans (WS2, D1-backed) ──────────────────────────
         .post_async("/v1/plans", |mut req, ctx| async move {
             let body: models::CreatePlan = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::create_plan(&d1, &id, &body).await?;
+            db::create_plan(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&models::Created {
                 id,
                 status: "created".into(),
@@ -98,9 +140,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── Tool Calls (WS2, D1-backed) ─────────────────────
         .post_async("/v1/tool-calls", |mut req, ctx| async move {
             let body: models::RecordToolCall = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::record_tool_call(&d1, &id, &body).await?;
+            db::record_tool_call(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&models::Created {
                 id,
                 status: "recorded".into(),
@@ -109,9 +152,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── Releases (WS2, D1-backed) ───────────────────────
         .post_async("/v1/releases", |mut req, ctx| async move {
             let body: models::CreateRelease = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::create_release(&d1, &id, &body).await?;
+            db::create_release(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&models::Created {
                 id,
                 status: "created".into(),
@@ -120,9 +164,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── Provenance Events (WS3, D1-backed) ──────────────
         .post_async("/v1/events", |mut req, ctx| async move {
             let body: models::IngestEvent = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::ingest_event(&d1, &id, &body).await?;
+            db::ingest_event(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&models::EventAck {
                 id,
                 event_type: body.event_type,
@@ -198,6 +243,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         // ── Artifacts (R2-backed) ─────────────────────────────
         .put_async("/v1/artifacts/:key", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let key = match ctx.param("key") {
                 Some(k) => k.to_string(),
                 None => return Response::error("missing artifact key", 400),
@@ -207,20 +253,24 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 return Response::error("artifact exceeds max size", 413);
             }
             let bucket = ctx.env.bucket("ARTIFACTS")?;
-            let size = storage::put_blob(&bucket, &key, data).await?;
+            let scoped_key = format!("{}{}", tenant_ctx.r2_prefix(), key);
+            let size = storage::put_blob(&bucket, &scoped_key, data).await?;
             Response::from_json(&serde_json::json!({
                 "key": key,
+                "scoped_key": scoped_key,
                 "size": size,
                 "stored": true,
             }))
         })
-        .get_async("/v1/artifacts/:key", |_req, ctx| async move {
+        .get_async("/v1/artifacts/:key", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let key = match ctx.param("key") {
                 Some(k) => k.to_string(),
                 None => return Response::error("missing artifact key", 400),
             };
             let bucket = ctx.env.bucket("ARTIFACTS")?;
-            match storage::get_blob(&bucket, &key).await? {
+            let scoped_key = format!("{}{}", tenant_ctx.r2_prefix(), key);
+            match storage::get_blob(&bucket, &scoped_key).await? {
                 Some(data) => {
                     let headers = Headers::new();
                     headers.set("content-type", "application/octet-stream")?;
@@ -232,8 +282,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── Policy & Governance (WS4) ──────────────────────────
         .post_async("/v1/policies/check", |mut req, ctx| async move {
             let body: models::PolicyCheckRequest = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
-            let evaluated = policy::evaluate_policy(&ctx.env, &d1, &body).await?;
+            let evaluated =
+                policy::evaluate_policy(&ctx.env, &d1, &tenant_ctx.tenant_id, &body).await?;
             Response::from_json(&models::PolicyCheckResponse {
                 id: evaluated.decision_id.clone(),
                 action: body.action,
@@ -249,6 +301,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── Policy Rules CRUD (WS4) ─────────────────────────────
         .post_async("/v1/policies/rules", |mut req, ctx| async move {
             let body: models::CreatePolicyRule = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             // Validate verdict
             match body.verdict.as_str() {
                 "allow" | "deny" | "escalate" => {}
@@ -266,22 +319,24 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::create_policy_rule(&d1, &id, &body).await?;
+            db::create_policy_rule(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&models::Created {
                 id,
                 status: "created".into(),
             })
         })
-        .get_async("/v1/policies/rules", |_req, ctx| async move {
+        .get_async("/v1/policies/rules", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
-            let rules = db::list_policy_rules(&d1).await?;
+            let rules = db::list_policy_rules(&d1, &tenant_ctx.tenant_id).await?;
             let responses: Vec<_> = rules.into_iter().map(|r| r.into_response()).collect();
             Response::from_json(&serde_json::json!({ "rules": responses }))
         })
-        .get_async("/v1/policies/rules/:id", |_req, ctx| async move {
+        .get_async("/v1/policies/rules/:id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let id = ctx.param("id").unwrap().to_string();
             let d1 = ctx.env.d1("DB")?;
-            match db::get_policy_rule(&d1, &id).await? {
+            match db::get_policy_rule(&d1, &tenant_ctx.tenant_id, &id).await? {
                 Some(rule) => Response::from_json(&rule.into_response()),
                 None => Response::error("rule not found", 404),
             }
@@ -289,6 +344,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .patch_async("/v1/policies/rules/:id", |mut req, ctx| async move {
             let id = ctx.param("id").unwrap().to_string();
             let body: models::UpdatePolicyRule = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             // Validate verdict if provided
             if let Some(ref v) = body.verdict {
                 match v.as_str() {
@@ -308,9 +364,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
             }
             let d1 = ctx.env.d1("DB")?;
-            let updated = db::update_policy_rule(&d1, &id, &body).await?;
+            let updated = db::update_policy_rule(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             if updated {
-                match db::get_policy_rule(&d1, &id).await? {
+                match db::get_policy_rule(&d1, &tenant_ctx.tenant_id, &id).await? {
                     Some(rule) => Response::from_json(&rule.into_response()),
                     None => Response::error("rule not found", 404),
                 }
@@ -318,10 +374,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Response::error("rule not found", 404)
             }
         })
-        .delete_async("/v1/policies/rules/:id", |_req, ctx| async move {
+        .delete_async("/v1/policies/rules/:id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let id = ctx.param("id").unwrap().to_string();
             let d1 = ctx.env.d1("DB")?;
-            let deleted = db::delete_policy_rule(&d1, &id).await?;
+            let deleted = db::delete_policy_rule(&d1, &tenant_ctx.tenant_id, &id).await?;
             if deleted {
                 Response::from_json(&serde_json::json!({ "deleted": true }))
             } else {
@@ -330,6 +387,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         // ── Policy Decision History (WS4) ────────────────────────
         .get_async("/v1/policies/decisions", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let url = req.url()?;
             let params: std::collections::HashMap<String, String> = url
                 .query_pairs()
@@ -344,7 +402,15 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .unwrap_or(50u32)
                 .min(200);
             let d1 = ctx.env.d1("DB")?;
-            let decisions = db::list_policy_decisions(&d1, action, actor, decision, limit).await?;
+            let decisions = db::list_policy_decisions(
+                &d1,
+                &tenant_ctx.tenant_id,
+                action,
+                actor,
+                decision,
+                limit,
+            )
+            .await?;
             let responses: Vec<_> = decisions.into_iter().map(|d| d.into_response()).collect();
             Response::from_json(&serde_json::json!({ "decisions": responses }))
         })
@@ -387,15 +453,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── Agent Tasks (M1) ──────────────────────────────────
         .post_async("/v1/tasks", |mut req, ctx| async move {
             let body: models::CreateAgentTask = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::create_task(&d1, &id, &body).await?;
+            db::create_task(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&models::TaskCreated {
                 id,
                 status: "pending".into(),
             })
         })
         .get_async("/mcp/task/next", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let url = req.url()?;
             let params: std::collections::HashMap<String, String> = url
                 .query_pairs()
@@ -414,12 +482,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             };
 
             let d1 = ctx.env.d1("DB")?;
-            match db::claim_next_task(&d1, &agent_id, &caps).await? {
+            match db::claim_next_task(&d1, &tenant_ctx.tenant_id, &agent_id, &caps).await? {
                 Some(task) => Response::from_json(&task),
                 None => Ok(Response::empty()?.with_status(204)),
             }
         })
         .post_async("/mcp/task/:id/heartbeat", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let task_id = match ctx.param("id") {
                 Some(id) => id.to_string(),
                 None => return Response::error("missing task id", 400),
@@ -435,7 +504,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             };
 
             let d1 = ctx.env.d1("DB")?;
-            let updated = db::heartbeat_task(&d1, &task_id, &agent_id).await?;
+            let updated =
+                db::heartbeat_task(&d1, &tenant_ctx.tenant_id, &task_id, &agent_id).await?;
             if updated {
                 Response::from_json(&serde_json::json!({ "ok": true }))
             } else {
@@ -443,13 +513,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .post_async("/mcp/task/:id/complete", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let task_id = match ctx.param("id") {
                 Some(id) => id.to_string(),
                 None => return Response::error("missing task id", 400),
             };
             let body: models::TaskCompleteRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-            let updated = db::complete_task(&d1, &task_id, body.result.as_ref()).await?;
+            let updated =
+                db::complete_task(&d1, &tenant_ctx.tenant_id, &task_id, body.result.as_ref())
+                    .await?;
             if updated {
                 Response::from_json(&serde_json::json!({ "status": "completed" }))
             } else {
@@ -457,44 +530,54 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .post_async("/mcp/task/:id/fail", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let task_id = match ctx.param("id") {
                 Some(id) => id.to_string(),
                 None => return Response::error("missing task id", 400),
             };
             let body: models::TaskFailRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-            let new_status = db::fail_task(&d1, &task_id, &body.error).await?;
+            let new_status =
+                db::fail_task(&d1, &tenant_ctx.tenant_id, &task_id, &body.error).await?;
             Response::from_json(&serde_json::json!({ "status": new_status }))
         })
         // ── Agents (M1) ───────────────────────────────────────
         .post_async("/v1/agents", |mut req, ctx| async move {
             let body: models::RegisterAgent = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::register_agent(&d1, &id, &body).await?;
+            db::register_agent(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&serde_json::json!({
                 "id": id,
                 "name": body.name,
                 "status": "active",
             }))
         })
-        .get_async("/v1/agents", |_req, ctx| async move {
+        .get_async("/v1/agents", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
-            let agents = db::list_agents(&d1).await?;
+            let agents = db::list_agents(&d1, &tenant_ctx.tenant_id).await?;
             Response::from_json(&serde_json::json!({ "agents": agents }))
         })
         // ── Checkpoints (M2) ──────────────────────────────────
         .post_async("/v1/checkpoints", |mut req, ctx| async move {
             let body: models::CreateCheckpoint = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let bucket = ctx.env.bucket("ARTIFACTS")?;
             let id = generate_id()?;
-            let r2_key = format!("checkpoints/{}/{}", body.thread_id, id);
+            let r2_key = format!(
+                "{}checkpoints/{}/{}",
+                tenant_ctx.r2_prefix(),
+                body.thread_id,
+                id
+            );
 
             let state_bytes =
                 serde_json::to_vec(&body.state).map_err(|e| Error::RustError(e.to_string()))?;
             let size = storage::put_blob(&bucket, &r2_key, state_bytes).await? as i64;
-            db::create_checkpoint(&d1, &id, &body, &r2_key, size).await?;
+            db::create_checkpoint(&d1, &tenant_ctx.tenant_id, &id, &body, &r2_key, size).await?;
 
             Response::from_json(&models::CheckpointCreated {
                 id,
@@ -504,37 +587,40 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async(
             "/v1/checkpoints/threads/:thread_id",
-            |_req, ctx| async move {
+            |req, ctx| async move {
+                let tenant_ctx = tenant::tenant_from_request(&req)?;
                 let thread_id = ctx.param("thread_id").unwrap().to_string();
                 let d1 = ctx.env.d1("DB")?;
-                match db::get_latest_checkpoint(&d1, &thread_id).await? {
+                match db::get_latest_checkpoint(&d1, &tenant_ctx.tenant_id, &thread_id).await? {
                     Some(row) => Response::from_json(&row.into_checkpoint()),
                     None => Response::error("no checkpoint found", 404),
                 }
             },
         )
-        .get_async("/v1/checkpoints/:id", |_req, ctx| async move {
+        .get_async("/v1/checkpoints/:id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let id = ctx.param("id").unwrap().to_string();
             let d1 = ctx.env.d1("DB")?;
-            match db::get_checkpoint_by_id(&d1, &id).await? {
+            match db::get_checkpoint_by_id(&d1, &tenant_ctx.tenant_id, &id).await? {
                 Some(row) => Response::from_json(&row.into_checkpoint()),
                 None => Response::error("checkpoint not found", 404),
             }
         })
-        .delete_async("/v1/checkpoints/:id", |_req, ctx| async move {
+        .delete_async("/v1/checkpoints/:id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let id = match ctx.param("id") {
                 Some(k) => k.to_string(),
                 None => return Response::error("missing checkpoint id", 400),
             };
             let d1 = ctx.env.d1("DB")?;
 
-            let row = match db::get_checkpoint_by_id(&d1, &id).await? {
+            let row = match db::get_checkpoint_by_id(&d1, &tenant_ctx.tenant_id, &id).await? {
                 Some(r) => r,
                 None => return Response::error("checkpoint not found", 404),
             };
             let r2_key = row.state_r2_key.clone();
 
-            let deleted = db::delete_checkpoint(&d1, &id).await?;
+            let deleted = db::delete_checkpoint(&d1, &tenant_ctx.tenant_id, &id).await?;
             if deleted {
                 let bucket = ctx.env.bucket("ARTIFACTS")?;
                 let _ = storage::delete_blob(&bucket, &r2_key).await;
@@ -569,13 +655,15 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .get_async(
             "/v1/context-pack/threads/:thread_id",
             |req, ctx| async move {
+                let tenant_ctx = tenant::tenant_from_request(&req)?;
                 let thread_id = match ctx.param("thread_id") {
                     Some(t) => t.to_string(),
                     None => return Response::error("missing thread_id", 400),
                 };
                 let max_items = parse_limit_query(req.url().ok(), "max_items").unwrap_or(50);
                 let d1 = ctx.env.d1("DB")?;
-                let checkpoint = db::get_latest_checkpoint(&d1, &thread_id).await?;
+                let checkpoint =
+                    db::get_latest_checkpoint(&d1, &tenant_ctx.tenant_id, &thread_id).await?;
                 let memories = db::list_memories_for_thread(&d1, &thread_id, max_items).await?;
                 Response::from_json(&serde_json::json!({
                     "thread_id": thread_id,
@@ -586,6 +674,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         )
         // ── Traces / Provenance (WS3: issue #43) ──────────────
         .get_async("/v1/traces/:run_id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let run_id = match ctx.param("run_id") {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
@@ -594,7 +683,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 parse_limit_query(req.url().ok(), "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
             let d1 = ctx.env.d1("DB")?;
             // Fetch limit+1 to detect truncation without a separate COUNT query
-            let mut events = db::get_trace_for_run(&d1, &run_id, limit + 1).await?;
+            let mut events =
+                db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
             let truncated = events.len() > limit as usize;
             if truncated {
                 events.truncate(limit as usize);
@@ -607,13 +697,14 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             })
         })
         .get_async("/v1/traces/:run_id/lineage", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let run_id = match ctx.param("run_id") {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
             };
             let limit = parse_limit_query(req.url().ok(), "hops").unwrap_or(100);
             let d1 = ctx.env.d1("DB")?;
-            let events = db::get_trace_for_run(&d1, &run_id, limit).await?;
+            let events = db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit).await?;
             Response::from_json(&models::TraceResponse {
                 run_id,
                 events,
@@ -678,6 +769,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── Graph Events (M3) ─────────────────────────────────
         .post_async("/v1/graph-events", |mut req, ctx| async move {
             let body: models::GraphEventBatch = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
 
@@ -689,7 +781,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
 
             let count = events.len();
-            db::insert_events_bronze(&d1, &events).await?;
+            db::insert_events_bronze(&d1, &tenant_ctx.tenant_id, &events).await?;
 
             let mut silver_events: Vec<(String, String, &models::GraphEvent, String)> =
                 Vec::with_capacity(events.len());
@@ -697,7 +789,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let silver_id = generate_id()?;
                 silver_events.push((silver_id, bronze_id.clone(), evt, created_at.clone()));
             }
-            db::insert_events_silver(&d1, &silver_events, &now).await?;
+            db::insert_events_silver(&d1, &tenant_ctx.tenant_id, &silver_events, &now).await?;
 
             Response::from_json(&models::GraphEventAck {
                 accepted: count,
