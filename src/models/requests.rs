@@ -53,6 +53,7 @@ pub struct PolicyCheckRequest {
     pub actor: String,
     pub resource: Option<String>,
     pub context: Option<serde_json::Value>,
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -85,8 +86,16 @@ pub struct PolicyCheckResponse {
     pub action: String,
     pub decision: String,
     pub reason: String,
-    pub risk_level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limited: Option<bool>,
 }
 
 // ── Policy rules CRUD ──────────────────────────────────────────
@@ -175,4 +184,66 @@ pub struct TenantProvisionResponse {
     pub tenant_id: String,
     pub status: String,
     pub provisioned_in_ms: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct PutPolicyDefinitionRequest {
+    pub bundle: serde_json::Value,
+    #[serde(default)]
+    pub activate: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct PolicyDefinitionResponse {
+    pub version: String,
+    pub stored: bool,
+    pub activated: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct PolicyActivationResponse {
+    pub version: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ActivePolicyResponse {
+    pub version: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct RetentionRunRequest {
+    #[serde(default = "default_events_ttl_days")]
+    pub events_ttl_days: i64,
+    #[serde(default = "default_artifacts_ttl_days")]
+    pub artifacts_ttl_days: i64,
+    #[serde(default = "default_checkpoints_ttl_days")]
+    pub checkpoints_ttl_days: i64,
+    #[serde(default = "default_policy_ttl_days")]
+    pub policy_ttl_days: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct RetentionRunResponse {
+    pub events_deleted: usize,
+    pub artifacts_deleted: usize,
+    pub checkpoints_deleted: usize,
+    pub policy_decisions_deleted: usize,
+}
+
+fn default_events_ttl_days() -> i64 {
+    30
+}
+
+fn default_artifacts_ttl_days() -> i64 {
+    30
+}
+
+fn default_checkpoints_ttl_days() -> i64 {
+    30
+}
+
+fn default_policy_ttl_days() -> i64 {
+    90
 }
