@@ -1,4 +1,3 @@
-use futures_util::StreamExt;
 use serde::Serialize;
 use worker::*;
 
@@ -78,32 +77,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 accepted: true,
             })
         })
-        // ── Artifacts (R2-backed, streaming validated) ────────
+        // ── Artifacts (R2-backed) ─────────────────────────────
         .put_async("/v1/artifacts/:key", |mut req, ctx| async move {
-            let Some(key) = ctx.param("key").map(ToString::to_string) else {
-                return Response::error("missing artifact key", 400);
+            let key = match ctx.param("key") {
+                Some(k) => k.to_string(),
+                None => return Response::error("missing artifact key", 400),
             };
-
-            if let Some(value) = req.headers().get("content-length")? {
-                let content_length = match value.parse::<usize>() {
-                    Ok(parsed) => parsed,
-                    Err(_) => return Response::error("invalid content-length header", 400),
-                };
-                if content_length > MAX_ARTIFACT_BYTES {
-                    return Response::error("artifact exceeds max size", 413);
-                }
+            let data = req.bytes().await?;
+            if data.len() > MAX_ARTIFACT_BYTES {
+                return Response::error("artifact exceeds max size", 413);
             }
-
-            let mut stream = req.stream()?;
-            let mut data = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                data.extend_from_slice(&chunk);
-                if data.len() > MAX_ARTIFACT_BYTES {
-                    return Response::error("artifact exceeds max size", 413);
-                }
-            }
-
             let bucket = ctx.env.bucket("ARTIFACTS")?;
             let size = storage::put_blob(&bucket, &key, data).await?;
             Response::from_json(&serde_json::json!({
@@ -113,8 +96,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }))
         })
         .get_async("/v1/artifacts/:key", |_req, ctx| async move {
-            let Some(key) = ctx.param("key").map(ToString::to_string) else {
-                return Response::error("missing artifact key", 400);
+            let key = match ctx.param("key") {
+                Some(k) => k.to_string(),
+                None => return Response::error("missing artifact key", 400),
             };
             let bucket = ctx.env.bucket("ARTIFACTS")?;
             match storage::get_blob(&bucket, &key).await? {
@@ -172,7 +156,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .post_async("/mcp/task/:id/heartbeat", |req, ctx| async move {
-            let task_id = ctx.param("id").unwrap().to_string();
+            let task_id = match ctx.param("id") {
+                Some(id) => id.to_string(),
+                None => return Response::error("missing task id", 400),
+            };
             let url = req.url()?;
             let params: std::collections::HashMap<String, String> = url
                 .query_pairs()
@@ -192,7 +179,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .post_async("/mcp/task/:id/complete", |mut req, ctx| async move {
-            let task_id = ctx.param("id").unwrap().to_string();
+            let task_id = match ctx.param("id") {
+                Some(id) => id.to_string(),
+                None => return Response::error("missing task id", 400),
+            };
             let body: models::TaskCompleteRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let updated = db::complete_task(&d1, &task_id, body.result.as_ref()).await?;
@@ -203,7 +193,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .post_async("/mcp/task/:id/fail", |mut req, ctx| async move {
-            let task_id = ctx.param("id").unwrap().to_string();
+            let task_id = match ctx.param("id") {
+                Some(id) => id.to_string(),
+                None => return Response::error("missing task id", 400),
+            };
             let body: models::TaskFailRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let new_status = db::fail_task(&d1, &task_id, &body.error).await?;
@@ -265,17 +258,22 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .delete_async("/v1/checkpoints/:id", |_req, ctx| async move {
-            let id = ctx.param("id").unwrap().to_string();
+            let id = match ctx.param("id") {
+                Some(k) => k.to_string(),
+                None => return Response::error("missing checkpoint id", 400),
+            };
             let d1 = ctx.env.d1("DB")?;
 
-            // Get R2 key before deleting
-            if let Some(row) = db::get_checkpoint_by_id(&d1, &id).await? {
-                let bucket = ctx.env.bucket("ARTIFACTS")?;
-                let _ = storage::delete_blob(&bucket, &row.state_r2_key).await;
-            }
+            let row = match db::get_checkpoint_by_id(&d1, &id).await? {
+                Some(r) => r,
+                None => return Response::error("checkpoint not found", 404),
+            };
+            let r2_key = row.state_r2_key.clone();
 
             let deleted = db::delete_checkpoint(&d1, &id).await?;
             if deleted {
+                let bucket = ctx.env.bucket("ARTIFACTS")?;
+                let _ = storage::delete_blob(&bucket, &r2_key).await;
                 Response::from_json(&serde_json::json!({ "deleted": true }))
             } else {
                 Response::error("checkpoint not found", 404)
@@ -287,11 +285,12 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let d1 = ctx.env.d1("DB")?;
             let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
 
-            let events: Vec<(String, &models::GraphEvent, String)> = body
-                .events
-                .iter()
-                .map(|e| (generate_id().unwrap_or_default(), e, now.clone()))
-                .collect();
+            let mut events: Vec<(String, &models::GraphEvent, String)> =
+                Vec::with_capacity(body.events.len());
+            for e in &body.events {
+                let id = generate_id()?;
+                events.push((id, e, now.clone()));
+            }
 
             let count = events.len();
             db::insert_events_bronze(&d1, &events).await?;

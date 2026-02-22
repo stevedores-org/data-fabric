@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-// ── Agent Task Queue (M1) ───────────────────────────────────────
+// ── MCP Task Queue (M1) ────────────────────────────────────────
 
+/// Request to create a new MCP task in the agent work queue.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct CreateAgentTask {
+pub struct CreateMcpTask {
     pub job_id: String,
     pub task_type: String,
     #[serde(default)]
@@ -15,8 +16,9 @@ pub struct CreateAgentTask {
     pub max_retries: Option<i32>,
 }
 
+/// A claimed MCP task with full lifecycle fields (lease, retry, agent).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct AgentTask {
+pub struct McpTask {
     pub id: String,
     pub job_id: String,
     pub task_type: String,
@@ -36,7 +38,7 @@ pub struct AgentTask {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct TaskCreated {
+pub struct McpTaskCreated {
     pub id: String,
     pub status: String,
 }
@@ -51,8 +53,9 @@ pub struct TaskFailRequest {
     pub error: String,
 }
 
-// ── Agent Registration (M1) ─────────────────────────────────────
+// ── Agents (M1) ────────────────────────────────────────────────
 
+/// Request to register a new agent.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct RegisterAgent {
     pub name: String,
@@ -61,6 +64,7 @@ pub struct RegisterAgent {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// A registered agent with heartbeat and status.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct Agent {
     pub id: String,
@@ -72,8 +76,9 @@ pub struct Agent {
     pub metadata: Option<serde_json::Value>,
 }
 
-// ── Checkpoints (M2: oxidizedgraph state) ───────────────────────
+// ── Checkpoints (M2) ──────────────────────────────────────────
 
+/// Request to create a checkpoint for oxidizedgraph state.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct CreateCheckpoint {
     pub thread_id: String,
@@ -83,6 +88,7 @@ pub struct CreateCheckpoint {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// A persisted checkpoint (state stored in R2, metadata in D1).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct Checkpoint {
     pub id: String,
@@ -102,8 +108,9 @@ pub struct CheckpointCreated {
     pub state_r2_key: String,
 }
 
-// ── Graph Events (M3: event pipeline) ───────────────────────────
+// ── Graph Events (M3) ─────────────────────────────────────────
 
+/// A single graph execution event (node start/end, edge traversal, etc).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct GraphEvent {
     pub run_id: Option<String>,

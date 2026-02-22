@@ -69,6 +69,7 @@ dependencies = [
  "js-sys",
  "serde",
  "serde_json",
+ "wasm-bindgen",
  "worker",
  "worker-macros",
 ]
