@@ -60,23 +60,26 @@ pub async fn claim_next_task(
     let now = now_iso();
     let lease = lease_time(300);
 
-    // Build capability filter: match any capability as task_type
-    let like_clause = if capabilities.is_empty() {
-        "1=1".to_string()
+    // Capability filter with parameterized placeholders (no SQL injection)
+    let (where_caps, bind_caps): (String, Vec<JsValue>) = if capabilities.is_empty() {
+        ("1=1".to_string(), vec![])
     } else {
-        capabilities
-            .iter()
-            .map(|c| format!("task_type = '{}'", c))
+        let placeholders = (1..=capabilities.len())
+            .map(|i| format!("task_type = ?{i}"))
             .collect::<Vec<_>>()
-            .join(" OR ")
+            .join(" OR ");
+        let values = capabilities
+            .iter()
+            .map(|c| JsValue::from_str(c))
+            .collect::<Vec<_>>();
+        (placeholders, values)
     };
 
     let query = format!(
-        "SELECT id FROM mcp_tasks WHERE status = 'pending' AND ({}) ORDER BY priority DESC, created_at ASC LIMIT 1",
-        like_clause
+        "SELECT id FROM mcp_tasks WHERE status = 'pending' AND ({where_caps}) ORDER BY priority DESC, created_at ASC LIMIT 1"
     );
 
-    let result: Option<TaskIdRow> = db.prepare(&query).bind(&[])?.first(None).await?;
+    let result: Option<TaskIdRow> = db.prepare(&query).bind(&bind_caps)?.first(None).await?;
 
     let task_id = match result {
         Some(row) => row.id,

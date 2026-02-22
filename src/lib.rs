@@ -89,6 +89,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             })
         })
         // ── Artifacts (R2-backed) ─────────────────────────────
+        // PUT buffers full body in memory; size limited by MAX_ARTIFACT_BYTES.
         .put_async("/v1/artifacts/:key", |mut req, ctx| async move {
             let key = match ctx.param("key") {
                 Some(k) => k.to_string(),
@@ -167,7 +168,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .post_async("/mcp/task/:id/heartbeat", |req, ctx| async move {
-            let task_id = ctx.param("id").unwrap().to_string();
+            let task_id = match ctx.param("id") {
+                Some(id) => id.to_string(),
+                None => return Response::error("missing task id", 400),
+            };
             let url = req.url()?;
             let params: std::collections::HashMap<String, String> = url
                 .query_pairs()
@@ -187,7 +191,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .post_async("/mcp/task/:id/complete", |mut req, ctx| async move {
-            let task_id = ctx.param("id").unwrap().to_string();
+            let task_id = match ctx.param("id") {
+                Some(id) => id.to_string(),
+                None => return Response::error("missing task id", 400),
+            };
             let body: models::TaskCompleteRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let updated = db::complete_task(&d1, &task_id, body.result.as_ref()).await?;
@@ -198,7 +205,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .post_async("/mcp/task/:id/fail", |mut req, ctx| async move {
-            let task_id = ctx.param("id").unwrap().to_string();
+            let task_id = match ctx.param("id") {
+                Some(id) => id.to_string(),
+                None => return Response::error("missing task id", 400),
+            };
             let body: models::TaskFailRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let new_status = db::fail_task(&d1, &task_id, &body.error).await?;
@@ -260,17 +270,22 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .delete_async("/v1/checkpoints/:id", |_req, ctx| async move {
-            let id = ctx.param("id").unwrap().to_string();
+            let id = match ctx.param("id") {
+                Some(k) => k.to_string(),
+                None => return Response::error("missing checkpoint id", 400),
+            };
             let d1 = ctx.env.d1("DB")?;
 
-            // Get R2 key before deleting
-            if let Some(row) = db::get_checkpoint_by_id(&d1, &id).await? {
-                let bucket = ctx.env.bucket("ARTIFACTS")?;
-                let _ = storage::delete_blob(&bucket, &row.state_r2_key).await;
-            }
+            let row = match db::get_checkpoint_by_id(&d1, &id).await? {
+                Some(r) => r,
+                None => return Response::error("checkpoint not found", 404),
+            };
+            let r2_key = row.state_r2_key.clone();
 
             let deleted = db::delete_checkpoint(&d1, &id).await?;
             if deleted {
+                let bucket = ctx.env.bucket("ARTIFACTS")?;
+                let _ = storage::delete_blob(&bucket, &r2_key).await;
                 Response::from_json(&serde_json::json!({ "deleted": true }))
             } else {
                 Response::error("checkpoint not found", 404)
@@ -282,11 +297,12 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let d1 = ctx.env.d1("DB")?;
             let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
 
-            let events: Vec<(String, &models::GraphEvent, String)> = body
-                .events
-                .iter()
-                .map(|e| (generate_id().unwrap_or_default(), e, now.clone()))
-                .collect();
+            let mut events: Vec<(String, &models::GraphEvent, String)> =
+                Vec::with_capacity(body.events.len());
+            for e in &body.events {
+                let id = generate_id()?;
+                events.push((id, e, now.clone()));
+            }
 
             let count = events.len();
             db::insert_events_bronze(&d1, &events).await?;
