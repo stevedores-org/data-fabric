@@ -29,7 +29,6 @@ impl IntegrationTarget {
 }
 
 /// Registration record for an active integration.
-#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct Integration {
     pub id: String,
@@ -229,20 +228,9 @@ pub mod aivcs {
             meta.insert("metadata".into(), user_meta.clone());
         }
 
-        let trigger_suffix = match evt.event_type {
-            PipelineEventType::PipelineStart => "pipeline_start",
-            PipelineEventType::PipelineEnd => "pipeline_end",
-            PipelineEventType::StageStart => "stage_start",
-            PipelineEventType::StageEnd => "stage_end",
-            PipelineEventType::TestResult => "test_result",
-            PipelineEventType::BuildComplete => "build_complete",
-            PipelineEventType::DeployStart => "deploy_start",
-            PipelineEventType::DeployEnd => "deploy_end",
-        };
-
         Some(crate::models::CreateRun {
             repo: evt.repo.clone(),
-            trigger: Some(format!("aivcs:{trigger_suffix}")),
+            trigger: Some("aivcs:pipeline_start".into()),
             actor: Some(evt.actor.clone()),
             metadata: Some(serde_json::Value::Object(meta)),
         })
@@ -271,10 +259,9 @@ pub mod aivcs {
             payload.insert("commit_sha".into(), serde_json::Value::String(sha.clone()));
         }
         if let Some(ref arts) = evt.artifacts {
-            payload.insert(
-                "artifacts".into(),
-                serde_json::to_value(arts).unwrap_or_default(),
-            );
+            if let Ok(v) = serde_json::to_value(arts) {
+                payload.insert("artifacts".into(), v);
+            }
         }
         if let Some(ref meta) = evt.metadata {
             payload.insert("metadata".into(), meta.clone());
@@ -358,10 +345,10 @@ pub mod llama_rs {
             params.insert("messages".into(), msgs.clone());
         }
         if let Some(temp) = req.temperature {
-            params.insert(
-                "temperature".into(),
-                serde_json::Value::Number(serde_json::Number::from_f64(temp).unwrap_or(0.into())),
-            );
+            if let Some(n) = serde_json::Number::from_f64(temp) {
+                params.insert("temperature".into(), serde_json::Value::Number(n));
+            }
+            // Skip NaN/Infinity rather than silently defaulting to 0
         }
         if let Some(max) = req.max_tokens {
             params.insert("max_tokens".into(), serde_json::Value::Number(max.into()));

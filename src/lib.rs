@@ -769,13 +769,14 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         // ── WS6: Integration Registry ────────────────────────
         .post_async("/v1/integrations", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: integrations::RegisterIntegration = req.json().await?;
             if body.name.trim().is_empty() || body.name.len() > 256 {
                 return Response::error("name must be 1-256 characters", 400);
             }
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::register_integration(&d1, &id, &body).await?;
+            db::register_integration(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&serde_json::json!({
                 "id": id,
                 "target": body.target,
@@ -784,11 +785,12 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }))
         })
         .get_async("/v1/integrations", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let limit = parse_limit_query(req.url().ok(), "limit")
                 .unwrap_or(50)
                 .min(200);
             let d1 = ctx.env.d1("DB")?;
-            let list = db::list_integrations(&d1, limit).await?;
+            let list = db::list_integrations(&d1, &tenant_ctx.tenant_id, limit).await?;
             Response::from_json(&serde_json::json!({ "integrations": list }))
         })
         // ── WS6: oxidizedgraph intake ───────────────────────
@@ -797,40 +799,30 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             |mut req, ctx| async move {
                 let tenant_ctx = tenant::tenant_from_request(&req)?;
                 let batch: integrations::oxidizedgraph::GraphExecBatch = req.json().await?;
+                if batch.events.len() > db::INTEGRATION_BATCH_LIMIT {
+                    return Response::error(
+                        format!("batch exceeds max {} events", db::INTEGRATION_BATCH_LIMIT),
+                        400,
+                    );
+                }
                 let d1 = ctx.env.d1("DB")?;
                 let bucket = ctx.env.bucket("ARTIFACTS")?;
                 let now = db::now_iso();
 
                 let owned_events = integrations::oxidizedgraph::adapt_to_graph_events(&batch);
-                let mut bronze_events: Vec<(String, models::GraphEvent, String)> = Vec::new();
-                for evt in owned_events {
-                    let id = generate_id()?;
-                    bronze_events.push((id, evt, now.clone()));
-                }
-                let event_count = bronze_events.len();
-                if !bronze_events.is_empty() {
-                    let refs: Vec<(String, &models::GraphEvent, String)> = bronze_events
-                        .iter()
-                        .map(|(id, evt, ts)| (id.clone(), evt, ts.clone()))
-                        .collect();
-                    db::insert_events_bronze(&d1, &tenant_ctx.tenant_id, &refs).await?;
-
-                    let mut silver_events: Vec<(String, String, &models::GraphEvent, String)> =
-                        Vec::with_capacity(refs.len());
-                    for (bronze_id, evt, created_at) in &refs {
-                        let silver_id = generate_id()?;
-                        silver_events.push((silver_id, bronze_id.clone(), evt, created_at.clone()));
-                    }
-                    db::insert_events_silver(&d1, &tenant_ctx.tenant_id, &silver_events, &now)
+                let event_count =
+                    ingest_events_bronze_silver(&d1, &tenant_ctx.tenant_id, owned_events, &now)
                         .await?;
-                }
 
                 let mut checkpoint_count = 0usize;
                 for evt in &batch.events {
                     if let Some(cp) = integrations::oxidizedgraph::adapt_to_checkpoint(&batch, evt)
                     {
                         let id = generate_id()?;
-                        let r2_key = format!("checkpoints/{}/{}", cp.thread_id, id);
+                        let r2_key = format!(
+                            "checkpoints/{}/{}/{}",
+                            tenant_ctx.tenant_id, cp.thread_id, id
+                        );
                         let state_bytes = serde_json::to_vec(&cp.state)
                             .map_err(|e| Error::RustError(e.to_string()))?;
                         let size = storage::put_blob(&bucket, &r2_key, state_bytes).await? as i64;
@@ -840,7 +832,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     }
                 }
 
-                if let Err(e) = db::touch_integration(&d1, "oxidizedgraph").await {
+                if let Err(e) =
+                    db::touch_integration(&d1, &tenant_ctx.tenant_id, "oxidizedgraph").await
+                {
                     worker::console_log!("WARN: touch_integration(oxidizedgraph) failed: {e:?}");
                 }
 
@@ -868,7 +862,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let evt_id = generate_id()?;
             db::ingest_event(&d1, &tenant_ctx.tenant_id, &evt_id, &fabric_evt).await?;
 
-            if let Err(e) = db::touch_integration(&d1, "aivcs").await {
+            if let Err(e) = db::touch_integration(&d1, &tenant_ctx.tenant_id, "aivcs").await {
                 worker::console_log!("WARN: touch_integration(aivcs) failed: {e:?}");
             }
 
@@ -890,7 +884,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let id = generate_id()?;
                 db::create_task(&d1, &tenant_ctx.tenant_id, &id, &task).await?;
 
-                if let Err(e) = db::touch_integration(&d1, "llama_rs").await {
+                if let Err(e) = db::touch_integration(&d1, &tenant_ctx.tenant_id, "llama_rs").await
+                {
                     worker::console_log!("WARN: touch_integration(llama_rs) failed: {e:?}");
                 }
 
@@ -910,30 +905,21 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let now = db::now_iso();
 
                 let graph_events = integrations::llama_rs::adapt_to_graph_events(&telemetry);
-                let mut bronze_events: Vec<(String, models::GraphEvent, String)> = Vec::new();
-                for evt in graph_events {
-                    let id = generate_id()?;
-                    bronze_events.push((id, evt, now.clone()));
+                if graph_events.len() > db::INTEGRATION_BATCH_LIMIT {
+                    return Response::error(
+                        format!(
+                            "telemetry exceeds max {} events",
+                            db::INTEGRATION_BATCH_LIMIT
+                        ),
+                        400,
+                    );
                 }
-                let count = bronze_events.len();
-                if !bronze_events.is_empty() {
-                    let refs: Vec<(String, &models::GraphEvent, String)> = bronze_events
-                        .iter()
-                        .map(|(id, evt, ts)| (id.clone(), evt, ts.clone()))
-                        .collect();
-                    db::insert_events_bronze(&d1, &tenant_ctx.tenant_id, &refs).await?;
-
-                    let mut silver_events: Vec<(String, String, &models::GraphEvent, String)> =
-                        Vec::with_capacity(refs.len());
-                    for (bronze_id, evt, created_at) in &refs {
-                        let silver_id = generate_id()?;
-                        silver_events.push((silver_id, bronze_id.clone(), evt, created_at.clone()));
-                    }
-                    db::insert_events_silver(&d1, &tenant_ctx.tenant_id, &silver_events, &now)
+                let count =
+                    ingest_events_bronze_silver(&d1, &tenant_ctx.tenant_id, graph_events, &now)
                         .await?;
-                }
 
-                if let Err(e) = db::touch_integration(&d1, "llama_rs").await {
+                if let Err(e) = db::touch_integration(&d1, &tenant_ctx.tenant_id, "llama_rs").await
+                {
                     worker::console_log!("WARN: touch_integration(llama_rs) failed: {e:?}");
                 }
 
@@ -1037,6 +1023,40 @@ fn generate_id() -> Result<String> {
     getrandom::getrandom(&mut buf)
         .map_err(|err| Error::RustError(format!("failed to generate id: {err}")))?;
     Ok(hex::encode(buf))
+}
+
+/// Shared helper: ingest a vec of GraphEvents into bronze + silver layers.
+/// Returns the number of events ingested.
+async fn ingest_events_bronze_silver(
+    d1: &D1Database,
+    tenant_id: &str,
+    events: Vec<models::GraphEvent>,
+    now: &str,
+) -> Result<usize> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let mut bronze_events: Vec<(String, models::GraphEvent, String)> =
+        Vec::with_capacity(events.len());
+    for evt in events {
+        let id = generate_id()?;
+        bronze_events.push((id, evt, now.to_string()));
+    }
+    let count = bronze_events.len();
+    let refs: Vec<(String, &models::GraphEvent, String)> = bronze_events
+        .iter()
+        .map(|(id, evt, ts)| (id.clone(), evt, ts.clone()))
+        .collect();
+    db::insert_events_bronze(d1, tenant_id, &refs).await?;
+
+    let mut silver_events: Vec<(String, String, &models::GraphEvent, String)> =
+        Vec::with_capacity(refs.len());
+    for (bronze_id, evt, created_at) in &refs {
+        let silver_id = generate_id()?;
+        silver_events.push((silver_id, bronze_id.clone(), evt, created_at.clone()));
+    }
+    db::insert_events_silver(d1, tenant_id, &silver_events, now).await?;
+    Ok(count)
 }
 
 /// Parse a numeric query param (e.g. limit, hops). Returns None if URL is None or param missing/invalid.

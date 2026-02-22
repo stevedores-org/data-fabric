@@ -3,6 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS integrations (
   id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
   target TEXT NOT NULL, -- oxidizedgraph | aivcs | llama_rs
   name TEXT NOT NULL,
   endpoint TEXT,
@@ -12,8 +13,9 @@ CREATE TABLE IF NOT EXISTS integrations (
   created_at TEXT NOT NULL,
   updated_at TEXT,
   last_seen_at TEXT,
-  UNIQUE(target, name)
+  UNIQUE(tenant_id, target, name)
 );
 
+CREATE INDEX IF NOT EXISTS idx_integrations_tenant ON integrations(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_integrations_target ON integrations(target);
 CREATE INDEX IF NOT EXISTS idx_integrations_status ON integrations(status);

@@ -2501,8 +2501,12 @@ fn lease_time(seconds: u64) -> String {
 
 // ── Integrations (WS6) ─────────────────────────────────────────
 
+/// Maximum events per integration intake request (H2/H3: D1 batch limits).
+pub const INTEGRATION_BATCH_LIMIT: usize = 100;
+
 pub async fn register_integration(
     db: &D1Database,
+    tenant_id: &str,
     id: &str,
     body: &crate::integrations::RegisterIntegration,
 ) -> Result<()> {
@@ -2517,9 +2521,9 @@ pub async fn register_integration(
     let api_version = body.api_version.as_deref().unwrap_or("v1");
 
     db.prepare(
-        "INSERT INTO integrations (id, target, name, endpoint, api_version, status, config, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)
-         ON CONFLICT(target, name) DO UPDATE SET
+        "INSERT INTO integrations (id, tenant_id, target, name, endpoint, api_version, status, config, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8)
+         ON CONFLICT(tenant_id, target, name) DO UPDATE SET
            endpoint = excluded.endpoint,
            api_version = excluded.api_version,
            config = excluded.config,
@@ -2528,6 +2532,7 @@ pub async fn register_integration(
     )
     .bind(&[
         JsValue::from_str(id),
+        JsValue::from_str(tenant_id),
         JsValue::from_str(body.target.as_str()),
         JsValue::from_str(&body.name),
         opt_str(&body.endpoint),
@@ -2544,26 +2549,67 @@ pub async fn register_integration(
     Ok(())
 }
 
-pub async fn list_integrations(db: &D1Database, limit: u32) -> Result<Vec<serde_json::Value>> {
+pub async fn list_integrations(
+    db: &D1Database,
+    tenant_id: &str,
+    limit: u32,
+) -> Result<Vec<crate::integrations::Integration>> {
     let result: D1Result = db
         .prepare(
-            "SELECT * FROM integrations WHERE status = 'active' ORDER BY created_at DESC LIMIT ?1",
+            "SELECT id, target, name, endpoint, api_version, status, config, created_at, last_seen_at
+             FROM integrations WHERE tenant_id = ?1 AND status = 'active' ORDER BY created_at DESC LIMIT ?2",
         )
-        .bind(&[JsValue::from(limit)])?
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from(limit)])?
         .all()
         .await?;
 
-    let rows: Vec<serde_json::Value> = result.results()?;
-    Ok(rows)
+    let rows: Vec<IntegrationRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_integration()).collect())
 }
 
-pub async fn touch_integration(db: &D1Database, target: &str) -> Result<()> {
+pub async fn touch_integration(db: &D1Database, tenant_id: &str, target: &str) -> Result<()> {
     let now = now_iso();
-    db.prepare("UPDATE integrations SET last_seen_at = ?1 WHERE target = ?2 AND status = 'active'")
-        .bind(&[JsValue::from_str(&now), JsValue::from_str(target)])?
-        .run()
-        .await?;
+    db.prepare(
+        "UPDATE integrations SET last_seen_at = ?1 WHERE tenant_id = ?2 AND target = ?3 AND status = 'active'",
+    )
+    .bind(&[
+        JsValue::from_str(&now),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(target),
+    ])?
+    .run()
+    .await?;
     Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IntegrationRow {
+    id: String,
+    target: String,
+    name: String,
+    endpoint: Option<String>,
+    api_version: String,
+    status: String,
+    config: Option<String>,
+    created_at: String,
+    last_seen_at: Option<String>,
+}
+
+impl IntegrationRow {
+    fn into_integration(self) -> crate::integrations::Integration {
+        crate::integrations::Integration {
+            id: self.id,
+            target: serde_json::from_value(serde_json::Value::String(self.target.clone()))
+                .unwrap_or(crate::integrations::IntegrationTarget::Oxidizedgraph),
+            name: self.name,
+            endpoint: self.endpoint,
+            api_version: self.api_version,
+            status: self.status,
+            config: self.config.and_then(|s| serde_json::from_str(&s).ok()),
+            created_at: self.created_at,
+            last_seen_at: self.last_seen_at,
+        }
+    }
 }
 
 #[cfg(test)]
