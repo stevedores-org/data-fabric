@@ -730,14 +730,8 @@ pub async fn retrieve_memory(
         idx += 1;
     }
 
-    if !req.include_unsafe {
-        where_parts.push("unsafe_reason IS NULL".to_string());
-    }
-    if !req.include_stale {
-        where_parts.push(format!("(expires_at IS NULL OR expires_at > ?{idx})"));
-        bind.push(JsValue::from_str(&now));
-        idx += 1;
-    }
+    // Note: stale/unsafe filtering is done in Rust (below) so that
+    // telemetry counters (stale_filtered, unsafe_filtered) reflect reality.
 
     let qlike = format!("%{}%", req.query.to_lowercase());
     where_parts.push(format!(
@@ -809,6 +803,7 @@ pub async fn retrieve_memory(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let top_k = req.top_k.clamp(1, 50);
+    let total_eligible = candidates.len();
     let selected = candidates.into_iter().take(top_k).collect::<Vec<_>>();
 
     let elapsed = (js_sys::Date::now() - start).round() as i64;
@@ -828,7 +823,7 @@ pub async fn retrieve_memory(
     Ok(models::RetrieveMemoryResponse {
         query_id,
         latency_ms: elapsed,
-        total_candidates: selected.len() + stale_filtered + unsafe_filtered + conflict_filtered,
+        total_candidates: total_eligible + stale_filtered + unsafe_filtered + conflict_filtered,
         returned: selected.len(),
         stale_filtered,
         unsafe_filtered,
@@ -865,10 +860,9 @@ pub async fn build_context_pack(
 }
 
 pub async fn retire_memory_item(db: &D1Database, id: &str) -> Result<bool> {
-    let now = now_iso();
     let res: D1Result = db
-        .prepare("UPDATE memory_index SET status = 'retired', indexed_at = ?1 WHERE id = ?2")
-        .bind(&[JsValue::from_str(&now), JsValue::from_str(id)])?
+        .prepare("UPDATE memory_index SET status = 'retired' WHERE id = ?1")
+        .bind(&[JsValue::from_str(id)])?
         .run()
         .await?;
     let changed = res
@@ -885,9 +879,9 @@ pub async fn run_memory_gc(
     let now = now_iso();
     let limit = req.limit.clamp(1, 10_000) as i32;
 
-    let rows: Vec<MemoryIdRow> = db
+    let rows: Vec<MemoryGcRow> = db
         .prepare(
-            "SELECT id FROM memory_index
+            "SELECT id, status FROM memory_index
              WHERE (status = 'retired' OR (expires_at IS NOT NULL AND expires_at <= ?1))
              ORDER BY indexed_at ASC
              LIMIT ?2",
@@ -906,6 +900,8 @@ pub async fn run_memory_gc(
         });
     }
 
+    let retired_count = rows.iter().filter(|r| r.status == "retired").count();
+
     let mut stmts = Vec::with_capacity(rows.len());
     for row in &rows {
         let stmt = db
@@ -917,7 +913,7 @@ pub async fn run_memory_gc(
 
     Ok(models::MemoryGcResponse {
         scanned,
-        retired: 0,
+        retired: retired_count,
         deleted: scanned,
     })
 }
@@ -940,7 +936,7 @@ pub async fn record_retrieval_feedback(
         JsValue::from(if feedback.first_pass_success { 1 } else { 0 }),
         JsValue::from(if feedback.cache_hit { 1 } else { 0 }),
         match feedback.latency_ms {
-            Some(v) => JsValue::from(v as f64),
+            Some(v) => JsValue::from(v as i32),
             None => JsValue::NULL,
         },
         JsValue::from_str(&now),
@@ -1140,8 +1136,15 @@ fn freshness_score(row: &MemoryIndexRow, now_ms: f64) -> f64 {
         .as_ref()
         .or(row.last_accessed_at.as_ref())
         .unwrap_or(&row.indexed_at);
-    let item_ms = js_sys::Date::parse(stamp);
-    if !item_ms.is_finite() || !now_ms.is_finite() || now_ms <= item_ms {
+    let mut item_ms = js_sys::Date::parse(stamp);
+    if !item_ms.is_finite() {
+        let fallback_ms = js_sys::Date::parse(&row.indexed_at);
+        if !fallback_ms.is_finite() {
+            return 0.0;
+        }
+        item_ms = fallback_ms;
+    }
+    if !now_ms.is_finite() || now_ms <= item_ms {
         return 1.0;
     }
     let age_hours = (now_ms - item_ms) / 3_600_000.0;
@@ -1671,8 +1674,9 @@ pub struct CheckpointRow {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct MemoryIdRow {
+struct MemoryGcRow {
     id: String,
+    status: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
