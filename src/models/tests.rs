@@ -327,12 +327,119 @@ fn event_ack_response() {
 #[test]
 fn policy_check_response() {
     let resp = PolicyCheckResponse {
+        id: "pd1".into(),
         action: "deploy".into(),
         decision: "allow".into(),
         reason: "no restrictions".into(),
+        risk_level: Some("write".into()),
+        policy_version: Some("v1".into()),
+        matched_rule: Some("rule1".into()),
+        escalation_id: None,
+        rate_limited: Some(false),
     };
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["decision"], "allow");
+    assert_eq!(json["risk_level"], "write");
+    assert_eq!(json["matched_rule"], "rule1");
+}
+
+// ── WS4 Policy Rules ────────────────────────────────────────────
+
+#[test]
+fn create_policy_rule_defaults() {
+    let input = r#"{"name":"test","verdict":"allow"}"#;
+    let parsed: CreatePolicyRule = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.action_pattern, "*");
+    assert_eq!(parsed.resource_pattern, "*");
+    assert_eq!(parsed.actor_pattern, "*");
+    assert_eq!(parsed.risk_level, "read");
+    assert_eq!(parsed.priority, 0);
+}
+
+#[test]
+fn create_policy_rule_full() {
+    let input = r#"{
+        "name": "block prod deploys",
+        "action_pattern": "deploy",
+        "resource_pattern": "prod",
+        "actor_pattern": "*",
+        "risk_level": "irreversible",
+        "verdict": "deny",
+        "reason": "prod deploys require approval",
+        "priority": 100
+    }"#;
+    let parsed: CreatePolicyRule = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.name, "block prod deploys");
+    assert_eq!(parsed.verdict, "deny");
+    assert_eq!(parsed.priority, 100);
+}
+
+#[test]
+fn update_policy_rule_partial() {
+    let input = r#"{"verdict":"deny","enabled":false}"#;
+    let parsed: UpdatePolicyRule = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.verdict.as_deref(), Some("deny"));
+    assert_eq!(parsed.enabled, Some(false));
+    assert!(parsed.name.is_none());
+    assert!(parsed.action_pattern.is_none());
+}
+
+#[test]
+fn policy_rule_response_round_trip() {
+    let resp = PolicyRuleResponse {
+        id: "r1".into(),
+        name: "test rule".into(),
+        action_pattern: "deploy:*".into(),
+        resource_pattern: "prod".into(),
+        actor_pattern: "*".into(),
+        risk_level: "destructive".into(),
+        verdict: "escalate".into(),
+        reason: "needs approval".into(),
+        priority: 10,
+        enabled: true,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: PolicyRuleResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
+
+#[test]
+fn policy_decision_response_round_trip() {
+    let resp = PolicyDecisionResponse {
+        id: "d1".into(),
+        action: "deploy".into(),
+        actor: "agent-1".into(),
+        resource: Some("staging".into()),
+        decision: "allow".into(),
+        reason: "matched rule".into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        context: Some(serde_json::json!({"env": "staging"})),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: PolicyDecisionResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
+
+#[test]
+fn put_policy_definition_request_round_trip() {
+    let input = r#"{
+        "bundle":{"version":"v1","rules":[],"rate_limits":[]},
+        "activate":true
+    }"#;
+    let parsed: PutPolicyDefinitionRequest = serde_json::from_str(input).unwrap();
+    assert!(parsed.activate);
+    assert_eq!(parsed.bundle["version"], "v1");
+}
+
+#[test]
+fn retention_run_request_defaults() {
+    let parsed: RetentionRunRequest = serde_json::from_str("{}").unwrap();
+    assert_eq!(parsed.events_ttl_days, 30);
+    assert_eq!(parsed.artifacts_ttl_days, 30);
+    assert_eq!(parsed.checkpoints_ttl_days, 30);
+    assert_eq!(parsed.policy_ttl_days, 90);
 }
 
 // ── Orchestration types (M1-M3) ────────────────────────────────
@@ -451,6 +558,91 @@ fn error_response_serializes() {
 // ── WS3 Trace / Provenance (#43) ──────────────────────────────
 
 #[test]
+fn trace_response_with_total_truncated() {
+    let resp = TraceResponse {
+        run_id: "r1".into(),
+        events: vec![],
+        total: Some(100),
+        truncated: Some(true),
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["total"], 100);
+    assert_eq!(json["truncated"], true);
+}
+
+#[test]
+fn trace_response_omits_none_total() {
+    let resp = TraceResponse {
+        run_id: "r1".into(),
+        events: vec![],
+        total: None,
+        truncated: None,
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert!(json.get("total").is_none());
+    assert!(json.get("truncated").is_none());
+}
+
+#[test]
+fn provenance_edge_round_trip() {
+    let edge = ProvenanceEdge {
+        depth: 0,
+        rel_type: "causality".into(),
+        from_kind: "run".into(),
+        from_id: "r1".into(),
+        to_kind: "node".into(),
+        to_id: "n1".into(),
+        relation: Some("executed".into()),
+        created_at: Some("2026-02-22T12:00:00Z".into()),
+    };
+    let json = serde_json::to_string(&edge).unwrap();
+    let parsed: ProvenanceEdge = serde_json::from_str(&json).unwrap();
+    assert_eq!(edge, parsed);
+}
+
+#[test]
+fn provenance_response_serializes() {
+    let resp = ProvenanceResponse {
+        entity_kind: "run".into(),
+        entity_id: "r1".into(),
+        direction: "forward".into(),
+        hops: 5,
+        edges: vec![ProvenanceEdge {
+            depth: 0,
+            rel_type: "causality".into(),
+            from_kind: "run".into(),
+            from_id: "r1".into(),
+            to_kind: "node".into(),
+            to_id: "n1".into(),
+            relation: None,
+            created_at: None,
+        }],
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["direction"], "forward");
+    assert_eq!(json["hops"], 5);
+    assert_eq!(json["edges"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn run_summary_round_trip() {
+    let summary = RunSummary {
+        run_id: "r1".into(),
+        event_count: 42,
+        first_event_at: Some("2026-02-22T10:00:00Z".into()),
+        last_event_at: Some("2026-02-22T12:00:00Z".into()),
+        actors: vec!["agent-1".into(), "ci-bot".into()],
+        event_types: vec!["node.start".into(), "node.end".into()],
+        updated_at: "2026-02-22T12:00:00Z".into(),
+    };
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: RunSummary = serde_json::from_str(&json).unwrap();
+    assert_eq!(summary, parsed);
+    assert_eq!(parsed.event_count, 42);
+    assert_eq!(parsed.actors.len(), 2);
+}
+
+#[test]
 fn trace_event_round_trip() {
     let evt = TraceEvent {
         id: "ev1".into(),
@@ -482,8 +674,91 @@ fn trace_response_serializes() {
             payload: None,
             created_at: "2026-02-22T12:00:00Z".into(),
         }],
+        total: Some(1),
+        truncated: Some(false),
     };
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["run_id"], "r1");
     assert_eq!(json["events"].as_array().unwrap().len(), 1);
+    assert_eq!(json["total"], 1);
+}
+
+// ── WS5 Memory (#45) ───────────────────────────────────────────
+
+#[test]
+fn create_memory_round_trip() {
+    let input = r#"{"thread_id":"t1","scope":"run","key":"summary","ref_type":"artifact","ref_id":"a1","run_id":"r1"}"#;
+    let parsed: CreateMemory = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.thread_id, "t1");
+    assert_eq!(parsed.scope, "run");
+    assert_eq!(parsed.ref_type, "artifact");
+    assert_eq!(parsed.ref_id, "a1");
+    assert_eq!(parsed.run_id.as_deref(), Some("r1"));
+}
+
+#[test]
+fn memory_created_serializes() {
+    let mc = MemoryCreated {
+        id: "m1".into(),
+        thread_id: "t1".into(),
+        scope: "run".into(),
+        key: "summary".into(),
+    };
+    let json = serde_json::to_value(&mc).unwrap();
+    assert_eq!(json["thread_id"], "t1");
+    assert_eq!(json["key"], "summary");
+}
+
+// ── WS5: Retrieval & Memory ────────────────────────────────────
+
+#[test]
+fn upsert_memory_item_round_trip() {
+    let input = r#"{
+        "repo":"stevedores-org/data-fabric",
+        "kind":"checkpoint",
+        "run_id":"r1",
+        "thread_id":"th-1",
+        "summary":"checkpoint after codegen",
+        "tags":["ci","checkpoint"],
+        "success_rate":0.9,
+        "ttl_seconds":3600
+    }"#;
+    let parsed: UpsertMemoryItemRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.repo, "stevedores-org/data-fabric");
+    assert_eq!(parsed.kind, MemoryKind::Checkpoint);
+    assert_eq!(parsed.tags.len(), 2);
+}
+
+#[test]
+fn retrieve_memory_defaults_apply() {
+    let input = r#"{"repo":"stevedores-org/data-fabric","query":"fix failing checks"}"#;
+    let parsed: RetrieveMemoryRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.top_k, 8);
+    assert!(!parsed.include_stale);
+    assert!(!parsed.include_unsafe);
+    assert!(!parsed.include_conflicted);
+}
+
+#[test]
+fn context_pack_request_defaults_budget() {
+    let input =
+        r#"{"repo":"stevedores-org/data-fabric","query":"orchestrator retry loop","top_k":5}"#;
+    let parsed: ContextPackRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.token_budget, 4096);
+    assert_eq!(parsed.retrieval.top_k, 5);
+}
+
+#[test]
+fn retrieval_feedback_round_trip() {
+    let input = r#"{
+        "query_id":"q1",
+        "success":true,
+        "first_pass_success":false,
+        "cache_hit":true,
+        "latency_ms":120
+    }"#;
+    let parsed: RetrievalFeedback = serde_json::from_str(input).unwrap();
+    assert!(parsed.success);
+    assert!(parsed.cache_hit);
+    assert_eq!(parsed.latency_ms, Some(120));
 }
