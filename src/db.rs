@@ -872,14 +872,24 @@ pub async fn register_integration(
     body: &crate::integrations::RegisterIntegration,
 ) -> Result<()> {
     let now = now_iso();
-    let config_json = body
-        .config
-        .as_ref()
-        .map(|c| serde_json::to_string(c).unwrap());
+    let config_json = match &body.config {
+        Some(c) => Some(
+            serde_json::to_string(c)
+                .map_err(|e| Error::RustError(format!("config serialization: {e}")))?,
+        ),
+        None => None,
+    };
     let api_version = body.api_version.as_deref().unwrap_or("v1");
 
     db.prepare(
-        "INSERT INTO integrations (id, target, name, endpoint, api_version, status, config, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)",
+        "INSERT INTO integrations (id, target, name, endpoint, api_version, status, config, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)
+         ON CONFLICT(target, name) DO UPDATE SET
+           endpoint = excluded.endpoint,
+           api_version = excluded.api_version,
+           config = excluded.config,
+           status = 'active',
+           updated_at = excluded.created_at",
     )
     .bind(&[
         JsValue::from_str(id),
@@ -905,6 +915,10 @@ pub async fn list_integrations(db: &D1Database) -> Result<Vec<serde_json::Value>
 
     let rows: Vec<serde_json::Value> = result.results()?;
     Ok(rows)
+}
+
+pub fn now_iso_pub() -> String {
+    now_iso()
 }
 
 pub async fn touch_integration(db: &D1Database, target: &str) -> Result<()> {

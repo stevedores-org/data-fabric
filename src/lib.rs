@@ -382,21 +382,21 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let batch: integrations::oxidizedgraph::GraphExecBatch = req.json().await?;
                 let d1 = ctx.env.d1("DB")?;
                 let bucket = ctx.env.bucket("ARTIFACTS")?;
-                let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
+                let now = db::now_iso_pub();
 
                 let owned_events = integrations::oxidizedgraph::adapt_to_graph_events(&batch);
-                let mut event_refs: Vec<(String, models::GraphEvent, String)> = Vec::new();
+                let mut bronze_events: Vec<(String, models::GraphEvent, String)> = Vec::new();
                 for evt in owned_events {
                     let id = generate_id()?;
-                    event_refs.push((id, evt, now.clone()));
+                    bronze_events.push((id, evt, now.clone()));
                 }
-                let bronze_events: Vec<(String, &models::GraphEvent, String)> = event_refs
-                    .iter()
-                    .map(|(id, evt, ts)| (id.clone(), evt, ts.clone()))
-                    .collect();
                 let event_count = bronze_events.len();
                 if !bronze_events.is_empty() {
-                    db::insert_events_bronze(&d1, &bronze_events).await?;
+                    let refs: Vec<(String, &models::GraphEvent, String)> = bronze_events
+                        .iter()
+                        .map(|(id, evt, ts)| (id.clone(), evt, ts.clone()))
+                        .collect();
+                    db::insert_events_bronze(&d1, &refs).await?;
                 }
 
                 let mut checkpoint_count = 0usize;
@@ -471,21 +471,21 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             |mut req, ctx| async move {
                 let telemetry: integrations::llama_rs::InferenceTelemetry = req.json().await?;
                 let d1 = ctx.env.d1("DB")?;
-                let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
+                let now = db::now_iso_pub();
 
                 let graph_events = integrations::llama_rs::adapt_to_graph_events(&telemetry);
-                let mut event_refs: Vec<(String, models::GraphEvent, String)> = Vec::new();
+                let mut bronze_events: Vec<(String, models::GraphEvent, String)> = Vec::new();
                 for evt in graph_events {
                     let id = generate_id()?;
-                    event_refs.push((id, evt, now.clone()));
+                    bronze_events.push((id, evt, now.clone()));
                 }
-                let bronze_events: Vec<(String, &models::GraphEvent, String)> = event_refs
-                    .iter()
-                    .map(|(id, evt, ts)| (id.clone(), evt, ts.clone()))
-                    .collect();
                 let count = bronze_events.len();
                 if !bronze_events.is_empty() {
-                    db::insert_events_bronze(&d1, &bronze_events).await?;
+                    let refs: Vec<(String, &models::GraphEvent, String)> = bronze_events
+                        .iter()
+                        .map(|(id, evt, ts)| (id.clone(), evt, ts.clone()))
+                        .collect();
+                    db::insert_events_bronze(&d1, &refs).await?;
                 }
 
                 let _ = db::touch_integration(&d1, "llama_rs").await;

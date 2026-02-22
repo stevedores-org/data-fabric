@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS integrations (
   status TEXT NOT NULL DEFAULT 'active', -- active | inactive | error
   config TEXT, -- JSON
   created_at TEXT NOT NULL,
-  last_seen_at TEXT
+  updated_at TEXT,
+  last_seen_at TEXT,
+  UNIQUE(target, name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_integrations_target ON integrations(target);

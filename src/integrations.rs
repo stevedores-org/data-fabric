@@ -230,7 +230,13 @@ pub mod aivcs {
 
         Some(crate::models::CreateRun {
             repo: evt.repo.clone(),
-            trigger: Some(format!("aivcs:{:?}", evt.event_type)),
+            trigger: Some(format!(
+                "aivcs:{}",
+                serde_json::to_value(&evt.event_type)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+            )),
             actor: Some(evt.actor.clone()),
             metadata: Some(serde_json::Value::Object(meta)),
         })
@@ -605,6 +611,7 @@ mod tests {
         let run = aivcs::adapt_to_run(&evt).unwrap();
         assert_eq!(run.repo, "stevedores-org/data-fabric");
         assert_eq!(run.actor.as_deref(), Some("ci-bot"));
+        assert_eq!(run.trigger.as_deref(), Some("aivcs:pipeline_start"));
         let meta = run.metadata.unwrap();
         assert_eq!(meta["source"], "aivcs");
         assert_eq!(meta["commit_sha"], "abc123");
