@@ -50,6 +50,138 @@ pub struct PolicyCheckResponse {
     pub reason: String,
 }
 
+// ── Tasks (M1: agent task queue) ────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct CreateTask {
+    pub job_id: String,
+    pub task_type: String,
+    #[serde(default)]
+    pub priority: i32,
+    pub params: Option<serde_json::Value>,
+    pub graph_ref: Option<String>,
+    pub play_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub max_retries: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct Task {
+    pub id: String,
+    pub job_id: String,
+    pub task_type: String,
+    pub priority: i32,
+    pub status: String,
+    pub params: Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
+    pub agent_id: Option<String>,
+    pub graph_ref: Option<String>,
+    pub play_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub retry_count: i32,
+    pub max_retries: i32,
+    pub lease_expires_at: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct TaskCreated {
+    pub id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct TaskCompleteRequest {
+    pub result: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct TaskFailRequest {
+    pub error: String,
+}
+
+// ── Agents (M1: agent registration) ─────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct RegisterAgent {
+    pub name: String,
+    pub capabilities: Vec<String>,
+    pub endpoint: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct Agent {
+    pub id: String,
+    pub name: String,
+    pub capabilities: Vec<String>,
+    pub endpoint: Option<String>,
+    pub last_heartbeat: Option<String>,
+    pub status: String,
+    pub metadata: Option<serde_json::Value>,
+}
+
+// ── Checkpoints (M2: oxidizedgraph state) ───────────────────────
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct CreateCheckpoint {
+    pub thread_id: String,
+    pub node_id: String,
+    pub parent_id: Option<String>,
+    pub state: serde_json::Value,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct Checkpoint {
+    pub id: String,
+    pub thread_id: String,
+    pub node_id: String,
+    pub parent_id: Option<String>,
+    pub state_r2_key: String,
+    pub state_size_bytes: Option<i64>,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct CheckpointCreated {
+    pub id: String,
+    pub thread_id: String,
+    pub state_r2_key: String,
+}
+
+// ── Graph Events (M3: event pipeline) ───────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct GraphEvent {
+    pub run_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub event_type: String,
+    pub node_id: Option<String>,
+    pub actor: Option<String>,
+    pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct GraphEventBatch {
+    pub events: Vec<GraphEvent>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct GraphEventAck {
+    pub accepted: usize,
+    pub queued: bool,
+}
+
+// ── Common ──────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +263,56 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["decision"], "allow");
+    }
+
+    #[test]
+    fn create_task_round_trip() {
+        let input = r#"{"job_id":"j1","task_type":"build","priority":5,"params":{"repo":"test"}}"#;
+        let parsed: CreateTask = serde_json::from_str(input).unwrap();
+        assert_eq!(parsed.job_id, "j1");
+        assert_eq!(parsed.task_type, "build");
+        assert_eq!(parsed.priority, 5);
+        let json = serde_json::to_string(&parsed).unwrap();
+        let reparsed: CreateTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn create_task_minimal() {
+        let input = r#"{"job_id":"j1","task_type":"build"}"#;
+        let parsed: CreateTask = serde_json::from_str(input).unwrap();
+        assert_eq!(parsed.priority, 0);
+        assert!(parsed.params.is_none());
+        assert!(parsed.graph_ref.is_none());
+    }
+
+    #[test]
+    fn register_agent_round_trip() {
+        let input =
+            r#"{"name":"build-agent","capabilities":["build","test"],"endpoint":"https://agent.example.com"}"#;
+        let parsed: RegisterAgent = serde_json::from_str(input).unwrap();
+        assert_eq!(parsed.name, "build-agent");
+        assert_eq!(parsed.capabilities, vec!["build", "test"]);
+        assert_eq!(
+            parsed.endpoint.as_deref(),
+            Some("https://agent.example.com")
+        );
+    }
+
+    #[test]
+    fn create_checkpoint_round_trip() {
+        let input = r#"{"thread_id":"t1","node_id":"n1","state":{"messages":[]}}"#;
+        let parsed: CreateCheckpoint = serde_json::from_str(input).unwrap();
+        assert_eq!(parsed.thread_id, "t1");
+        assert_eq!(parsed.node_id, "n1");
+        assert!(parsed.parent_id.is_none());
+    }
+
+    #[test]
+    fn graph_event_batch_round_trip() {
+        let input = r#"{"events":[{"event_type":"node.start","node_id":"n1","thread_id":"t1"}]}"#;
+        let parsed: GraphEventBatch = serde_json::from_str(input).unwrap();
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].event_type, "node.start");
     }
 }
