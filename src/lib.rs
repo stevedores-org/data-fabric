@@ -1,6 +1,6 @@
+use futures_util::StreamExt;
 use serde::Serialize;
 use worker::*;
-use futures_util::StreamExt;
 
 mod models;
 
