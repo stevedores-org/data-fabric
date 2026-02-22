@@ -1,6 +1,6 @@
 # WS1 Source Inventory Matrix
 
-Baseline extraction source: `/Users/aivcs/engineering/code/codex/lornu.ai/crates/data-fabric/src`.
+Baseline extraction source: `<lornu.ai-repo>/crates/data-fabric/src`.
 
 ## 1) Core crate module inventory (complete)
 

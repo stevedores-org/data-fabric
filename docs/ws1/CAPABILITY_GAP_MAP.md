@@ -30,7 +30,7 @@ Scoring:
 3. `P0-3` play launch/decomposition endpoint into task graph - score `20`.
 
 ### P1 (immediately after P0)
-1. MCP contract hardening + event-pipeline consumerization - score `16`.
+1. MCP contract hardening + event-pipeline consumption - score `16`.
 2. Bronze/Silver/Gold lifecycle parity (promotion and query semantics) - score `16`.
 3. Graph event processing pipeline (queueing and replayability) - score `16`.
 
