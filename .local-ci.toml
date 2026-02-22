@@ -1,5 +1,6 @@
 # local-ci configuration for data-fabric
 # See: https://github.com/stevedores-org/local-ci
+# Keep in sync with .github/workflows/ci.yml
 
 [cache]
 enabled = true

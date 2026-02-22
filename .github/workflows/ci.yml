@@ -10,8 +10,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  cargo-ci:
-    name: cargo-ci (fmt, clippy, check, test)
+  local-ci:
+    name: local-ci (fmt, clippy, check, test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +22,7 @@ jobs:
           target: wasm32-unknown-unknown
           components: rustfmt, clippy
 
+      # Keep this workflow in sync with .local-ci.toml stage coverage and wasm target.
       - name: Verify local-ci config stays in sync
         run: ./scripts/verify-local-ci-sync.sh
 

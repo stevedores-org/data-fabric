@@ -9,7 +9,7 @@ check_contains() {
   local pattern="$2"
   local message="$3"
 
-  if ! rg -Fq "$pattern" "$file"; then
+  if ! grep -Fq "$pattern" "$file"; then
     echo "sync-check failed: ${message}" >&2
     exit 1
   fi
