@@ -1,4 +1,5 @@
 use crate::models;
+use std::collections::{HashMap, HashSet};
 use wasm_bindgen::JsValue;
 use worker::*;
 
@@ -336,6 +337,52 @@ pub async fn delete_checkpoint(db: &D1Database, tenant_id: &str, id: &str) -> Re
     Ok(changed)
 }
 
+// ── Memory (WS5: #45) ──────────────────────────────────────────
+
+pub async fn create_memory(db: &D1Database, id: &str, body: &models::CreateMemory) -> Result<()> {
+    let now = now_iso();
+    db.prepare(
+        "INSERT INTO memory (id, run_id, thread_id, scope, key, ref_type, ref_id, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        opt_str(&body.run_id),
+        JsValue::from_str(&body.thread_id),
+        JsValue::from_str(&body.scope),
+        JsValue::from_str(&body.key),
+        JsValue::from_str(&body.ref_type),
+        JsValue::from_str(&body.ref_id),
+        JsValue::from_str(&now),
+        opt_str(&body.expires_at),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// List memories for a thread, recency-ordered. Limit applied (default 100). Excludes expired if expires_at < now.
+pub async fn list_memories_for_thread(
+    db: &D1Database,
+    thread_id: &str,
+    limit: u32,
+) -> Result<Vec<models::Memory>> {
+    let now = now_iso();
+    let result: D1Result = db
+        .prepare(
+            "SELECT * FROM memory WHERE thread_id = ?1 AND (expires_at IS NULL OR expires_at > ?2) ORDER BY created_at DESC LIMIT ?3",
+        )
+        .bind(&[
+            JsValue::from_str(thread_id),
+            JsValue::from_str(&now),
+            JsValue::from(limit),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<MemoryRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_memory()).collect())
+}
+
 // ── Events Bronze ───────────────────────────────────────────────
 
 pub async fn insert_events_bronze(
@@ -528,6 +575,80 @@ pub async fn get_run(db: &D1Database, tenant_id: &str, id: &str) -> Result<Optio
     Ok(row.map(|r| r.into_run_response()))
 }
 
+// ── WS5 Retrieval + Memory Federation ───────────────────────────
+
+pub async fn upsert_memory_item(
+    db: &D1Database,
+    id: &str,
+    body: &models::UpsertMemoryItemRequest,
+) -> Result<Option<String>> {
+    let now = now_iso();
+    let tags_json = serde_json::to_string(&body.tags).unwrap_or_else(|_| "[]".to_string());
+    let metadata_json = body
+        .metadata
+        .as_ref()
+        .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".to_string()));
+    let source_created_at = body
+        .source_created_at
+        .clone()
+        .unwrap_or_else(|| now.clone());
+    let expires_at = body
+        .ttl_seconds
+        .map(|ttl| add_seconds_to_now(ttl.max(0) as u64));
+    let kind = serde_json::to_string(&body.kind)
+        .unwrap_or_else(|_| "\"context\"".to_string())
+        .trim_matches('"')
+        .to_string();
+    let conflict_version = body.conflict_version.unwrap_or(1).max(1);
+
+    db.prepare(
+        "INSERT INTO memory_index (
+            id, repo, kind, run_id, task_id, thread_id, checkpoint_id, artifact_key, title, summary,
+            tags, content_ref, metadata, success_rate, source_created_at, indexed_at, last_accessed_at,
+            access_count, status, unsafe_reason, expires_at, conflict_key, conflict_version
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14, ?15, ?16, NULL,
+            0, 'active', ?17, ?18, ?19, ?20
+        )",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(&body.repo),
+        JsValue::from_str(&kind),
+        opt_str(&body.run_id),
+        opt_str(&body.task_id),
+        opt_str(&body.thread_id),
+        opt_str(&body.checkpoint_id),
+        opt_str(&body.artifact_key),
+        opt_str(&body.title),
+        JsValue::from_str(&body.summary),
+        JsValue::from_str(&tags_json),
+        opt_str(&body.content_ref),
+        match &metadata_json {
+            Some(s) => JsValue::from_str(s),
+            None => JsValue::NULL,
+        },
+        match body.success_rate {
+            Some(v) => JsValue::from_f64(v),
+            None => JsValue::NULL,
+        },
+        JsValue::from_str(&source_created_at),
+        JsValue::from_str(&now),
+        opt_str(&body.unsafe_reason),
+        match &expires_at {
+            Some(s) => JsValue::from_str(s),
+            None => JsValue::NULL,
+        },
+        opt_str(&body.conflict_key),
+        JsValue::from(conflict_version),
+    ])?
+    .run()
+    .await?;
+
+    Ok(expires_at)
+}
+
 // ── WS2 Domain: Tasks (run-scoped) ──────────────────────────────
 
 pub async fn create_ws2_task(
@@ -629,6 +750,273 @@ pub async fn record_tool_call(
         opt_json(&body.output),
         match body.duration_ms {
             Some(ms) => JsValue::from(ms as f64),
+            None => JsValue::NULL,
+        },
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn retrieve_memory(
+    db: &D1Database,
+    req: &models::RetrieveMemoryRequest,
+) -> Result<models::RetrieveMemoryResponse> {
+    let start = js_sys::Date::now();
+    let now = now_iso();
+    let now_ms = js_sys::Date::parse(&now);
+    let query_id = random_hex_id()?;
+
+    let mut repos = vec![req.repo.clone()];
+    for r in &req.related_repos {
+        if !repos.iter().any(|x| x == r) {
+            repos.push(r.clone());
+        }
+    }
+
+    let mut bind: Vec<JsValue> = vec![];
+    let mut where_parts: Vec<String> = vec![];
+    let mut idx = 1usize;
+
+    where_parts.push("status = 'active'".to_string());
+
+    let repo_clause = (0..repos.len())
+        .map(|_| {
+            let p = format!("?{idx}");
+            idx += 1;
+            p
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    where_parts.push(format!("repo IN ({repo_clause})"));
+    for repo in &repos {
+        bind.push(JsValue::from_str(repo));
+    }
+
+    if let Some(thread_id) = &req.thread_id {
+        where_parts.push(format!("thread_id = ?{idx}"));
+        bind.push(JsValue::from_str(thread_id));
+        idx += 1;
+    }
+    if let Some(run_id) = &req.run_id {
+        where_parts.push(format!("run_id = ?{idx}"));
+        bind.push(JsValue::from_str(run_id));
+        idx += 1;
+    }
+    if let Some(task_id) = &req.task_id {
+        where_parts.push(format!("task_id = ?{idx}"));
+        bind.push(JsValue::from_str(task_id));
+        idx += 1;
+    }
+
+    // Note: stale/unsafe filtering is done in Rust (below) so that
+    // telemetry counters (stale_filtered, unsafe_filtered) reflect reality.
+
+    let qlike = format!("%{}%", req.query.to_lowercase());
+    where_parts.push(format!(
+        "(lower(summary) LIKE ?{idx} OR lower(COALESCE(title, '')) LIKE ?{} OR lower(COALESCE(tags, '')) LIKE ?{})",
+        idx + 1,
+        idx + 2
+    ));
+    bind.push(JsValue::from_str(&qlike));
+    bind.push(JsValue::from_str(&qlike));
+    bind.push(JsValue::from_str(&qlike));
+
+    let sql = format!(
+        "SELECT * FROM memory_index WHERE {} ORDER BY indexed_at DESC LIMIT 200",
+        where_parts.join(" AND ")
+    );
+
+    let result: D1Result = db.prepare(&sql).bind(&bind)?.all().await?;
+    let rows: Vec<MemoryIndexRow> = result.results()?;
+
+    let mut stale_filtered = 0usize;
+    let mut unsafe_filtered = 0usize;
+    let mut conflict_filtered = 0usize;
+
+    let latest_conflicts = latest_conflict_versions(&rows);
+
+    let mut candidates = vec![];
+    for row in rows {
+        let stale = is_stale(&row, &now);
+        let conflicted = is_conflicted(&row, &latest_conflicts);
+
+        if stale && !req.include_stale {
+            stale_filtered += 1;
+            continue;
+        }
+        if row.unsafe_reason.is_some() && !req.include_unsafe {
+            unsafe_filtered += 1;
+            continue;
+        }
+        if conflicted && !req.include_conflicted {
+            conflict_filtered += 1;
+            continue;
+        }
+
+        let score = score_candidate(&row, &req.query, now_ms);
+        let estimated_tokens = estimate_tokens(&row.title, &row.summary, &row.tags);
+        candidates.push(models::MemoryCandidate {
+            id: row.id,
+            repo: row.repo,
+            kind: row.kind,
+            run_id: row.run_id,
+            task_id: row.task_id,
+            thread_id: row.thread_id,
+            title: row.title,
+            summary: row.summary,
+            tags: parse_tags(&row.tags),
+            content_ref: row.content_ref,
+            success_rate: row.success_rate,
+            stale,
+            unsafe_reason: row.unsafe_reason,
+            conflicted,
+            estimated_tokens,
+            score,
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top_k = req.top_k.clamp(1, 50);
+    let total_eligible = candidates.len();
+    let selected = candidates.into_iter().take(top_k).collect::<Vec<_>>();
+
+    let elapsed = (js_sys::Date::now() - start).round() as i64;
+    log_retrieval_query(
+        db,
+        &query_id,
+        req,
+        selected.len() as i64,
+        elapsed,
+        stale_filtered as i64,
+        unsafe_filtered as i64,
+        conflict_filtered as i64,
+    )
+    .await?;
+    touch_memory_items(db, &selected).await?;
+
+    Ok(models::RetrieveMemoryResponse {
+        query_id,
+        latency_ms: elapsed,
+        total_candidates: total_eligible + stale_filtered + unsafe_filtered + conflict_filtered,
+        returned: selected.len(),
+        stale_filtered,
+        unsafe_filtered,
+        conflict_filtered,
+        items: selected,
+    })
+}
+
+pub async fn build_context_pack(
+    db: &D1Database,
+    req: &models::ContextPackRequest,
+) -> Result<models::ContextPackResponse> {
+    let retrieval = retrieve_memory(db, &req.retrieval).await?;
+    let mut used = 0usize;
+    let mut dropped = 0usize;
+    let mut packed = vec![];
+    for item in retrieval.items {
+        if used + item.estimated_tokens > req.token_budget {
+            dropped += 1;
+            continue;
+        }
+        used += item.estimated_tokens;
+        packed.push(item);
+    }
+
+    Ok(models::ContextPackResponse {
+        query_id: retrieval.query_id,
+        latency_ms: retrieval.latency_ms,
+        token_budget: req.token_budget,
+        used_tokens: used,
+        dropped_due_to_budget: dropped,
+        items: packed,
+    })
+}
+
+pub async fn retire_memory_item(db: &D1Database, id: &str) -> Result<bool> {
+    let res: D1Result = db
+        .prepare("UPDATE memory_index SET status = 'retired' WHERE id = ?1")
+        .bind(&[JsValue::from_str(id)])?
+        .run()
+        .await?;
+    let changed = res
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+    Ok(changed)
+}
+
+pub async fn run_memory_gc(
+    db: &D1Database,
+    req: &models::MemoryGcRequest,
+) -> Result<models::MemoryGcResponse> {
+    let now = now_iso();
+    let limit = req.limit.clamp(1, 10_000) as i32;
+
+    let rows: Vec<MemoryGcRow> = db
+        .prepare(
+            "SELECT id, status FROM memory_index
+             WHERE (status = 'retired' OR (expires_at IS NOT NULL AND expires_at <= ?1))
+             ORDER BY indexed_at ASC
+             LIMIT ?2",
+        )
+        .bind(&[JsValue::from_str(&now), JsValue::from(limit)])?
+        .all()
+        .await?
+        .results()?;
+
+    let scanned = rows.len();
+    if scanned == 0 {
+        return Ok(models::MemoryGcResponse {
+            scanned: 0,
+            retired: 0,
+            deleted: 0,
+        });
+    }
+
+    let retired_count = rows.iter().filter(|r| r.status == "retired").count();
+
+    let mut stmts = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let stmt = db
+            .prepare("DELETE FROM memory_index WHERE id = ?1")
+            .bind(&[JsValue::from_str(&row.id)])?;
+        stmts.push(stmt);
+    }
+    db.batch(stmts).await?;
+
+    Ok(models::MemoryGcResponse {
+        scanned,
+        retired: retired_count,
+        deleted: scanned,
+    })
+}
+
+pub async fn record_retrieval_feedback(
+    db: &D1Database,
+    feedback: &models::RetrievalFeedback,
+) -> Result<()> {
+    let now = now_iso();
+    db.prepare(
+        "INSERT INTO memory_retrieval_feedback (
+            query_id, run_id, task_id, success, first_pass_success, cache_hit, latency_ms, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )
+    .bind(&[
+        JsValue::from_str(&feedback.query_id),
+        opt_str(&feedback.run_id),
+        opt_str(&feedback.task_id),
+        JsValue::from(if feedback.success { 1 } else { 0 }),
+        JsValue::from(if feedback.first_pass_success { 1 } else { 0 }),
+        JsValue::from(if feedback.cache_hit { 1 } else { 0 }),
+        match feedback.latency_ms {
+            Some(v) => JsValue::from(v as i32),
             None => JsValue::NULL,
         },
         JsValue::from_str(&now),
@@ -758,6 +1146,222 @@ pub async fn create_policy_rule(
         JsValue::from_str(&body.verdict),
         JsValue::from_str(&body.reason),
         JsValue::from(body.priority),
+        JsValue::from_str(&now),
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn memory_eval_summary(db: &D1Database) -> Result<models::MemoryEvalSummary> {
+    let row: Option<MemoryEvalRow> = db
+        .prepare(
+            "SELECT
+                COUNT(*) AS total_queries,
+                AVG(CASE WHEN cache_hit = 1 THEN 1.0 ELSE 0.0 END) AS cache_hit_rate,
+                AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) AS success_rate,
+                AVG(CASE WHEN first_pass_success = 1 THEN 1.0 ELSE 0.0 END) AS first_pass_success_rate
+             FROM memory_retrieval_feedback",
+        )
+        .bind(&[])?
+        .first(None)
+        .await?;
+
+    let p50: Option<PercentileRow> = db
+        .prepare(
+            "SELECT latency_ms
+             FROM memory_retrieval_feedback
+             WHERE latency_ms IS NOT NULL
+             ORDER BY latency_ms
+             LIMIT 1 OFFSET (SELECT CAST((COUNT(*) * 0.50) AS INTEGER) FROM memory_retrieval_feedback WHERE latency_ms IS NOT NULL)",
+        )
+        .bind(&[])?
+        .first(None)
+        .await?;
+    let p95: Option<PercentileRow> = db
+        .prepare(
+            "SELECT latency_ms
+             FROM memory_retrieval_feedback
+             WHERE latency_ms IS NOT NULL
+             ORDER BY latency_ms
+             LIMIT 1 OFFSET (SELECT CAST((COUNT(*) * 0.95) AS INTEGER) FROM memory_retrieval_feedback WHERE latency_ms IS NOT NULL)",
+        )
+        .bind(&[])?
+        .first(None)
+        .await?;
+
+    let summary = row.unwrap_or(MemoryEvalRow {
+        total_queries: 0,
+        cache_hit_rate: None,
+        success_rate: None,
+        first_pass_success_rate: None,
+    });
+
+    Ok(models::MemoryEvalSummary {
+        total_queries: summary.total_queries,
+        cache_hit_rate: summary.cache_hit_rate.unwrap_or(0.0),
+        success_rate: summary.success_rate.unwrap_or(0.0),
+        first_pass_success_rate: summary.first_pass_success_rate.unwrap_or(0.0),
+        p50_latency_ms: p50.and_then(|p| p.latency_ms),
+        p95_latency_ms: p95.and_then(|p| p.latency_ms),
+    })
+}
+
+fn score_candidate(row: &MemoryIndexRow, query: &str, now_ms: f64) -> f64 {
+    let query_tokens = tokenize(query);
+    let text = format!(
+        "{} {} {}",
+        row.title.clone().unwrap_or_default(),
+        row.summary,
+        row.tags.clone().unwrap_or_default()
+    );
+    let text_tokens = tokenize(&text);
+    let similarity = jaccard_similarity(&query_tokens, &text_tokens);
+
+    let freshness = freshness_score(row, now_ms);
+    let success = row.success_rate.unwrap_or(0.5).clamp(0.0, 1.0);
+    let popularity = (row.access_count.max(0) as f64 / 20.0).min(1.0);
+
+    (similarity * 0.55) + (freshness * 0.25) + (success * 0.15) + (popularity * 0.05)
+}
+
+fn freshness_score(row: &MemoryIndexRow, now_ms: f64) -> f64 {
+    let stamp = row
+        .source_created_at
+        .as_ref()
+        .or(row.last_accessed_at.as_ref())
+        .unwrap_or(&row.indexed_at);
+    let mut item_ms = js_sys::Date::parse(stamp);
+    if !item_ms.is_finite() {
+        let fallback_ms = js_sys::Date::parse(&row.indexed_at);
+        if !fallback_ms.is_finite() {
+            return 0.0;
+        }
+        item_ms = fallback_ms;
+    }
+    if !now_ms.is_finite() || now_ms <= item_ms {
+        return 1.0;
+    }
+    let age_hours = (now_ms - item_ms) / 3_600_000.0;
+    (-age_hours / 72.0).exp().clamp(0.0, 1.0)
+}
+
+fn estimate_tokens(title: &Option<String>, summary: &str, tags: &Option<String>) -> usize {
+    let tag_chars = tags.as_ref().map(|t| t.len()).unwrap_or(0);
+    (title.as_ref().map(|t| t.len()).unwrap_or(0) + summary.len() + tag_chars) / 4 + 16
+}
+
+fn tokenize(input: &str) -> HashSet<String> {
+    input
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
+fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let inter = a.intersection(b).count() as f64;
+    let union = a.union(b).count() as f64;
+    if union == 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+fn latest_conflict_versions(rows: &[MemoryIndexRow]) -> HashMap<String, i64> {
+    let mut latest: HashMap<String, i64> = HashMap::new();
+    for row in rows {
+        if let Some(key) = &row.conflict_key {
+            let v = row.conflict_version.unwrap_or(1);
+            latest
+                .entry(key.clone())
+                .and_modify(|cur: &mut i64| *cur = (*cur).max(v))
+                .or_insert(v);
+        }
+    }
+    latest
+}
+
+fn is_conflicted(row: &MemoryIndexRow, latest: &HashMap<String, i64>) -> bool {
+    match &row.conflict_key {
+        Some(k) => row.conflict_version.unwrap_or(1) < *latest.get(k).unwrap_or(&1),
+        None => false,
+    }
+}
+
+fn is_stale(row: &MemoryIndexRow, now: &str) -> bool {
+    match &row.expires_at {
+        Some(exp) => exp.as_str() <= now,
+        None => false,
+    }
+}
+
+fn parse_tags(tags: &Option<String>) -> Vec<String> {
+    tags.as_ref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default()
+}
+
+async fn touch_memory_items(db: &D1Database, items: &[models::MemoryCandidate]) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let now = now_iso();
+    let mut stmts = Vec::with_capacity(items.len());
+    for item in items {
+        let stmt = db
+            .prepare(
+                "UPDATE memory_index
+                 SET access_count = access_count + 1, last_accessed_at = ?1
+                 WHERE id = ?2",
+            )
+            .bind(&[JsValue::from_str(&now), JsValue::from_str(&item.id)])?;
+        stmts.push(stmt);
+    }
+    db.batch(stmts).await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn log_retrieval_query(
+    db: &D1Database,
+    query_id: &str,
+    req: &models::RetrieveMemoryRequest,
+    returned_count: i64,
+    latency_ms: i64,
+    stale_filtered: i64,
+    unsafe_filtered: i64,
+    conflict_filtered: i64,
+) -> Result<()> {
+    let now = now_iso();
+    db.prepare(
+        "INSERT INTO memory_retrieval_queries (
+            id, repo, query_text, run_id, task_id, thread_id, top_k, related_repos,
+            returned_count, latency_ms, stale_filtered, unsafe_filtered, conflict_filtered, created_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            ?9, ?10, ?11, ?12, ?13, ?14
+        )",
+    )
+    .bind(&[
+        JsValue::from_str(query_id),
+        JsValue::from_str(&req.repo),
+        JsValue::from_str(&req.query),
+        opt_str(&req.run_id),
+        opt_str(&req.task_id),
+        opt_str(&req.thread_id),
+        JsValue::from(req.top_k as f64),
+        JsValue::from_str(&serde_json::to_string(&req.related_repos).unwrap_or_else(|_| "[]".to_string())),
+        JsValue::from(returned_count),
+        JsValue::from(latency_ms),
+        JsValue::from(stale_filtered),
+        JsValue::from(unsafe_filtered),
+        JsValue::from(conflict_filtered),
         JsValue::from_str(&now),
     ])?
     .run()
@@ -1082,6 +1686,19 @@ pub async fn provision_tenant(
     Ok(())
 }
 
+fn add_seconds_to_now(seconds: u64) -> String {
+    let now = js_sys::Date::now();
+    let future = js_sys::Date::new(&JsValue::from_f64(now + (seconds as f64 * 1000.0)));
+    future.to_iso_string().as_string().unwrap()
+}
+
+fn random_hex_id() -> Result<String> {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf)
+        .map_err(|err| Error::RustError(format!("failed to generate id: {err}")))?;
+    Ok(hex::encode(buf))
+}
+
 // ── Internal row types ──────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -1202,6 +1819,48 @@ pub struct CheckpointRow {
     pub created_at: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct MemoryGcRow {
+    id: String,
+    status: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PercentileRow {
+    latency_ms: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MemoryEvalRow {
+    total_queries: i64,
+    cache_hit_rate: Option<f64>,
+    success_rate: Option<f64>,
+    first_pass_success_rate: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, Clone)]
+struct MemoryIndexRow {
+    id: String,
+    repo: String,
+    kind: String,
+    run_id: Option<String>,
+    task_id: Option<String>,
+    thread_id: Option<String>,
+    title: Option<String>,
+    summary: String,
+    tags: Option<String>,
+    content_ref: Option<String>,
+    success_rate: Option<f64>,
+    source_created_at: Option<String>,
+    indexed_at: String,
+    last_accessed_at: Option<String>,
+    access_count: i32,
+    unsafe_reason: Option<String>,
+    expires_at: Option<String>,
+    conflict_key: Option<String>,
+    conflict_version: Option<i64>,
+}
+
 impl CheckpointRow {
     pub fn into_checkpoint(self) -> models::Checkpoint {
         models::Checkpoint {
@@ -1213,6 +1872,35 @@ impl CheckpointRow {
             state_size_bytes: self.state_size_bytes,
             metadata: self.metadata.and_then(|s| serde_json::from_str(&s).ok()),
             created_at: self.created_at,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MemoryRow {
+    id: String,
+    run_id: Option<String>,
+    thread_id: String,
+    scope: String,
+    key: String,
+    ref_type: String,
+    ref_id: String,
+    created_at: String,
+    expires_at: Option<String>,
+}
+
+impl MemoryRow {
+    fn into_memory(self) -> models::Memory {
+        models::Memory {
+            id: self.id,
+            run_id: self.run_id,
+            thread_id: self.thread_id,
+            scope: self.scope,
+            key: self.key,
+            ref_type: self.ref_type,
+            ref_id: self.ref_id,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
         }
     }
 }
@@ -1298,6 +1986,232 @@ pub struct Ws2TaskResponse {
     pub created_at: String,
     pub updated_at: String,
     pub metadata: Option<serde_json::Value>,
+}
+
+// ── Provenance Links (WS3: causality chain) ─────────────────────
+
+pub async fn insert_relationship(
+    db: &D1Database,
+    rel_type: &str,
+    from_kind: &str,
+    from_id: &str,
+    to_kind: &str,
+    to_id: &str,
+    relation: Option<&str>,
+) -> Result<()> {
+    let now = now_iso();
+    db.prepare(
+        "INSERT OR IGNORE INTO relationships (rel_type, from_kind, from_id, to_kind, to_id, relation, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(&[
+        JsValue::from_str(rel_type),
+        JsValue::from_str(from_kind),
+        JsValue::from_str(from_id),
+        JsValue::from_str(to_kind),
+        JsValue::from_str(to_id),
+        match relation {
+            Some(r) => JsValue::from_str(r),
+            None => JsValue::NULL,
+        },
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// Walk the provenance chain from an entity. Direction "forward" follows from→to; "backward" follows to→from.
+pub async fn get_provenance_chain(
+    db: &D1Database,
+    kind: &str,
+    id: &str,
+    direction: &str,
+    max_hops: u32,
+) -> Result<Vec<models::ProvenanceEdge>> {
+    let query = if direction == "backward" {
+        "WITH RECURSIVE chain(depth, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at) AS (
+           SELECT 0, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at
+             FROM relationships WHERE to_kind = ?1 AND to_id = ?2
+           UNION
+           SELECT c.depth + 1, r.rel_type, r.from_kind, r.from_id, r.to_kind, r.to_id, r.relation, r.created_at
+             FROM relationships r JOIN chain c ON r.to_kind = c.from_kind AND r.to_id = c.from_id
+             WHERE c.depth < ?3
+         ) SELECT * FROM chain ORDER BY depth"
+    } else {
+        "WITH RECURSIVE chain(depth, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at) AS (
+           SELECT 0, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at
+             FROM relationships WHERE from_kind = ?1 AND from_id = ?2
+           UNION
+           SELECT c.depth + 1, r.rel_type, r.from_kind, r.from_id, r.to_kind, r.to_id, r.relation, r.created_at
+             FROM relationships r JOIN chain c ON r.from_kind = c.to_kind AND r.from_id = c.to_id
+             WHERE c.depth < ?3
+         ) SELECT * FROM chain ORDER BY depth"
+    };
+
+    let result: D1Result = db
+        .prepare(query)
+        .bind(&[
+            JsValue::from_str(kind),
+            JsValue::from_str(id),
+            JsValue::from(max_hops),
+        ])?
+        .all()
+        .await?;
+
+    let rows: Vec<ProvenanceEdgeRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_edge()).collect())
+}
+
+/// Extract implicit causality edges from a GraphEvent and insert them.
+pub async fn insert_causality_from_event(db: &D1Database, evt: &models::GraphEvent) -> Result<()> {
+    // run → task causality
+    if let (Some(ref run_id), Some(ref node_id)) = (&evt.run_id, &evt.node_id) {
+        insert_relationship(
+            db,
+            "causality",
+            "run",
+            run_id,
+            "node",
+            node_id,
+            Some("executed"),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// ── Gold Layer: Run Summaries (WS3) ─────────────────────────────
+
+pub async fn upsert_run_summary(
+    db: &D1Database,
+    run_id: &str,
+    actor: Option<&str>,
+    event_type: &str,
+    created_at: &str,
+) -> Result<()> {
+    let now = now_iso();
+    let actor_json: Vec<&str> = actor.into_iter().collect();
+    let event_type_json = vec![event_type];
+
+    // Atomic upsert: INSERT on first event, ON CONFLICT merge arrays + update counts.
+    // json_group_array(DISTINCT ...) via subquery deduplicates actors/event_types.
+    db.prepare(
+        "INSERT INTO run_summaries (run_id, event_count, first_event_at, last_event_at, actors, event_types, updated_at)
+         VALUES (?1, 1, ?2, ?2, ?3, ?4, ?5)
+         ON CONFLICT(run_id) DO UPDATE SET
+           event_count = event_count + 1,
+           first_event_at = MIN(first_event_at, excluded.first_event_at),
+           last_event_at = MAX(last_event_at, excluded.last_event_at),
+           actors = (
+             SELECT json_group_array(value) FROM (
+               SELECT DISTINCT value FROM (
+                 SELECT value FROM json_each(run_summaries.actors)
+                 UNION ALL
+                 SELECT value FROM json_each(excluded.actors)
+               )
+             )
+           ),
+           event_types = (
+             SELECT json_group_array(value) FROM (
+               SELECT DISTINCT value FROM (
+                 SELECT value FROM json_each(run_summaries.event_types)
+                 UNION ALL
+                 SELECT value FROM json_each(excluded.event_types)
+               )
+             )
+           ),
+           updated_at = excluded.updated_at",
+    )
+    .bind(&[
+        JsValue::from_str(run_id),
+        JsValue::from_str(created_at),
+        JsValue::from_str(&serde_json::to_string(&actor_json).unwrap()),
+        JsValue::from_str(&serde_json::to_string(&event_type_json).unwrap()),
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn get_run_summary(db: &D1Database, run_id: &str) -> Result<Option<models::RunSummary>> {
+    let row: Option<RunSummaryRow> = db
+        .prepare("SELECT * FROM run_summaries WHERE run_id = ?1")
+        .bind(&[JsValue::from_str(run_id)])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.into_summary()))
+}
+
+pub async fn list_run_summaries(db: &D1Database, limit: u32) -> Result<Vec<models::RunSummary>> {
+    let result: D1Result = db
+        .prepare("SELECT * FROM run_summaries ORDER BY updated_at DESC LIMIT ?1")
+        .bind(&[JsValue::from(limit)])?
+        .all()
+        .await?;
+    let rows: Vec<RunSummaryRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_summary()).collect())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProvenanceEdgeRow {
+    depth: i32,
+    rel_type: String,
+    from_kind: String,
+    from_id: String,
+    to_kind: String,
+    to_id: String,
+    relation: Option<String>,
+    created_at: Option<String>,
+}
+
+impl ProvenanceEdgeRow {
+    fn into_edge(self) -> models::ProvenanceEdge {
+        models::ProvenanceEdge {
+            depth: self.depth,
+            rel_type: self.rel_type,
+            from_kind: self.from_kind,
+            from_id: self.from_id,
+            to_kind: self.to_kind,
+            to_id: self.to_id,
+            relation: self.relation,
+            created_at: self.created_at,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RunSummaryRow {
+    run_id: String,
+    event_count: i32,
+    first_event_at: Option<String>,
+    last_event_at: Option<String>,
+    actors: Option<String>,
+    event_types: Option<String>,
+    updated_at: String,
+}
+
+impl RunSummaryRow {
+    fn into_summary(self) -> models::RunSummary {
+        models::RunSummary {
+            run_id: self.run_id,
+            event_count: self.event_count,
+            first_event_at: self.first_event_at,
+            last_event_at: self.last_event_at,
+            actors: self
+                .actors
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default(),
+            event_types: self
+                .event_types
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default(),
+            updated_at: self.updated_at,
+        }
+    }
 }
 
 // ── WS4 Policy row types ────────────────────────────────────────
@@ -1454,5 +2368,21 @@ mod tests {
         assert_eq!(classify_action_risk("update:config"), "write");
         assert_eq!(classify_action_risk("create:resource"), "write");
         assert_eq!(classify_action_risk("deploy:staging"), "write");
+    }
+
+    #[test]
+    fn tokenization_works() {
+        let t = tokenize("Fix CI checks for PR-31");
+        assert!(t.contains("fix"));
+        assert!(t.contains("checks"));
+        assert!(t.contains("pr"));
+    }
+
+    #[test]
+    fn jaccard_scoring_is_monotonic() {
+        let a = tokenize("graph event replay");
+        let b = tokenize("graph event replay state");
+        let c = tokenize("unrelated topic");
+        assert!(jaccard_similarity(&a, &b) > jaccard_similarity(&a, &c));
     }
 }

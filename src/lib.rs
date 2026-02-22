@@ -173,6 +173,73 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 accepted: true,
             })
         })
+        // ── Retrieval & Memory Federation (WS5) ───────────────
+        .post_async("/v1/memory/index", |mut req, ctx| async move {
+            let body: models::UpsertMemoryItemRequest = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            let expires_at = db::upsert_memory_item(&d1, &id, &body).await?;
+            Response::from_json(&models::MemoryItemCreated {
+                id,
+                status: "indexed".into(),
+                expires_at,
+            })
+        })
+        .post_async("/v1/memory/retrieve", |mut req, ctx| async move {
+            let body: models::RetrieveMemoryRequest = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            let response = db::retrieve_memory(&d1, &body).await?;
+            Response::from_json(&response)
+        })
+        .post_async("/v1/memory/context-pack", |mut req, ctx| async move {
+            let body: models::ContextPackRequest = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            let response = db::build_context_pack(&d1, &body).await?;
+            Response::from_json(&response)
+        })
+        .post_async("/v1/memory/:id/retire", |_req, ctx| async move {
+            let id = match ctx.param("id") {
+                Some(k) => k.to_string(),
+                None => return Response::error("missing memory id", 400),
+            };
+            let d1 = ctx.env.d1("DB")?;
+            let retired = db::retire_memory_item(&d1, &id).await?;
+            if retired {
+                Response::from_json(&models::RetireMemoryResponse {
+                    id,
+                    status: "retired".into(),
+                })
+            } else {
+                Response::error("memory item not found", 404)
+            }
+        })
+        .post_async("/v1/memory/gc", |mut req, ctx| async move {
+            let body: models::MemoryGcRequest = {
+                let text = req.text().await?;
+                if text.trim().is_empty() {
+                    models::MemoryGcRequest { limit: 1000 }
+                } else {
+                    match serde_json::from_str::<models::MemoryGcRequest>(&text) {
+                        Ok(v) => v,
+                        Err(_) => return Response::error("invalid JSON body", 400),
+                    }
+                }
+            };
+            let d1 = ctx.env.d1("DB")?;
+            let response = db::run_memory_gc(&d1, &body).await?;
+            Response::from_json(&response)
+        })
+        .post_async("/v1/memory/retrieval-feedback", |mut req, ctx| async move {
+            let body: models::RetrievalFeedback = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            db::record_retrieval_feedback(&d1, &body).await?;
+            Response::from_json(&models::RetrievalFeedbackAck { recorded: true })
+        })
+        .get_async("/v1/memory/eval/summary", |_req, ctx| async move {
+            let d1 = ctx.env.d1("DB")?;
+            let summary = db::memory_eval_summary(&d1).await?;
+            Response::from_json(&summary)
+        })
         // ── Artifacts (R2-backed) ─────────────────────────────
         .put_async("/v1/artifacts/:key", |mut req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
@@ -525,6 +592,48 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Response::error("checkpoint not found", 404)
             }
         })
+        // ── Memory (WS5: #45) ─────────────────────────────────
+        .post_async("/v1/memory", |mut req, ctx| async move {
+            let body: models::CreateMemory = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            db::create_memory(&d1, &id, &body).await?;
+            Response::from_json(&models::MemoryCreated {
+                id,
+                thread_id: body.thread_id,
+                scope: body.scope,
+                key: body.key,
+            })
+        })
+        .get_async("/v1/memory/threads/:thread_id", |req, ctx| async move {
+            let thread_id = match ctx.param("thread_id") {
+                Some(t) => t.to_string(),
+                None => return Response::error("missing thread_id", 400),
+            };
+            let limit = parse_limit_query(req.url().ok(), "limit").unwrap_or(100);
+            let d1 = ctx.env.d1("DB")?;
+            let memories = db::list_memories_for_thread(&d1, &thread_id, limit).await?;
+            Response::from_json(&serde_json::json!({ "memories": memories }))
+        })
+        .get_async(
+            "/v1/context-pack/threads/:thread_id",
+            |req, ctx| async move {
+                let tenant_ctx = tenant::tenant_from_request(&req)?;
+                let thread_id = match ctx.param("thread_id") {
+                    Some(t) => t.to_string(),
+                    None => return Response::error("missing thread_id", 400),
+                };
+                let max_items = parse_limit_query(req.url().ok(), "max_items").unwrap_or(50);
+                let d1 = ctx.env.d1("DB")?;
+                let checkpoint = db::get_latest_checkpoint(&d1, &tenant_ctx.tenant_id, &thread_id).await?;
+                let memories = db::list_memories_for_thread(&d1, &thread_id, max_items).await?;
+                Response::from_json(&serde_json::json!({
+                    "thread_id": thread_id,
+                    "checkpoint": checkpoint.map(|r| r.into_checkpoint()),
+                    "memories": memories,
+                }))
+            },
+        )
         // ── Traces / Provenance (WS3: issue #43) ──────────────
         .get_async("/v1/traces/:run_id", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
@@ -535,8 +644,18 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let limit =
                 parse_limit_query(req.url().ok(), "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
             let d1 = ctx.env.d1("DB")?;
-            let events = db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit).await?;
-            Response::from_json(&models::TraceResponse { run_id, events })
+            // Fetch limit+1 to detect truncation without a separate COUNT query
+            let mut events = db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
+            let truncated = events.len() > limit as usize;
+            if truncated {
+                events.truncate(limit as usize);
+            }
+            Response::from_json(&models::TraceResponse {
+                run_id,
+                events,
+                total: None,
+                truncated: Some(truncated),
+            })
         })
         .get_async("/v1/traces/:run_id/lineage", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
@@ -544,10 +663,69 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
             };
-            let hops = parse_limit_query(req.url().ok(), "hops").unwrap_or(100);
+            let limit = parse_limit_query(req.url().ok(), "hops").unwrap_or(100);
             let d1 = ctx.env.d1("DB")?;
-            let events = db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, hops).await?;
-            Response::from_json(&models::TraceResponse { run_id, events })
+            let events = db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit).await?;
+            Response::from_json(&models::TraceResponse {
+                run_id,
+                events,
+                total: None,
+                truncated: None,
+            })
+        })
+        // ── Provenance Chain (WS3) ──────────────────────────────
+        .get_async("/v1/provenance/:kind/:id", |req, ctx| async move {
+            let kind = match ctx.param("kind") {
+                Some(k) => k.to_string(),
+                None => return Response::error("missing kind", 400),
+            };
+            let id = match ctx.param("id") {
+                Some(i) => i.to_string(),
+                None => return Response::error("missing id", 400),
+            };
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let direction = params
+                .get("direction")
+                .map(|s| s.as_str())
+                .unwrap_or("forward");
+            if direction != "forward" && direction != "backward" {
+                return Response::error("invalid direction: must be 'forward' or 'backward'", 400);
+            }
+            let hops = params
+                .get("hops")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5u32)
+                .min(100);
+            let d1 = ctx.env.d1("DB")?;
+            let edges = db::get_provenance_chain(&d1, &kind, &id, direction, hops).await?;
+            Response::from_json(&models::ProvenanceResponse {
+                entity_kind: kind,
+                entity_id: id,
+                direction: direction.into(),
+                hops,
+                edges,
+            })
+        })
+        // ── Gold Layer: Run Summaries (WS3) ─────────────────────
+        .get_async("/v1/runs/:run_id/summary", |_req, ctx| async move {
+            let run_id = ctx.param("run_id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            match db::get_run_summary(&d1, &run_id).await? {
+                Some(summary) => Response::from_json(&summary),
+                None => Response::error("run summary not found", 404),
+            }
+        })
+        .get_async("/v1/gold/run-summaries", |req, ctx| async move {
+            let limit = parse_limit_query(req.url().ok(), "limit")
+                .unwrap_or(50)
+                .min(200);
+            let d1 = ctx.env.d1("DB")?;
+            let summaries = db::list_run_summaries(&d1, limit).await?;
+            Response::from_json(&serde_json::json!({ "summaries": summaries }))
         })
         // ── Graph Events (M3) ─────────────────────────────────
         .post_async("/v1/graph-events", |mut req, ctx| async move {
@@ -583,17 +761,58 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .await
 }
 
-/// Queue consumer: processes enrichment jobs from the events queue.
-/// Ack all on success; on error retry the batch.
+/// Queue consumer: enriches events — silver promotion, causality edges, gold summaries.
 #[event(queue)]
-pub async fn queue(batch: MessageBatch<serde_json::Value>, _env: Env, _ctx: Context) -> Result<()> {
+pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
     let queue_name = batch.queue();
+    let d1 = env.d1("DB")?;
     let messages = batch.messages()?;
-    for msg in messages {
-        let _body = msg.body();
-        worker::console_log!("[queue {}] processing message", queue_name);
+
+    for msg in &messages {
+        let body = msg.body();
+        match serde_json::from_value::<models::GraphEvent>(body.clone()) {
+            Ok(evt) => {
+                let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
+
+                // Note: silver promotion is done synchronously in POST /v1/graph-events.
+                // The queue consumer handles only causality edges and gold layer summaries.
+
+                // Causality edges
+                if let Err(e) = db::insert_causality_from_event(&d1, &evt).await {
+                    worker::console_log!("[queue {}] causality insert error: {}", queue_name, e);
+                }
+
+                // Gold layer summary
+                if let Some(ref run_id) = evt.run_id {
+                    if let Err(e) = db::upsert_run_summary(
+                        &d1,
+                        run_id,
+                        evt.actor.as_deref(),
+                        &evt.event_type,
+                        &now,
+                    )
+                    .await
+                    {
+                        worker::console_log!(
+                            "[queue {}] run summary upsert error: {}",
+                            queue_name,
+                            e
+                        );
+                    }
+                }
+
+                msg.ack();
+            }
+            Err(e) => {
+                worker::console_log!(
+                    "[queue {}] failed to deserialize message: {}",
+                    queue_name,
+                    e
+                );
+                msg.retry();
+            }
+        }
     }
-    batch.ack_all();
     Ok(())
 }
 
