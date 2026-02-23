@@ -10,10 +10,10 @@ pattern = "data-fabric.stevedores.org/*"
 zone_name = "stevedores.org"
 
 [build]
-command = "cargo install worker-build && worker-build --release"
+command = "bash scripts/build-worker.sh"
 
-# deploy: bunx wrangler deploy
-# dev:    bunx wrangler dev
+# deploy: bun run deploy
+# dev:    bun run dev
 
 [vars]
 APP_ENV = "dev"

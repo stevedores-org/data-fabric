@@ -693,11 +693,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("missing run_id", 400),
             };
             let url = req.url().ok();
-            let (limit, has_valid_limit_param) = parse_limit_query_with_valid_presence(
-                url,
-                "limit",
-                db::TRACE_DEFAULT_LIMIT,
-            );
+            let (limit, has_valid_limit_param) =
+                parse_limit_query_with_valid_presence(url, "limit", db::TRACE_DEFAULT_LIMIT);
             let d1 = ctx.env.d1("DB")?;
             // Fetch limit+1 to detect truncation without a second query for count when not needed
             let mut events =
@@ -1132,8 +1129,7 @@ fn build_trace_response_metadata(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_trace_response_metadata, parse_limit_query,
-        parse_limit_query_with_valid_presence,
+        build_trace_response_metadata, parse_limit_query, parse_limit_query_with_valid_presence,
     };
     use worker::Url;
 
@@ -1191,7 +1187,10 @@ mod tests {
 
     #[test]
     fn build_trace_response_metadata_for_default_untruncated() {
-        assert_eq!(build_trace_response_metadata(20, false, false), (None, None));
+        assert_eq!(
+            build_trace_response_metadata(20, false, false),
+            (None, None)
+        );
     }
 
     #[test]
