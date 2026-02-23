@@ -709,6 +709,20 @@ fn memory_created_serializes() {
     assert_eq!(json["key"], "summary");
 }
 
+#[test]
+fn trace_response_serializes_with_metadata() {
+    let resp = TraceResponse {
+        run_id: "r1".into(),
+        events: vec![],
+        total: Some(150),
+        truncated: Some(true),
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["run_id"], "r1");
+    assert_eq!(json["total"], 150);
+    assert_eq!(json["truncated"], true);
+}
+
 // ── WS5: Retrieval & Memory ────────────────────────────────────
 
 #[test]

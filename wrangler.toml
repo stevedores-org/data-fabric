@@ -12,8 +12,8 @@ zone_name = "stevedores.org"
 [build]
 command = "bash scripts/build-worker.sh"
 
-# deploy: npx wrangler deploy
-# dev:    npx wrangler dev
+# deploy: bun run deploy
+# dev:    bun run dev
 
 [vars]
 APP_ENV = "dev"

@@ -149,6 +149,7 @@ pub struct TraceEvent {
 }
 
 /// Trace slice for a run: ordered events for debugging and replay.
+/// When `?limit=` or `?hops=` is used, `total` and `truncated` indicate there may be more events (issue #61).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct TraceResponse {
     pub run_id: String,

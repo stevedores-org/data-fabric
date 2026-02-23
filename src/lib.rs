@@ -177,10 +177,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         // ── Retrieval & Memory Federation (WS5) ───────────────
         .post_async("/v1/memory/index", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::UpsertMemoryItemRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            let expires_at = db::upsert_memory_item(&d1, &id, &body).await?;
+            let expires_at = db::upsert_memory_item(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&models::MemoryItemCreated {
                 id,
                 status: "indexed".into(),
@@ -188,24 +189,27 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             })
         })
         .post_async("/v1/memory/retrieve", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::RetrieveMemoryRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-            let response = db::retrieve_memory(&d1, &body).await?;
+            let response = db::retrieve_memory(&d1, &tenant_ctx.tenant_id, &body).await?;
             Response::from_json(&response)
         })
         .post_async("/v1/memory/context-pack", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::ContextPackRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-            let response = db::build_context_pack(&d1, &body).await?;
+            let response = db::build_context_pack(&d1, &tenant_ctx.tenant_id, &body).await?;
             Response::from_json(&response)
         })
-        .post_async("/v1/memory/:id/retire", |_req, ctx| async move {
+        .post_async("/v1/memory/:id/retire", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let id = match ctx.param("id") {
                 Some(k) => k.to_string(),
                 None => return Response::error("missing memory id", 400),
             };
             let d1 = ctx.env.d1("DB")?;
-            let retired = db::retire_memory_item(&d1, &id).await?;
+            let retired = db::retire_memory_item(&d1, &tenant_ctx.tenant_id, &id).await?;
             if retired {
                 Response::from_json(&models::RetireMemoryResponse {
                     id,
@@ -216,6 +220,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .post_async("/v1/memory/gc", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::MemoryGcRequest = {
                 let text = req.text().await?;
                 if text.trim().is_empty() {
@@ -228,18 +233,20 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
             };
             let d1 = ctx.env.d1("DB")?;
-            let response = db::run_memory_gc(&d1, &body).await?;
+            let response = db::run_memory_gc(&d1, &tenant_ctx.tenant_id, &body).await?;
             Response::from_json(&response)
         })
         .post_async("/v1/memory/retrieval-feedback", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::RetrievalFeedback = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-            db::record_retrieval_feedback(&d1, &body).await?;
+            db::record_retrieval_feedback(&d1, &tenant_ctx.tenant_id, &body).await?;
             Response::from_json(&models::RetrievalFeedbackAck { recorded: true })
         })
-        .get_async("/v1/memory/eval/summary", |_req, ctx| async move {
+        .get_async("/v1/memory/eval/summary", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
-            let summary = db::memory_eval_summary(&d1).await?;
+            let summary = db::memory_eval_summary(&d1, &tenant_ctx.tenant_id).await?;
             Response::from_json(&summary)
         })
         // ── Artifacts (R2-backed) ─────────────────────────────
@@ -632,10 +639,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         // ── Memory (WS5: #45) ─────────────────────────────────
         .post_async("/v1/memory", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::CreateMemory = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::create_memory(&d1, &id, &body).await?;
+            db::create_memory(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&models::MemoryCreated {
                 id,
                 thread_id: body.thread_id,
@@ -644,13 +652,15 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             })
         })
         .get_async("/v1/memory/threads/:thread_id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let thread_id = match ctx.param("thread_id") {
                 Some(t) => t.to_string(),
                 None => return Response::error("missing thread_id", 400),
             };
             let limit = parse_limit_query(req.url().ok(), "limit").unwrap_or(100);
             let d1 = ctx.env.d1("DB")?;
-            let memories = db::list_memories_for_thread(&d1, &thread_id, limit).await?;
+            let memories =
+                db::list_memories_for_thread(&d1, &tenant_ctx.tenant_id, &thread_id, limit).await?;
             Response::from_json(&serde_json::json!({ "memories": memories }))
         })
         .get_async(
@@ -665,7 +675,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let d1 = ctx.env.d1("DB")?;
                 let checkpoint =
                     db::get_latest_checkpoint(&d1, &tenant_ctx.tenant_id, &thread_id).await?;
-                let memories = db::list_memories_for_thread(&d1, &thread_id, max_items).await?;
+                let memories =
+                    db::list_memories_for_thread(&d1, &tenant_ctx.tenant_id, &thread_id, max_items)
+                        .await?;
                 Response::from_json(&serde_json::json!({
                     "thread_id": thread_id,
                     "checkpoint": checkpoint.map(|r| r.into_checkpoint()),
@@ -681,26 +693,24 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("missing run_id", 400),
             };
             let url = req.url().ok();
-            let has_limit = has_query_param(url.as_ref(), "limit");
-            let limit = parse_limit_query(url, "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
+            let (limit, has_valid_limit_param) =
+                parse_limit_query_with_valid_presence(url, "limit", db::TRACE_DEFAULT_LIMIT);
             let d1 = ctx.env.d1("DB")?;
-            // Fetch limit+1 to detect truncation without a separate COUNT query
+            // Fetch limit+1 to detect truncation without a second query for count when not needed
             let mut events =
                 db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
             let truncated = events.len() > limit as usize;
             if truncated {
                 events.truncate(limit as usize);
             }
-            let total = if has_limit {
-                Some(db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?)
-            } else {
-                None
-            };
+            let total = db::get_trace_count_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
+            let (total_meta, truncated_meta) =
+                build_trace_response_metadata(u64::from(total), truncated, has_valid_limit_param);
             Response::from_json(&models::TraceResponse {
                 run_id,
+                total: total_meta,
                 events,
-                total,
-                truncated: if has_limit { Some(truncated) } else { None },
+                truncated: truncated_meta,
             })
         })
         .get_async("/v1/traces/:run_id/lineage", |req, ctx| async move {
@@ -710,8 +720,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("missing run_id", 400),
             };
             let url = req.url().ok();
-            let has_hops = has_query_param(url.as_ref(), "hops");
-            let limit = parse_limit_query(url, "hops").unwrap_or(100);
+            let (limit, has_valid_hops_param) =
+                parse_limit_query_with_valid_presence(url, "hops", 100);
             let d1 = ctx.env.d1("DB")?;
             let mut events =
                 db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
@@ -719,16 +729,14 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if truncated {
                 events.truncate(limit as usize);
             }
-            let total = if has_hops {
-                Some(db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?)
-            } else {
-                None
-            };
+            let total = db::get_trace_count_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
+            let (total_meta, truncated_meta) =
+                build_trace_response_metadata(u64::from(total), truncated, has_valid_hops_param);
             Response::from_json(&models::TraceResponse {
                 run_id,
+                total: total_meta,
                 events,
-                total,
-                truncated: if has_hops { Some(truncated) } else { None },
+                truncated: truncated_meta,
             })
         })
         // ── Provenance Chain (WS3) ──────────────────────────────
@@ -1086,35 +1094,110 @@ fn parse_limit_query(url: Option<worker::Url>, param: &str) -> Option<u32> {
     value.parse().ok().filter(|&n| n > 0 && n <= 10_000)
 }
 
-fn has_query_param(url: Option<&worker::Url>, param: &str) -> bool {
-    let Some(url) = url else { return false };
-    url.query_pairs().any(|(k, _)| k == param)
+/// Parse a numeric query param and report whether a valid value was explicitly provided.
+fn parse_limit_query_with_valid_presence(
+    url: Option<worker::Url>,
+    param: &str,
+    default_value: u32,
+) -> (u32, bool) {
+    let parsed = parse_limit_query(url.clone(), param);
+    let has_valid_param = parsed.is_some();
+    (parsed.unwrap_or(default_value), has_valid_param)
+}
+
+/// Build metadata for trace responses.
+/// - `total` is emitted only when the caller supplied a valid bound and the result is not truncated.
+/// - `truncated` is emitted when truncation happened or when the caller supplied a valid bound.
+fn build_trace_response_metadata(
+    event_count: u64,
+    truncated: bool,
+    has_valid_bound_param: bool,
+) -> (Option<u64>, Option<bool>) {
+    let total = if has_valid_bound_param && !truncated {
+        Some(event_count)
+    } else {
+        None
+    };
+    let truncated_meta = if has_valid_bound_param || truncated {
+        Some(truncated)
+    } else {
+        None
+    };
+    (total, truncated_meta)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{has_query_param, parse_limit_query};
+    use super::{
+        build_trace_response_metadata, parse_limit_query, parse_limit_query_with_valid_presence,
+    };
+    use worker::Url;
 
     #[test]
-    fn parse_limit_query_validates_bounds() {
-        let url = worker::Url::parse("https://example.com/v1/traces/r1?limit=50").unwrap();
-        assert_eq!(parse_limit_query(Some(url), "limit"), Some(50));
-
-        let zero = worker::Url::parse("https://example.com/v1/traces/r1?limit=0").unwrap();
-        assert_eq!(parse_limit_query(Some(zero), "limit"), None);
-
-        let too_large = worker::Url::parse("https://example.com/v1/traces/r1?limit=10001").unwrap();
-        assert_eq!(parse_limit_query(Some(too_large), "limit"), None);
+    fn parse_limit_query_parses_valid_value() {
+        let url = Url::parse("https://example.test/v1/traces/r1?limit=25").ok();
+        assert_eq!(parse_limit_query(url, "limit"), Some(25));
     }
 
     #[test]
-    fn has_query_param_detects_presence_not_value() {
-        let with_hops =
-            worker::Url::parse("https://example.com/v1/traces/r1/lineage?hops=20").unwrap();
-        assert!(has_query_param(Some(&with_hops), "hops"));
-        assert!(!has_query_param(Some(&with_hops), "limit"));
+    fn parse_limit_query_rejects_invalid_or_out_of_range() {
+        let invalid = Url::parse("https://example.test/v1/traces/r1?limit=abc").ok();
+        let zero = Url::parse("https://example.test/v1/traces/r1?limit=0").ok();
+        let too_large = Url::parse("https://example.test/v1/traces/r1?limit=10001").ok();
+        assert_eq!(parse_limit_query(invalid, "limit"), None);
+        assert_eq!(parse_limit_query(zero, "limit"), None);
+        assert_eq!(parse_limit_query(too_large, "limit"), None);
+    }
 
-        let empty = worker::Url::parse("https://example.com/v1/traces/r1?limit=").unwrap();
-        assert!(has_query_param(Some(&empty), "limit"));
+    #[test]
+    fn parse_limit_query_with_valid_presence_reports_valid_presence() {
+        let with_param = Url::parse("https://example.test/v1/traces/r1?hops=7").ok();
+        let without_param = Url::parse("https://example.test/v1/traces/r1").ok();
+        let invalid_param = Url::parse("https://example.test/v1/traces/r1?hops=abc").ok();
+
+        assert_eq!(
+            parse_limit_query_with_valid_presence(with_param, "hops", 100),
+            (7, true),
+        );
+        assert_eq!(
+            parse_limit_query_with_valid_presence(without_param, "hops", 100),
+            (100, false),
+        );
+        assert_eq!(
+            parse_limit_query_with_valid_presence(invalid_param, "hops", 100),
+            (100, false),
+        );
+    }
+
+    #[test]
+    fn build_trace_response_metadata_for_valid_untruncated_bound() {
+        assert_eq!(
+            build_trace_response_metadata(7, false, true),
+            (Some(7), Some(false)),
+        );
+    }
+
+    #[test]
+    fn build_trace_response_metadata_for_valid_truncated_bound() {
+        assert_eq!(
+            build_trace_response_metadata(100, true, true),
+            (None, Some(true)),
+        );
+    }
+
+    #[test]
+    fn build_trace_response_metadata_for_default_untruncated() {
+        assert_eq!(
+            build_trace_response_metadata(20, false, false),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn build_trace_response_metadata_for_default_truncated() {
+        assert_eq!(
+            build_trace_response_metadata(1000, true, false),
+            (None, Some(true)),
+        );
     }
 }
