@@ -680,8 +680,12 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
             };
-            let limit =
-                parse_limit_query(req.url().ok(), "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
+            let url = req.url().ok();
+            let (limit, has_limit_param) = parse_limit_query_with_presence(
+                url,
+                "limit",
+                db::TRACE_DEFAULT_LIMIT,
+            );
             let d1 = ctx.env.d1("DB")?;
             // Fetch limit+1 to detect truncation without a separate COUNT query
             let mut events =
@@ -692,9 +696,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
             Response::from_json(&models::TraceResponse {
                 run_id,
+                total: if has_limit_param && !truncated {
+                    Some(events.len())
+                } else {
+                    None
+                },
                 events,
-                total: None,
-                truncated: Some(truncated),
+                truncated: if has_limit_param || truncated {
+                    Some(truncated)
+                } else {
+                    None
+                },
             })
         })
         .get_async("/v1/traces/:run_id/lineage", |req, ctx| async move {
@@ -703,14 +715,28 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
             };
-            let limit = parse_limit_query(req.url().ok(), "hops").unwrap_or(100);
+            let url = req.url().ok();
+            let (limit, has_hops_param) = parse_limit_query_with_presence(url, "hops", 100);
             let d1 = ctx.env.d1("DB")?;
-            let events = db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit).await?;
+            let mut events =
+                db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
+            let truncated = events.len() > limit as usize;
+            if truncated {
+                events.truncate(limit as usize);
+            }
             Response::from_json(&models::TraceResponse {
                 run_id,
+                total: if has_hops_param && !truncated {
+                    Some(events.len())
+                } else {
+                    None
+                },
                 events,
-                total: None,
-                truncated: None,
+                truncated: if has_hops_param || truncated {
+                    Some(truncated)
+                } else {
+                    None
+                },
             })
         })
         // ── Provenance Chain (WS3) ──────────────────────────────
@@ -1066,4 +1092,54 @@ fn parse_limit_query(url: Option<worker::Url>, param: &str) -> Option<u32> {
     let url = url?;
     let value = url.query_pairs().find(|(k, _)| k == param)?.1;
     value.parse().ok().filter(|&n| n > 0 && n <= 10_000)
+}
+
+/// Parse a numeric query param and report whether the param was explicitly provided.
+fn parse_limit_query_with_presence(
+    url: Option<worker::Url>,
+    param: &str,
+    default_value: u32,
+) -> (u32, bool) {
+    let parsed = parse_limit_query(url.clone(), param);
+    let has_param = url
+        .map(|u| u.query_pairs().any(|(k, _)| k == param))
+        .unwrap_or(false);
+    (parsed.unwrap_or(default_value), has_param)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_limit_query, parse_limit_query_with_presence};
+    use worker::Url;
+
+    #[test]
+    fn parse_limit_query_parses_valid_value() {
+        let url = Url::parse("https://example.test/v1/traces/r1?limit=25").ok();
+        assert_eq!(parse_limit_query(url, "limit"), Some(25));
+    }
+
+    #[test]
+    fn parse_limit_query_rejects_invalid_or_out_of_range() {
+        let invalid = Url::parse("https://example.test/v1/traces/r1?limit=abc").ok();
+        let zero = Url::parse("https://example.test/v1/traces/r1?limit=0").ok();
+        let too_large = Url::parse("https://example.test/v1/traces/r1?limit=10001").ok();
+        assert_eq!(parse_limit_query(invalid, "limit"), None);
+        assert_eq!(parse_limit_query(zero, "limit"), None);
+        assert_eq!(parse_limit_query(too_large, "limit"), None);
+    }
+
+    #[test]
+    fn parse_limit_query_with_presence_reports_query_presence() {
+        let with_param = Url::parse("https://example.test/v1/traces/r1?hops=7").ok();
+        let without_param = Url::parse("https://example.test/v1/traces/r1").ok();
+
+        assert_eq!(
+            parse_limit_query_with_presence(with_param, "hops", 100),
+            (7, true),
+        );
+        assert_eq!(
+            parse_limit_query_with_presence(without_param, "hops", 100),
+            (100, false),
+        );
+    }
 }
