@@ -22,6 +22,9 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Install JS tooling (locked)
+        run: bun install --frozen-lockfile
+
       - name: Install worker-build
         run: cargo install worker-build --locked
 
@@ -29,6 +32,6 @@ jobs:
         run: worker-build --release
 
       - name: Deploy to Cloudflare
-        run: bunx wrangler@3 deploy
+        run: bun run deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
