@@ -16,6 +16,7 @@ cargo test
 # worker-build --release
 # bunx wrangler deploy
 ```
+**Tooling:** We use [Bun](https://bun.sh) for JS/TS tooling (e.g. `bunx wrangler`). No Node/npm required; install Bun and use `bunx` for one-off commands.
 
 ## Docs
 - `docs/ARCHITECTURE.md`
