@@ -42,11 +42,12 @@ preview_id = "placeholder-provision-with-wrangler-kv-namespace-create"
 
 # ── Queues: provenance event bus, enrichment consumer ─────────────
 # Create queue: wrangler queues create data-fabric-events
+# Then uncomment the consumer block below and redeploy.
 # [[queues.producers]]
 # binding = "EVENTS"
 # queue = "data-fabric-events"
 #
-[[queues.consumers]]
-queue = "data-fabric-events"
-max_batch_size = 50
-max_batch_timeout = 5
+# [[queues.consumers]]
+# queue = "data-fabric-events"
+# max_batch_size = 50
+# max_batch_timeout = 5

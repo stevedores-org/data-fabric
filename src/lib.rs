@@ -703,9 +703,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if truncated {
                 events.truncate(limit as usize);
             }
-            let total = db::get_trace_count_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
+            let total = db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
             let (total_meta, truncated_meta) =
-                build_trace_response_metadata(u64::from(total), truncated, has_valid_limit_param);
+                build_trace_response_metadata(total, truncated, has_valid_limit_param);
             Response::from_json(&models::TraceResponse {
                 run_id,
                 total: total_meta,
@@ -729,9 +729,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if truncated {
                 events.truncate(limit as usize);
             }
-            let total = db::get_trace_count_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
+            let total = db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
             let (total_meta, truncated_meta) =
-                build_trace_response_metadata(u64::from(total), truncated, has_valid_hops_param);
+                build_trace_response_metadata(total, truncated, has_valid_hops_param);
             Response::from_json(&models::TraceResponse {
                 run_id,
                 total: total_meta,
