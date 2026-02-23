@@ -12,8 +12,8 @@ zone_name = "stevedores.org"
 [build]
 command = "cargo install worker-build && worker-build --release"
 
-# deploy: npx wrangler deploy
-# dev:    npx wrangler dev
+# deploy: bunx wrangler deploy
+# dev:    bunx wrangler dev
 
 [vars]
 APP_ENV = "dev"

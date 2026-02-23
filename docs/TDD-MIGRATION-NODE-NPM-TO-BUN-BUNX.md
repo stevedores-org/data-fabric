@@ -31,9 +31,13 @@ Non-goals for this decision:
 ## 3. Inventory Checklist (to execute next)
 
 - [ ] Local scripts and wrappers (`README`, helper scripts, Make targets)
-- [ ] CI workflows invoking Node/npm/npx
+- [x] CI workflows invoking Node/npm/npx
 - [ ] Hook/tooling entrypoints requiring package runner changes
 - [ ] Lockfile policy (`bun.lock` canonical; remove npm lock usage in critical path)
+
+Current finding:
+- `deploy.yml` migrated from `npx wrangler@3 deploy` to `bunx wrangler@3 deploy`.
+- No active `npm` command usage found in this repo's workflows.
 
 ## 4. Success Criteria (test-driven)
 

@@ -19,6 +19,9 @@ jobs:
           toolchain: stable
           target: wasm32-unknown-unknown
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Install worker-build
         run: cargo install worker-build --locked
 
@@ -26,6 +29,6 @@ jobs:
         run: worker-build --release
 
       - name: Deploy to Cloudflare
-        run: npx wrangler@3 deploy
+        run: bunx wrangler@3 deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
