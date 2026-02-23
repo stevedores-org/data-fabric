@@ -2567,18 +2567,40 @@ pub async fn list_integrations(
     Ok(rows.into_iter().map(|r| r.into_integration()).collect())
 }
 
-pub async fn touch_integration(db: &D1Database, tenant_id: &str, target: &str) -> Result<()> {
+pub async fn touch_integration(
+    db: &D1Database,
+    tenant_id: &str,
+    target: &str,
+    name: Option<&str>,
+) -> Result<()> {
     let now = now_iso();
-    db.prepare(
-        "UPDATE integrations SET last_seen_at = ?1 WHERE tenant_id = ?2 AND target = ?3 AND status = 'active'",
-    )
-    .bind(&[
-        JsValue::from_str(&now),
-        JsValue::from_str(tenant_id),
-        JsValue::from_str(target),
-    ])?
-    .run()
-    .await?;
+    match name {
+        Some(n) => {
+            db.prepare(
+                "UPDATE integrations SET last_seen_at = ?1 WHERE tenant_id = ?2 AND target = ?3 AND name = ?4 AND status = 'active'",
+            )
+            .bind(&[
+                JsValue::from_str(&now),
+                JsValue::from_str(tenant_id),
+                JsValue::from_str(target),
+                JsValue::from_str(n),
+            ])?
+            .run()
+            .await?;
+        }
+        None => {
+            db.prepare(
+                "UPDATE integrations SET last_seen_at = ?1 WHERE tenant_id = ?2 AND target = ?3 AND status = 'active'",
+            )
+            .bind(&[
+                JsValue::from_str(&now),
+                JsValue::from_str(tenant_id),
+                JsValue::from_str(target),
+            ])?
+            .run()
+            .await?;
+        }
+    }
     Ok(())
 }
 

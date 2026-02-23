@@ -833,7 +833,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
 
                 if let Err(e) =
-                    db::touch_integration(&d1, &tenant_ctx.tenant_id, "oxidizedgraph").await
+                    db::touch_integration(&d1, &tenant_ctx.tenant_id, "oxidizedgraph", None).await
                 {
                     worker::console_log!("WARN: touch_integration(oxidizedgraph) failed: {e:?}");
                 }
@@ -862,7 +862,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let evt_id = generate_id()?;
             db::ingest_event(&d1, &tenant_ctx.tenant_id, &evt_id, &fabric_evt).await?;
 
-            if let Err(e) = db::touch_integration(&d1, &tenant_ctx.tenant_id, "aivcs").await {
+            if let Err(e) = db::touch_integration(&d1, &tenant_ctx.tenant_id, "aivcs", None).await {
                 worker::console_log!("WARN: touch_integration(aivcs) failed: {e:?}");
             }
 
@@ -884,7 +884,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let id = generate_id()?;
                 db::create_task(&d1, &tenant_ctx.tenant_id, &id, &task).await?;
 
-                if let Err(e) = db::touch_integration(&d1, &tenant_ctx.tenant_id, "llama_rs").await
+                if let Err(e) =
+                    db::touch_integration(&d1, &tenant_ctx.tenant_id, "llama_rs", None).await
                 {
                     worker::console_log!("WARN: touch_integration(llama_rs) failed: {e:?}");
                 }
@@ -918,7 +919,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     ingest_events_bronze_silver(&d1, &tenant_ctx.tenant_id, graph_events, &now)
                         .await?;
 
-                if let Err(e) = db::touch_integration(&d1, &tenant_ctx.tenant_id, "llama_rs").await
+                if let Err(e) =
+                    db::touch_integration(&d1, &tenant_ctx.tenant_id, "llama_rs", None).await
                 {
                     worker::console_log!("WARN: touch_integration(llama_rs) failed: {e:?}");
                 }
@@ -1036,24 +1038,24 @@ async fn ingest_events_bronze_silver(
     if events.is_empty() {
         return Ok(0);
     }
-    let mut bronze_events: Vec<(String, models::GraphEvent, String)> =
-        Vec::with_capacity(events.len());
+    // Build (id, event, timestamp) tuples — owned events stored here, refs taken below
+    let mut owned: Vec<(String, models::GraphEvent, String)> = Vec::with_capacity(events.len());
     for evt in events {
-        let id = generate_id()?;
-        bronze_events.push((id, evt, now.to_string()));
+        owned.push((generate_id()?, evt, now.to_string()));
     }
-    let count = bronze_events.len();
-    let refs: Vec<(String, &models::GraphEvent, String)> = bronze_events
+    let count = owned.len();
+
+    // Borrow from owned vec — single ref-mapping pass, no intermediate Vec
+    let bronze_refs: Vec<(String, &models::GraphEvent, String)> = owned
         .iter()
         .map(|(id, evt, ts)| (id.clone(), evt, ts.clone()))
         .collect();
-    db::insert_events_bronze(d1, tenant_id, &refs).await?;
+    db::insert_events_bronze(d1, tenant_id, &bronze_refs).await?;
 
     let mut silver_events: Vec<(String, String, &models::GraphEvent, String)> =
-        Vec::with_capacity(refs.len());
-    for (bronze_id, evt, created_at) in &refs {
-        let silver_id = generate_id()?;
-        silver_events.push((silver_id, bronze_id.clone(), evt, created_at.clone()));
+        Vec::with_capacity(count);
+    for (bronze_id, evt, ts) in &bronze_refs {
+        silver_events.push((generate_id()?, bronze_id.clone(), *evt, ts.clone()));
     }
     db::insert_events_silver(d1, tenant_id, &silver_events, now).await?;
     Ok(count)
