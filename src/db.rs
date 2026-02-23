@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use wasm_bindgen::JsValue;
 use worker::*;
 
-fn now_iso() -> String {
+pub fn now_iso() -> String {
     js_sys::Date::new_0().to_iso_string().as_string().unwrap()
 }
 
@@ -2674,6 +2674,141 @@ fn lease_time(seconds: u64) -> String {
     let now = js_sys::Date::now();
     let future = js_sys::Date::new(&JsValue::from_f64(now + (seconds as f64 * 1000.0)));
     future.to_iso_string().as_string().unwrap()
+}
+
+// ── Integrations (WS6) ─────────────────────────────────────────
+
+/// Maximum events per integration intake request (H2/H3: D1 batch limits).
+pub const INTEGRATION_BATCH_LIMIT: usize = 100;
+
+pub async fn register_integration(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &crate::integrations::RegisterIntegration,
+) -> Result<()> {
+    let now = now_iso();
+    let config_json = match &body.config {
+        Some(c) => Some(
+            serde_json::to_string(c)
+                .map_err(|e| Error::RustError(format!("config serialization: {e}")))?,
+        ),
+        None => None,
+    };
+    let api_version = body.api_version.as_deref().unwrap_or("v1");
+
+    db.prepare(
+        "INSERT INTO integrations (id, tenant_id, target, name, endpoint, api_version, status, config, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8)
+         ON CONFLICT(tenant_id, target, name) DO UPDATE SET
+           endpoint = excluded.endpoint,
+           api_version = excluded.api_version,
+           config = excluded.config,
+           status = 'active',
+           updated_at = excluded.created_at",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(body.target.as_str()),
+        JsValue::from_str(&body.name),
+        opt_str(&body.endpoint),
+        JsValue::from_str(api_version),
+        match &config_json {
+            Some(s) => JsValue::from_str(s),
+            None => JsValue::NULL,
+        },
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
+}
+
+pub async fn list_integrations(
+    db: &D1Database,
+    tenant_id: &str,
+    limit: u32,
+) -> Result<Vec<crate::integrations::Integration>> {
+    let result: D1Result = db
+        .prepare(
+            "SELECT id, target, name, endpoint, api_version, status, config, created_at, last_seen_at
+             FROM integrations WHERE tenant_id = ?1 AND status = 'active' ORDER BY created_at DESC LIMIT ?2",
+        )
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from(limit)])?
+        .all()
+        .await?;
+
+    let rows: Vec<IntegrationRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_integration()).collect())
+}
+
+pub async fn touch_integration(
+    db: &D1Database,
+    tenant_id: &str,
+    target: &str,
+    name: Option<&str>,
+) -> Result<()> {
+    let now = now_iso();
+    match name {
+        Some(n) => {
+            db.prepare(
+                "UPDATE integrations SET last_seen_at = ?1 WHERE tenant_id = ?2 AND target = ?3 AND name = ?4 AND status = 'active'",
+            )
+            .bind(&[
+                JsValue::from_str(&now),
+                JsValue::from_str(tenant_id),
+                JsValue::from_str(target),
+                JsValue::from_str(n),
+            ])?
+            .run()
+            .await?;
+        }
+        None => {
+            db.prepare(
+                "UPDATE integrations SET last_seen_at = ?1 WHERE tenant_id = ?2 AND target = ?3 AND status = 'active'",
+            )
+            .bind(&[
+                JsValue::from_str(&now),
+                JsValue::from_str(tenant_id),
+                JsValue::from_str(target),
+            ])?
+            .run()
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IntegrationRow {
+    id: String,
+    target: String,
+    name: String,
+    endpoint: Option<String>,
+    api_version: String,
+    status: String,
+    config: Option<String>,
+    created_at: String,
+    last_seen_at: Option<String>,
+}
+
+impl IntegrationRow {
+    fn into_integration(self) -> crate::integrations::Integration {
+        crate::integrations::Integration {
+            id: self.id,
+            target: serde_json::from_value(serde_json::Value::String(self.target.clone()))
+                .unwrap_or(crate::integrations::IntegrationTarget::Oxidizedgraph),
+            name: self.name,
+            endpoint: self.endpoint,
+            api_version: self.api_version,
+            status: self.status,
+            config: self.config.and_then(|s| serde_json::from_str(&s).ok()),
+            created_at: self.created_at,
+            last_seen_at: self.last_seen_at,
+        }
+    }
 }
 
 #[cfg(test)]
