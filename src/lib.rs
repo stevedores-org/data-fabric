@@ -680,8 +680,12 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
             };
-            let limit =
-                parse_limit_query(req.url().ok(), "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
+            let url = req.url().ok();
+            let (limit, has_valid_limit_param) = parse_limit_query_with_valid_presence(
+                url,
+                "limit",
+                db::TRACE_DEFAULT_LIMIT,
+            );
             let d1 = ctx.env.d1("DB")?;
             // Fetch limit+1 to detect truncation without a separate COUNT query
             let mut events =
@@ -690,11 +694,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if truncated {
                 events.truncate(limit as usize);
             }
+            let (total, truncated_meta) =
+                build_trace_response_metadata(events.len(), truncated, has_valid_limit_param);
             Response::from_json(&models::TraceResponse {
                 run_id,
+                total,
                 events,
-                total: None,
-                truncated: Some(truncated),
+                truncated: truncated_meta,
             })
         })
         .get_async("/v1/traces/:run_id/lineage", |req, ctx| async move {
@@ -703,14 +709,23 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
             };
-            let limit = parse_limit_query(req.url().ok(), "hops").unwrap_or(100);
+            let url = req.url().ok();
+            let (limit, has_valid_hops_param) =
+                parse_limit_query_with_valid_presence(url, "hops", 100);
             let d1 = ctx.env.d1("DB")?;
-            let events = db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit).await?;
+            let mut events =
+                db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
+            let truncated = events.len() > limit as usize;
+            if truncated {
+                events.truncate(limit as usize);
+            }
+            let (total, truncated_meta) =
+                build_trace_response_metadata(events.len(), truncated, has_valid_hops_param);
             Response::from_json(&models::TraceResponse {
                 run_id,
+                total,
                 events,
-                total: None,
-                truncated: None,
+                truncated: truncated_meta,
             })
         })
         // ── Provenance Chain (WS3) ──────────────────────────────
@@ -1066,4 +1081,110 @@ fn parse_limit_query(url: Option<worker::Url>, param: &str) -> Option<u32> {
     let url = url?;
     let value = url.query_pairs().find(|(k, _)| k == param)?.1;
     value.parse().ok().filter(|&n| n > 0 && n <= 10_000)
+}
+
+/// Parse a numeric query param and report whether a valid value was explicitly provided.
+fn parse_limit_query_with_valid_presence(
+    url: Option<worker::Url>,
+    param: &str,
+    default_value: u32,
+) -> (u32, bool) {
+    let parsed = parse_limit_query(url.clone(), param);
+    let has_valid_param = parsed.is_some();
+    (parsed.unwrap_or(default_value), has_valid_param)
+}
+
+/// Build metadata for trace responses.
+/// - `total` is emitted only when the caller supplied a valid bound and the result is not truncated.
+/// - `truncated` is emitted when truncation happened or when the caller supplied a valid bound.
+fn build_trace_response_metadata(
+    event_count: usize,
+    truncated: bool,
+    has_valid_bound_param: bool,
+) -> (Option<usize>, Option<bool>) {
+    let total = if has_valid_bound_param && !truncated {
+        Some(event_count)
+    } else {
+        None
+    };
+    let truncated_meta = if has_valid_bound_param || truncated {
+        Some(truncated)
+    } else {
+        None
+    };
+    (total, truncated_meta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_trace_response_metadata, parse_limit_query,
+        parse_limit_query_with_valid_presence,
+    };
+    use worker::Url;
+
+    #[test]
+    fn parse_limit_query_parses_valid_value() {
+        let url = Url::parse("https://example.test/v1/traces/r1?limit=25").ok();
+        assert_eq!(parse_limit_query(url, "limit"), Some(25));
+    }
+
+    #[test]
+    fn parse_limit_query_rejects_invalid_or_out_of_range() {
+        let invalid = Url::parse("https://example.test/v1/traces/r1?limit=abc").ok();
+        let zero = Url::parse("https://example.test/v1/traces/r1?limit=0").ok();
+        let too_large = Url::parse("https://example.test/v1/traces/r1?limit=10001").ok();
+        assert_eq!(parse_limit_query(invalid, "limit"), None);
+        assert_eq!(parse_limit_query(zero, "limit"), None);
+        assert_eq!(parse_limit_query(too_large, "limit"), None);
+    }
+
+    #[test]
+    fn parse_limit_query_with_valid_presence_reports_valid_presence() {
+        let with_param = Url::parse("https://example.test/v1/traces/r1?hops=7").ok();
+        let without_param = Url::parse("https://example.test/v1/traces/r1").ok();
+        let invalid_param = Url::parse("https://example.test/v1/traces/r1?hops=abc").ok();
+
+        assert_eq!(
+            parse_limit_query_with_valid_presence(with_param, "hops", 100),
+            (7, true),
+        );
+        assert_eq!(
+            parse_limit_query_with_valid_presence(without_param, "hops", 100),
+            (100, false),
+        );
+        assert_eq!(
+            parse_limit_query_with_valid_presence(invalid_param, "hops", 100),
+            (100, false),
+        );
+    }
+
+    #[test]
+    fn build_trace_response_metadata_for_valid_untruncated_bound() {
+        assert_eq!(
+            build_trace_response_metadata(7, false, true),
+            (Some(7), Some(false)),
+        );
+    }
+
+    #[test]
+    fn build_trace_response_metadata_for_valid_truncated_bound() {
+        assert_eq!(
+            build_trace_response_metadata(100, true, true),
+            (None, Some(true)),
+        );
+    }
+
+    #[test]
+    fn build_trace_response_metadata_for_default_untruncated() {
+        assert_eq!(build_trace_response_metadata(20, false, false), (None, None));
+    }
+
+    #[test]
+    fn build_trace_response_metadata_for_default_truncated() {
+        assert_eq!(
+            build_trace_response_metadata(1000, true, false),
+            (None, Some(true)),
+        );
+    }
 }
