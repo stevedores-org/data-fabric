@@ -683,17 +683,18 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let limit =
                 parse_limit_query(req.url().ok(), "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
             let d1 = ctx.env.d1("DB")?;
-            // Fetch limit+1 to detect truncation without a separate COUNT query
+            // Fetch limit+1 to detect truncation without a second query for count when not needed
             let mut events =
                 db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
             let truncated = events.len() > limit as usize;
             if truncated {
                 events.truncate(limit as usize);
             }
+            let total = db::get_trace_count_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
             Response::from_json(&models::TraceResponse {
                 run_id,
                 events,
-                total: None,
+                total: Some(total as usize),
                 truncated: Some(truncated),
             })
         })
@@ -706,11 +707,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let limit = parse_limit_query(req.url().ok(), "hops").unwrap_or(100);
             let d1 = ctx.env.d1("DB")?;
             let events = db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit).await?;
+            let total = db::get_trace_count_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
+            let truncated = total > limit;
             Response::from_json(&models::TraceResponse {
                 run_id,
                 events,
-                total: None,
-                truncated: None,
+                total: Some(total as usize),
+                truncated: Some(truncated),
             })
         })
         // ── Provenance Chain (WS3) ──────────────────────────────
