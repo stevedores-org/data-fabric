@@ -3,13 +3,19 @@ set -euo pipefail
 
 TOOLS_DIR="${PWD}/.worker-tools"
 
-if ! command -v rustup >/dev/null 2>&1; then
-	curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+if [[ -d "$HOME/.cargo/bin" ]]; then
 	export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
-if ! rustup target list --installed | grep -q '^wasm32-unknown-unknown$'; then
-	rustup target add wasm32-unknown-unknown
+if ! rustc --print target-libdir --target wasm32-unknown-unknown >/dev/null 2>&1; then
+	if ! command -v rustup >/dev/null 2>&1; then
+		curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+		export PATH="$HOME/.cargo/bin:$PATH"
+	fi
+
+	if ! rustup target list --installed | grep -q '^wasm32-unknown-unknown$'; then
+		rustup target add wasm32-unknown-unknown
+	fi
 fi
 
 cargo install worker-build --locked --root "$TOOLS_DIR"
