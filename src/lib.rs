@@ -692,10 +692,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 events.truncate(limit as usize);
             }
             let total = if has_limit {
-                Some(
-                    db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?
-                        as usize,
-                )
+                Some(db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?)
             } else {
                 None
             };
@@ -723,10 +720,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 events.truncate(limit as usize);
             }
             let total = if has_hops {
-                Some(
-                    db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?
-                        as usize,
-                )
+                Some(db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?)
             } else {
                 None
             };
@@ -1095,4 +1089,32 @@ fn parse_limit_query(url: Option<worker::Url>, param: &str) -> Option<u32> {
 fn has_query_param(url: Option<&worker::Url>, param: &str) -> bool {
     let Some(url) = url else { return false };
     url.query_pairs().any(|(k, _)| k == param)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_query_param, parse_limit_query};
+
+    #[test]
+    fn parse_limit_query_validates_bounds() {
+        let url = worker::Url::parse("https://example.com/v1/traces/r1?limit=50").unwrap();
+        assert_eq!(parse_limit_query(Some(url), "limit"), Some(50));
+
+        let zero = worker::Url::parse("https://example.com/v1/traces/r1?limit=0").unwrap();
+        assert_eq!(parse_limit_query(Some(zero), "limit"), None);
+
+        let too_large = worker::Url::parse("https://example.com/v1/traces/r1?limit=10001").unwrap();
+        assert_eq!(parse_limit_query(Some(too_large), "limit"), None);
+    }
+
+    #[test]
+    fn has_query_param_detects_presence_not_value() {
+        let with_hops =
+            worker::Url::parse("https://example.com/v1/traces/r1/lineage?hops=20").unwrap();
+        assert!(has_query_param(Some(&with_hops), "hops"));
+        assert!(!has_query_param(Some(&with_hops), "limit"));
+
+        let empty = worker::Url::parse("https://example.com/v1/traces/r1?limit=").unwrap();
+        assert!(has_query_param(Some(&empty), "limit"));
+    }
 }
