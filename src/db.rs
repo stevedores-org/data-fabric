@@ -435,6 +435,25 @@ pub async fn insert_events_bronze(
 /// Default max events per trace query (avoids unbounded result sets).
 pub const TRACE_DEFAULT_LIMIT: u32 = 1000;
 
+/// Total event count for a run (for trace response metadata). Issue #61. Scoped by tenant.
+pub async fn get_trace_count_for_run(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+) -> Result<u32> {
+    let result: Option<TraceCountRow> = db
+        .prepare("SELECT COUNT(*) AS cnt FROM events_bronze WHERE tenant_id = ?1 AND run_id = ?2")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
+        .first(None)
+        .await?;
+    Ok(result.map(|r| r.cnt as u32).unwrap_or(0))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TraceCountRow {
+    cnt: i64,
+}
+
 /// Fetch trace slice for a run (ordered by created_at). WS3 provenance. Limited by `limit` (default TRACE_DEFAULT_LIMIT).
 pub async fn get_trace_for_run(
     db: &D1Database,

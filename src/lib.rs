@@ -699,18 +699,19 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 db::TRACE_DEFAULT_LIMIT,
             );
             let d1 = ctx.env.d1("DB")?;
-            // Fetch limit+1 to detect truncation without a separate COUNT query
+            // Fetch limit+1 to detect truncation without a second query for count when not needed
             let mut events =
                 db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
             let truncated = events.len() > limit as usize;
             if truncated {
                 events.truncate(limit as usize);
             }
-            let (total, truncated_meta) =
-                build_trace_response_metadata(events.len(), truncated, has_valid_limit_param);
+            let total = db::get_trace_count_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
+            let (total_meta, truncated_meta) =
+                build_trace_response_metadata(total as usize, truncated, has_valid_limit_param);
             Response::from_json(&models::TraceResponse {
                 run_id,
-                total,
+                total: total_meta,
                 events,
                 truncated: truncated_meta,
             })
@@ -731,11 +732,12 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if truncated {
                 events.truncate(limit as usize);
             }
-            let (total, truncated_meta) =
-                build_trace_response_metadata(events.len(), truncated, has_valid_hops_param);
+            let total = db::get_trace_count_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
+            let (total_meta, truncated_meta) =
+                build_trace_response_metadata(total as usize, truncated, has_valid_hops_param);
             Response::from_json(&models::TraceResponse {
                 run_id,
-                total,
+                total: total_meta,
                 events,
                 truncated: truncated_meta,
             })
