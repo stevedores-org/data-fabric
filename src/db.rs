@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use wasm_bindgen::JsValue;
 use worker::*;
 
-fn now_iso() -> String {
+pub fn now_iso() -> String {
     js_sys::Date::new_0().to_iso_string().as_string().unwrap()
 }
 
@@ -340,13 +340,19 @@ pub async fn delete_checkpoint(db: &D1Database, tenant_id: &str, id: &str) -> Re
 
 // ── Memory (WS5: #45) ──────────────────────────────────────────
 
-pub async fn create_memory(db: &D1Database, id: &str, body: &models::CreateMemory) -> Result<()> {
+pub async fn create_memory(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::CreateMemory,
+) -> Result<()> {
     let now = now_iso();
     db.prepare(
-        "INSERT INTO memory (id, run_id, thread_id, scope, key, ref_type, ref_id, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO memory (tenant_id, id, run_id, thread_id, scope, key, ref_type, ref_id, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         opt_str(&body.run_id),
         JsValue::from_str(&body.thread_id),
@@ -365,15 +371,17 @@ pub async fn create_memory(db: &D1Database, id: &str, body: &models::CreateMemor
 /// List memories for a thread, recency-ordered. Limit applied (default 100). Excludes expired if expires_at < now.
 pub async fn list_memories_for_thread(
     db: &D1Database,
+    tenant_id: &str,
     thread_id: &str,
     limit: u32,
 ) -> Result<Vec<models::Memory>> {
     let now = now_iso();
     let result: D1Result = db
         .prepare(
-            "SELECT * FROM memory WHERE thread_id = ?1 AND (expires_at IS NULL OR expires_at > ?2) ORDER BY created_at DESC LIMIT ?3",
+            "SELECT * FROM memory WHERE tenant_id = ?1 AND thread_id = ?2 AND (expires_at IS NULL OR expires_at > ?3) ORDER BY created_at DESC LIMIT ?4",
         )
         .bind(&[
+            JsValue::from_str(tenant_id),
             JsValue::from_str(thread_id),
             JsValue::from_str(&now),
             JsValue::from(limit),
@@ -580,6 +588,7 @@ pub async fn get_run(db: &D1Database, tenant_id: &str, id: &str) -> Result<Optio
 
 pub async fn upsert_memory_item(
     db: &D1Database,
+    tenant_id: &str,
     id: &str,
     body: &models::UpsertMemoryItemRequest,
 ) -> Result<Option<String>> {
@@ -604,16 +613,17 @@ pub async fn upsert_memory_item(
 
     db.prepare(
         "INSERT INTO memory_index (
-            id, repo, kind, run_id, task_id, thread_id, checkpoint_id, artifact_key, title, summary,
+            tenant_id, id, repo, kind, run_id, task_id, thread_id, checkpoint_id, artifact_key, title, summary,
             tags, content_ref, metadata, success_rate, source_created_at, indexed_at, last_accessed_at,
             access_count, status, unsafe_reason, expires_at, conflict_key, conflict_version
         ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, NULL,
-            0, 'active', ?17, ?18, ?19, ?20
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+            ?12, ?13, ?14, ?15, ?16, ?17, NULL,
+            0, 'active', ?18, ?19, ?20, ?21
         )",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(id),
         JsValue::from_str(&body.repo),
         JsValue::from_str(&kind),
@@ -762,6 +772,7 @@ pub async fn record_tool_call(
 
 pub async fn retrieve_memory(
     db: &D1Database,
+    tenant_id: &str,
     req: &models::RetrieveMemoryRequest,
 ) -> Result<models::RetrieveMemoryResponse> {
     let start = js_sys::Date::now();
@@ -779,6 +790,10 @@ pub async fn retrieve_memory(
     let mut bind: Vec<JsValue> = vec![];
     let mut where_parts: Vec<String> = vec![];
     let mut idx = 1usize;
+
+    where_parts.push(format!("tenant_id = ?{idx}"));
+    bind.push(JsValue::from_str(tenant_id));
+    idx += 1;
 
     where_parts.push("status = 'active'".to_string());
 
@@ -890,6 +905,7 @@ pub async fn retrieve_memory(
     let elapsed = (js_sys::Date::now() - start).round() as i64;
     log_retrieval_query(
         db,
+        tenant_id,
         &query_id,
         req,
         selected.len() as i64,
@@ -899,7 +915,7 @@ pub async fn retrieve_memory(
         conflict_filtered as i64,
     )
     .await?;
-    touch_memory_items(db, &selected).await?;
+    touch_memory_items(db, tenant_id, &selected).await?;
 
     Ok(models::RetrieveMemoryResponse {
         query_id,
@@ -915,9 +931,10 @@ pub async fn retrieve_memory(
 
 pub async fn build_context_pack(
     db: &D1Database,
+    tenant_id: &str,
     req: &models::ContextPackRequest,
 ) -> Result<models::ContextPackResponse> {
-    let retrieval = retrieve_memory(db, &req.retrieval).await?;
+    let retrieval = retrieve_memory(db, tenant_id, &req.retrieval).await?;
     let mut used = 0usize;
     let mut dropped = 0usize;
     let mut packed = vec![];
@@ -940,10 +957,10 @@ pub async fn build_context_pack(
     })
 }
 
-pub async fn retire_memory_item(db: &D1Database, id: &str) -> Result<bool> {
+pub async fn retire_memory_item(db: &D1Database, tenant_id: &str, id: &str) -> Result<bool> {
     let res: D1Result = db
-        .prepare("UPDATE memory_index SET status = 'retired' WHERE id = ?1")
-        .bind(&[JsValue::from_str(id)])?
+        .prepare("UPDATE memory_index SET status = 'retired' WHERE tenant_id = ?1 AND id = ?2")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
         .run()
         .await?;
     let changed = res
@@ -955,6 +972,7 @@ pub async fn retire_memory_item(db: &D1Database, id: &str) -> Result<bool> {
 
 pub async fn run_memory_gc(
     db: &D1Database,
+    tenant_id: &str,
     req: &models::MemoryGcRequest,
 ) -> Result<models::MemoryGcResponse> {
     let now = now_iso();
@@ -963,11 +981,15 @@ pub async fn run_memory_gc(
     let rows: Vec<MemoryGcRow> = db
         .prepare(
             "SELECT id, status FROM memory_index
-             WHERE (status = 'retired' OR (expires_at IS NOT NULL AND expires_at <= ?1))
+             WHERE tenant_id = ?1 AND (status = 'retired' OR (expires_at IS NOT NULL AND expires_at <= ?2))
              ORDER BY indexed_at ASC
-             LIMIT ?2",
+             LIMIT ?3",
         )
-        .bind(&[JsValue::from_str(&now), JsValue::from(limit)])?
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&now),
+            JsValue::from(limit),
+        ])?
         .all()
         .await?
         .results()?;
@@ -986,8 +1008,8 @@ pub async fn run_memory_gc(
     let mut stmts = Vec::with_capacity(rows.len());
     for row in &rows {
         let stmt = db
-            .prepare("DELETE FROM memory_index WHERE id = ?1")
-            .bind(&[JsValue::from_str(&row.id)])?;
+            .prepare("DELETE FROM memory_index WHERE tenant_id = ?1 AND id = ?2")
+            .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(&row.id)])?;
         stmts.push(stmt);
     }
     db.batch(stmts).await?;
@@ -1001,15 +1023,17 @@ pub async fn run_memory_gc(
 
 pub async fn record_retrieval_feedback(
     db: &D1Database,
+    tenant_id: &str,
     feedback: &models::RetrievalFeedback,
 ) -> Result<()> {
     let now = now_iso();
     db.prepare(
         "INSERT INTO memory_retrieval_feedback (
-            query_id, run_id, task_id, success, first_pass_success, cache_hit, latency_ms, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            tenant_id, query_id, run_id, task_id, success, first_pass_success, cache_hit, latency_ms, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(&feedback.query_id),
         opt_str(&feedback.run_id),
         opt_str(&feedback.task_id),
@@ -1216,7 +1240,10 @@ pub async fn create_policy_rule(
     Ok(())
 }
 
-pub async fn memory_eval_summary(db: &D1Database) -> Result<models::MemoryEvalSummary> {
+pub async fn memory_eval_summary(
+    db: &D1Database,
+    tenant_id: &str,
+) -> Result<models::MemoryEvalSummary> {
     let row: Option<MemoryEvalRow> = db
         .prepare(
             "SELECT
@@ -1224,9 +1251,9 @@ pub async fn memory_eval_summary(db: &D1Database) -> Result<models::MemoryEvalSu
                 AVG(CASE WHEN cache_hit = 1 THEN 1.0 ELSE 0.0 END) AS cache_hit_rate,
                 AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) AS success_rate,
                 AVG(CASE WHEN first_pass_success = 1 THEN 1.0 ELSE 0.0 END) AS first_pass_success_rate
-             FROM memory_retrieval_feedback",
+             FROM memory_retrieval_feedback WHERE tenant_id = ?1",
         )
-        .bind(&[])?
+        .bind(&[JsValue::from_str(tenant_id)])?
         .first(None)
         .await?;
 
@@ -1234,22 +1261,22 @@ pub async fn memory_eval_summary(db: &D1Database) -> Result<models::MemoryEvalSu
         .prepare(
             "SELECT latency_ms
              FROM memory_retrieval_feedback
-             WHERE latency_ms IS NOT NULL
+             WHERE tenant_id = ?1 AND latency_ms IS NOT NULL
              ORDER BY latency_ms
-             LIMIT 1 OFFSET (SELECT CAST((COUNT(*) * 0.50) AS INTEGER) FROM memory_retrieval_feedback WHERE latency_ms IS NOT NULL)",
+             LIMIT 1 OFFSET (SELECT CAST((COUNT(*) * 0.50) AS INTEGER) FROM memory_retrieval_feedback WHERE tenant_id = ?2 AND latency_ms IS NOT NULL)",
         )
-        .bind(&[])?
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(tenant_id)])?
         .first(None)
         .await?;
     let p95: Option<PercentileRow> = db
         .prepare(
             "SELECT latency_ms
              FROM memory_retrieval_feedback
-             WHERE latency_ms IS NOT NULL
+             WHERE tenant_id = ?1 AND latency_ms IS NOT NULL
              ORDER BY latency_ms
-             LIMIT 1 OFFSET (SELECT CAST((COUNT(*) * 0.95) AS INTEGER) FROM memory_retrieval_feedback WHERE latency_ms IS NOT NULL)",
+             LIMIT 1 OFFSET (SELECT CAST((COUNT(*) * 0.95) AS INTEGER) FROM memory_retrieval_feedback WHERE tenant_id = ?2 AND latency_ms IS NOT NULL)",
         )
-        .bind(&[])?
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(tenant_id)])?
         .first(None)
         .await?;
 
@@ -1369,7 +1396,11 @@ fn parse_tags(tags: &Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-async fn touch_memory_items(db: &D1Database, items: &[models::MemoryCandidate]) -> Result<()> {
+async fn touch_memory_items(
+    db: &D1Database,
+    tenant_id: &str,
+    items: &[models::MemoryCandidate],
+) -> Result<()> {
     if items.is_empty() {
         return Ok(());
     }
@@ -1380,9 +1411,13 @@ async fn touch_memory_items(db: &D1Database, items: &[models::MemoryCandidate]) 
             .prepare(
                 "UPDATE memory_index
                  SET access_count = access_count + 1, last_accessed_at = ?1
-                 WHERE id = ?2",
+                 WHERE tenant_id = ?2 AND id = ?3",
             )
-            .bind(&[JsValue::from_str(&now), JsValue::from_str(&item.id)])?;
+            .bind(&[
+                JsValue::from_str(&now),
+                JsValue::from_str(tenant_id),
+                JsValue::from_str(&item.id),
+            ])?;
         stmts.push(stmt);
     }
     db.batch(stmts).await?;
@@ -1392,6 +1427,7 @@ async fn touch_memory_items(db: &D1Database, items: &[models::MemoryCandidate]) 
 #[allow(clippy::too_many_arguments)]
 async fn log_retrieval_query(
     db: &D1Database,
+    tenant_id: &str,
     query_id: &str,
     req: &models::RetrieveMemoryRequest,
     returned_count: i64,
@@ -1403,14 +1439,15 @@ async fn log_retrieval_query(
     let now = now_iso();
     db.prepare(
         "INSERT INTO memory_retrieval_queries (
-            id, repo, query_text, run_id, task_id, thread_id, top_k, related_repos,
+            tenant_id, id, repo, query_text, run_id, task_id, thread_id, top_k, related_repos,
             returned_count, latency_ms, stale_filtered, unsafe_filtered, conflict_filtered, created_at
         ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-            ?9, ?10, ?11, ?12, ?13, ?14
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+            ?10, ?11, ?12, ?13, ?14, ?15
         )",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(query_id),
         JsValue::from_str(&req.repo),
         JsValue::from_str(&req.query),
@@ -2497,6 +2534,141 @@ fn lease_time(seconds: u64) -> String {
     let now = js_sys::Date::now();
     let future = js_sys::Date::new(&JsValue::from_f64(now + (seconds as f64 * 1000.0)));
     future.to_iso_string().as_string().unwrap()
+}
+
+// ── Integrations (WS6) ─────────────────────────────────────────
+
+/// Maximum events per integration intake request (H2/H3: D1 batch limits).
+pub const INTEGRATION_BATCH_LIMIT: usize = 100;
+
+pub async fn register_integration(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &crate::integrations::RegisterIntegration,
+) -> Result<()> {
+    let now = now_iso();
+    let config_json = match &body.config {
+        Some(c) => Some(
+            serde_json::to_string(c)
+                .map_err(|e| Error::RustError(format!("config serialization: {e}")))?,
+        ),
+        None => None,
+    };
+    let api_version = body.api_version.as_deref().unwrap_or("v1");
+
+    db.prepare(
+        "INSERT INTO integrations (id, tenant_id, target, name, endpoint, api_version, status, config, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8)
+         ON CONFLICT(tenant_id, target, name) DO UPDATE SET
+           endpoint = excluded.endpoint,
+           api_version = excluded.api_version,
+           config = excluded.config,
+           status = 'active',
+           updated_at = excluded.created_at",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(body.target.as_str()),
+        JsValue::from_str(&body.name),
+        opt_str(&body.endpoint),
+        JsValue::from_str(api_version),
+        match &config_json {
+            Some(s) => JsValue::from_str(s),
+            None => JsValue::NULL,
+        },
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
+}
+
+pub async fn list_integrations(
+    db: &D1Database,
+    tenant_id: &str,
+    limit: u32,
+) -> Result<Vec<crate::integrations::Integration>> {
+    let result: D1Result = db
+        .prepare(
+            "SELECT id, target, name, endpoint, api_version, status, config, created_at, last_seen_at
+             FROM integrations WHERE tenant_id = ?1 AND status = 'active' ORDER BY created_at DESC LIMIT ?2",
+        )
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from(limit)])?
+        .all()
+        .await?;
+
+    let rows: Vec<IntegrationRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_integration()).collect())
+}
+
+pub async fn touch_integration(
+    db: &D1Database,
+    tenant_id: &str,
+    target: &str,
+    name: Option<&str>,
+) -> Result<()> {
+    let now = now_iso();
+    match name {
+        Some(n) => {
+            db.prepare(
+                "UPDATE integrations SET last_seen_at = ?1 WHERE tenant_id = ?2 AND target = ?3 AND name = ?4 AND status = 'active'",
+            )
+            .bind(&[
+                JsValue::from_str(&now),
+                JsValue::from_str(tenant_id),
+                JsValue::from_str(target),
+                JsValue::from_str(n),
+            ])?
+            .run()
+            .await?;
+        }
+        None => {
+            db.prepare(
+                "UPDATE integrations SET last_seen_at = ?1 WHERE tenant_id = ?2 AND target = ?3 AND status = 'active'",
+            )
+            .bind(&[
+                JsValue::from_str(&now),
+                JsValue::from_str(tenant_id),
+                JsValue::from_str(target),
+            ])?
+            .run()
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IntegrationRow {
+    id: String,
+    target: String,
+    name: String,
+    endpoint: Option<String>,
+    api_version: String,
+    status: String,
+    config: Option<String>,
+    created_at: String,
+    last_seen_at: Option<String>,
+}
+
+impl IntegrationRow {
+    fn into_integration(self) -> crate::integrations::Integration {
+        crate::integrations::Integration {
+            id: self.id,
+            target: serde_json::from_value(serde_json::Value::String(self.target.clone()))
+                .unwrap_or(crate::integrations::IntegrationTarget::Oxidizedgraph),
+            name: self.name,
+            endpoint: self.endpoint,
+            api_version: self.api_version,
+            status: self.status,
+            config: self.config.and_then(|s| serde_json::from_str(&s).ok()),
+            created_at: self.created_at,
+            last_seen_at: self.last_seen_at,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -30,6 +30,10 @@ jobs:
       - name: Build worker
         run: worker-build --release
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: ".bun-version"
+
       - name: Deploy to Cloudflare
         run: bunx wrangler@3 deploy
         env:
