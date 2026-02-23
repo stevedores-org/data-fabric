@@ -105,11 +105,11 @@ Capture before starting:
 
 ## 8. Checklist Before Closing TDD
 
-- [ ] Inventory (section 4) completed and recorded.
-- [ ] All success criteria (section 2) verified and documented.
-- [ ] CONTRIBUTING (or equivalent) updated to Bun-only.
-- [ ] CI runs on Bun; no npm in critical path.
-- [ ] Rollback plan (section 6) agreed and branch/tag available.
+- [x] Inventory (section 4) completed and recorded.
+- [x] All success criteria (section 2) verified and documented (this repo: no Node lockfile/scripts; deploy uses Bun only).
+- [x] CONTRIBUTING (or equivalent) updated to Bun-only.
+- [x] CI runs on Bun; no npm in critical path.
+- [x] Rollback plan (section 6) agreed and branch/tag available.
 
 ---
 
