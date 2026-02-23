@@ -19,6 +19,9 @@ jobs:
           toolchain: stable
           target: wasm32-unknown-unknown
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Install worker-build
         run: cargo install worker-build --locked
 
