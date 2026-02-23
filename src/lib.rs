@@ -177,10 +177,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         // ── Retrieval & Memory Federation (WS5) ───────────────
         .post_async("/v1/memory/index", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::UpsertMemoryItemRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            let expires_at = db::upsert_memory_item(&d1, &id, &body).await?;
+            let expires_at = db::upsert_memory_item(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&models::MemoryItemCreated {
                 id,
                 status: "indexed".into(),
@@ -188,24 +189,27 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             })
         })
         .post_async("/v1/memory/retrieve", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::RetrieveMemoryRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-            let response = db::retrieve_memory(&d1, &body).await?;
+            let response = db::retrieve_memory(&d1, &tenant_ctx.tenant_id, &body).await?;
             Response::from_json(&response)
         })
         .post_async("/v1/memory/context-pack", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::ContextPackRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-            let response = db::build_context_pack(&d1, &body).await?;
+            let response = db::build_context_pack(&d1, &tenant_ctx.tenant_id, &body).await?;
             Response::from_json(&response)
         })
-        .post_async("/v1/memory/:id/retire", |_req, ctx| async move {
+        .post_async("/v1/memory/:id/retire", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let id = match ctx.param("id") {
                 Some(k) => k.to_string(),
                 None => return Response::error("missing memory id", 400),
             };
             let d1 = ctx.env.d1("DB")?;
-            let retired = db::retire_memory_item(&d1, &id).await?;
+            let retired = db::retire_memory_item(&d1, &tenant_ctx.tenant_id, &id).await?;
             if retired {
                 Response::from_json(&models::RetireMemoryResponse {
                     id,
@@ -216,6 +220,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .post_async("/v1/memory/gc", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::MemoryGcRequest = {
                 let text = req.text().await?;
                 if text.trim().is_empty() {
@@ -228,18 +233,20 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
             };
             let d1 = ctx.env.d1("DB")?;
-            let response = db::run_memory_gc(&d1, &body).await?;
+            let response = db::run_memory_gc(&d1, &tenant_ctx.tenant_id, &body).await?;
             Response::from_json(&response)
         })
         .post_async("/v1/memory/retrieval-feedback", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::RetrievalFeedback = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-            db::record_retrieval_feedback(&d1, &body).await?;
+            db::record_retrieval_feedback(&d1, &tenant_ctx.tenant_id, &body).await?;
             Response::from_json(&models::RetrievalFeedbackAck { recorded: true })
         })
-        .get_async("/v1/memory/eval/summary", |_req, ctx| async move {
+        .get_async("/v1/memory/eval/summary", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
-            let summary = db::memory_eval_summary(&d1).await?;
+            let summary = db::memory_eval_summary(&d1, &tenant_ctx.tenant_id).await?;
             Response::from_json(&summary)
         })
         // ── Artifacts (R2-backed) ─────────────────────────────
@@ -632,10 +639,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         // ── Memory (WS5: #45) ─────────────────────────────────
         .post_async("/v1/memory", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::CreateMemory = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            db::create_memory(&d1, &id, &body).await?;
+            db::create_memory(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
             Response::from_json(&models::MemoryCreated {
                 id,
                 thread_id: body.thread_id,
@@ -644,13 +652,15 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             })
         })
         .get_async("/v1/memory/threads/:thread_id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let thread_id = match ctx.param("thread_id") {
                 Some(t) => t.to_string(),
                 None => return Response::error("missing thread_id", 400),
             };
             let limit = parse_limit_query(req.url().ok(), "limit").unwrap_or(100);
             let d1 = ctx.env.d1("DB")?;
-            let memories = db::list_memories_for_thread(&d1, &thread_id, limit).await?;
+            let memories =
+                db::list_memories_for_thread(&d1, &tenant_ctx.tenant_id, &thread_id, limit).await?;
             Response::from_json(&serde_json::json!({ "memories": memories }))
         })
         .get_async(
@@ -665,7 +675,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let d1 = ctx.env.d1("DB")?;
                 let checkpoint =
                     db::get_latest_checkpoint(&d1, &tenant_ctx.tenant_id, &thread_id).await?;
-                let memories = db::list_memories_for_thread(&d1, &thread_id, max_items).await?;
+                let memories =
+                    db::list_memories_for_thread(&d1, &tenant_ctx.tenant_id, &thread_id, max_items)
+                        .await?;
                 Response::from_json(&serde_json::json!({
                     "thread_id": thread_id,
                     "checkpoint": checkpoint.map(|r| r.into_checkpoint()),
