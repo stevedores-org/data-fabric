@@ -2337,22 +2337,31 @@ pub async fn insert_causality_from_event(db: &D1Database, evt: &models::GraphEve
             )
             .await?;
         }
-        // task → task dependencies
+        // task → task dependencies (batched to avoid N sequential D1 round trips)
         if let Some(depends_on) = payload.get("depends_on").and_then(|v| v.as_array()) {
             if let Some(tid) = task_id {
+                let now = now_iso();
+                let mut stmts = Vec::with_capacity(depends_on.len());
                 for dep in depends_on {
                     if let Some(dep_id) = dep.as_str() {
-                        insert_relationship(
-                            db,
-                            "dependency",
-                            "task",
-                            tid,
-                            "task",
-                            dep_id,
-                            Some("depends_on"),
+                        let stmt = db.prepare(
+                            "INSERT OR IGNORE INTO relationships (rel_type, from_kind, from_id, to_kind, to_id, relation, created_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                         )
-                        .await?;
+                        .bind(&[
+                            JsValue::from_str("dependency"),
+                            JsValue::from_str("task"),
+                            JsValue::from_str(tid),
+                            JsValue::from_str("task"),
+                            JsValue::from_str(dep_id),
+                            JsValue::from_str("depends_on"),
+                            JsValue::from_str(&now),
+                        ])?;
+                        stmts.push(stmt);
                     }
+                }
+                if !stmts.is_empty() {
+                    db.batch(stmts).await?;
                 }
             }
         }
@@ -2496,6 +2505,9 @@ impl TaskDependencyRow {
 
 // ── Replay Contract Stub (WS3: issue #58) ───────────────────────
 
+/// Replay plan cap: limit trace fetch to avoid loading unbounded events for large runs.
+const REPLAY_PLAN_MAX_EVENTS: u32 = 500;
+
 pub async fn build_replay_plan(
     db: &D1Database,
     tenant_id: &str,
@@ -2503,8 +2515,8 @@ pub async fn build_replay_plan(
     from_event_id: Option<&str>,
     to_event_id: Option<&str>,
 ) -> Result<Vec<models::ReplayStep>> {
-    // Fetch the full trace slice for this run
-    let events = get_trace_for_run(db, tenant_id, run_id, TRACE_DEFAULT_LIMIT).await?;
+    // Fetch a capped trace slice (not the full run) to bound memory usage on large runs
+    let events = get_trace_for_run(db, tenant_id, run_id, REPLAY_PLAN_MAX_EVENTS).await?;
 
     // Find the slice boundaries
     let start_idx = match from_event_id {

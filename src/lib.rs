@@ -690,16 +690,15 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if truncated {
                 events.truncate(limit as usize);
             }
-            let mut resp = Response::from_json(&models::TraceResponse {
-                run_id,
-                events,
-                total: None,
-                truncated: Some(truncated),
-            })?;
-            let dur = js_sys::Date::now() - started;
-            resp.headers_mut()
-                .set("Server-Timing", &format!("total;dur={:.1}", dur))?;
-            Ok(resp)
+            timed_json_response(
+                started,
+                &models::TraceResponse {
+                    run_id,
+                    events,
+                    total: None,
+                    truncated: Some(truncated),
+                },
+            )
         })
         .get_async("/v1/traces/:run_id/lineage", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
@@ -747,17 +746,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .min(100);
             let d1 = ctx.env.d1("DB")?;
             let edges = db::get_provenance_chain(&d1, &kind, &id, direction, hops).await?;
-            let mut resp = Response::from_json(&models::ProvenanceResponse {
-                entity_kind: kind,
-                entity_id: id,
-                direction: direction.into(),
-                hops,
-                edges,
-            })?;
-            let dur = js_sys::Date::now() - started;
-            resp.headers_mut()
-                .set("Server-Timing", &format!("total;dur={:.1}", dur))?;
-            Ok(resp)
+            timed_json_response(
+                started,
+                &models::ProvenanceResponse {
+                    entity_kind: kind,
+                    entity_id: id,
+                    direction: direction.into(),
+                    hops,
+                    edges,
+                },
+            )
         })
         // ── Gold Layer: Run Summaries (WS3) ─────────────────────
         .get_async("/v1/runs/:run_id/summary", |_req, ctx| async move {
@@ -775,11 +773,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .min(200);
             let d1 = ctx.env.d1("DB")?;
             let summaries = db::list_run_summaries(&d1, limit).await?;
-            let mut resp = Response::from_json(&serde_json::json!({ "summaries": summaries }))?;
-            let dur = js_sys::Date::now() - started;
-            resp.headers_mut()
-                .set("Server-Timing", &format!("total;dur={:.1}", dur))?;
-            Ok(resp)
+            timed_json_response(started, &serde_json::json!({ "summaries": summaries }))
         })
         // ── Gold Layer: Task Dependency Graph (WS3: #58) ────────
         .get_async("/v1/gold/runs/:run_id/task-graph", |req, ctx| async move {
@@ -788,12 +782,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let run_id = ctx.param("run_id").unwrap().to_string();
             let d1 = ctx.env.d1("DB")?;
             let edges = db::get_task_dependencies(&d1, &tenant_ctx.tenant_id, &run_id).await?;
-            let mut resp =
-                Response::from_json(&serde_json::json!({ "run_id": run_id, "edges": edges }))?;
-            let dur = js_sys::Date::now() - started;
-            resp.headers_mut()
-                .set("Server-Timing", &format!("total;dur={:.1}", dur))?;
-            Ok(resp)
+            timed_json_response(
+                started,
+                &serde_json::json!({ "run_id": run_id, "edges": edges }),
+            )
         })
         // ── Replay Contract Stub (WS3: #58) ─────────────────────
         .post_async("/v1/replay/plan", |mut req, ctx| async move {
@@ -809,15 +801,15 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 body.to_event_id.as_deref(),
             )
             .await?;
-            let mut resp = Response::from_json(&models::ReplayPlanResponse {
-                run_id: body.run_id,
-                steps,
-                status: "stub".into(),
-            })?;
-            let dur = js_sys::Date::now() - started;
-            resp.headers_mut()
-                .set("Server-Timing", &format!("total;dur={:.1}", dur))?;
-            Ok(resp)
+            // TODO: replace hardcoded "stub" status once replay execution is implemented
+            timed_json_response(
+                started,
+                &models::ReplayPlanResponse {
+                    run_id: body.run_id,
+                    steps,
+                    status: "stub".into(),
+                },
+            )
         })
         // ── Graph Events (M3) ─────────────────────────────────
         .post_async("/v1/graph-events", |mut req, ctx| async move {
@@ -862,14 +854,14 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
 
             let duration_ms = js_sys::Date::now() - started;
-            let mut resp = Response::from_json(&models::GraphEventAck {
-                accepted: count,
-                queued: true,
-                duration_ms: Some(duration_ms),
-            })?;
-            resp.headers_mut()
-                .set("Server-Timing", &format!("total;dur={:.1}", duration_ms))?;
-            Ok(resp)
+            timed_json_response(
+                started,
+                &models::GraphEventAck {
+                    accepted: count,
+                    queued: true,
+                    duration_ms: Some(duration_ms),
+                },
+            )
         })
         .run(req, env)
         .await
@@ -953,6 +945,15 @@ fn generate_id() -> Result<String> {
     getrandom::getrandom(&mut buf)
         .map_err(|err| Error::RustError(format!("failed to generate id: {err}")))?;
     Ok(hex::encode(buf))
+}
+
+/// Build a JSON response with a `Server-Timing` header recording the elapsed time since `started`.
+fn timed_json_response<T: Serialize>(started: f64, body: &T) -> Result<Response> {
+    let mut resp = Response::from_json(body)?;
+    let dur = js_sys::Date::now() - started;
+    resp.headers_mut()
+        .set("Server-Timing", &format!("total;dur={:.1}", dur))?;
+    Ok(resp)
 }
 
 /// Parse a numeric query param (e.g. limit, hops). Returns None if URL is None or param missing/invalid.
