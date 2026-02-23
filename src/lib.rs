@@ -680,8 +680,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
             };
-            let limit =
-                parse_limit_query(req.url().ok(), "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
+            let url = req.url().ok();
+            let has_limit = has_query_param(url.as_ref(), "limit");
+            let limit = parse_limit_query(url, "limit").unwrap_or(db::TRACE_DEFAULT_LIMIT);
             let d1 = ctx.env.d1("DB")?;
             // Fetch limit+1 to detect truncation without a separate COUNT query
             let mut events =
@@ -690,11 +691,19 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if truncated {
                 events.truncate(limit as usize);
             }
+            let total = if has_limit {
+                Some(
+                    db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?
+                        as usize,
+                )
+            } else {
+                None
+            };
             Response::from_json(&models::TraceResponse {
                 run_id,
                 events,
-                total: None,
-                truncated: Some(truncated),
+                total,
+                truncated: if has_limit { Some(truncated) } else { None },
             })
         })
         .get_async("/v1/traces/:run_id/lineage", |req, ctx| async move {
@@ -703,14 +712,29 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(r) => r.to_string(),
                 None => return Response::error("missing run_id", 400),
             };
-            let limit = parse_limit_query(req.url().ok(), "hops").unwrap_or(100);
+            let url = req.url().ok();
+            let has_hops = has_query_param(url.as_ref(), "hops");
+            let limit = parse_limit_query(url, "hops").unwrap_or(100);
             let d1 = ctx.env.d1("DB")?;
-            let events = db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit).await?;
+            let mut events =
+                db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
+            let truncated = events.len() > limit as usize;
+            if truncated {
+                events.truncate(limit as usize);
+            }
+            let total = if has_hops {
+                Some(
+                    db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?
+                        as usize,
+                )
+            } else {
+                None
+            };
             Response::from_json(&models::TraceResponse {
                 run_id,
                 events,
-                total: None,
-                truncated: None,
+                total,
+                truncated: if has_hops { Some(truncated) } else { None },
             })
         })
         // ── Provenance Chain (WS3) ──────────────────────────────
@@ -1066,4 +1090,9 @@ fn parse_limit_query(url: Option<worker::Url>, param: &str) -> Option<u32> {
     let url = url?;
     let value = url.query_pairs().find(|(k, _)| k == param)?.1;
     value.parse().ok().filter(|&n| n > 0 && n <= 10_000)
+}
+
+fn has_query_param(url: Option<&worker::Url>, param: &str) -> bool {
+    let Some(url) = url else { return false };
+    url.query_pairs().any(|(k, _)| k == param)
 }
