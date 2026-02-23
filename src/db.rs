@@ -1008,8 +1008,8 @@ pub async fn run_memory_gc(
     let mut stmts = Vec::with_capacity(rows.len());
     for row in &rows {
         let stmt = db
-            .prepare("DELETE FROM memory_index WHERE id = ?1")
-            .bind(&[JsValue::from_str(&row.id)])?;
+            .prepare("DELETE FROM memory_index WHERE tenant_id = ?1 AND id = ?2")
+            .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(&row.id)])?;
         stmts.push(stmt);
     }
     db.batch(stmts).await?;
@@ -1263,9 +1263,9 @@ pub async fn memory_eval_summary(
              FROM memory_retrieval_feedback
              WHERE tenant_id = ?1 AND latency_ms IS NOT NULL
              ORDER BY latency_ms
-             LIMIT 1 OFFSET (SELECT CAST((COUNT(*) * 0.50) AS INTEGER) FROM memory_retrieval_feedback WHERE tenant_id = ?1 AND latency_ms IS NOT NULL)",
+             LIMIT 1 OFFSET (SELECT CAST((COUNT(*) * 0.50) AS INTEGER) FROM memory_retrieval_feedback WHERE tenant_id = ?2 AND latency_ms IS NOT NULL)",
         )
-        .bind(&[JsValue::from_str(tenant_id)])?
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(tenant_id)])?
         .first(None)
         .await?;
     let p95: Option<PercentileRow> = db
@@ -1274,9 +1274,9 @@ pub async fn memory_eval_summary(
              FROM memory_retrieval_feedback
              WHERE tenant_id = ?1 AND latency_ms IS NOT NULL
              ORDER BY latency_ms
-             LIMIT 1 OFFSET (SELECT CAST((COUNT(*) * 0.95) AS INTEGER) FROM memory_retrieval_feedback WHERE tenant_id = ?1 AND latency_ms IS NOT NULL)",
+             LIMIT 1 OFFSET (SELECT CAST((COUNT(*) * 0.95) AS INTEGER) FROM memory_retrieval_feedback WHERE tenant_id = ?2 AND latency_ms IS NOT NULL)",
         )
-        .bind(&[JsValue::from_str(tenant_id)])?
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(tenant_id)])?
         .first(None)
         .await?;
 

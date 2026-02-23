@@ -8,3 +8,5 @@ ALTER TABLE memory ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS idx_memory_index_tenant ON memory_index(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_memory_queries_tenant ON memory_retrieval_queries(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_memory_feedback_tenant ON memory_retrieval_feedback(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_memory_tenant ON memory(tenant_id);
