@@ -1119,6 +1119,8 @@ fn timed_json_response<T: Serialize>(started: f64, body: &T) -> Result<Response>
     resp.headers_mut()
         .set("Server-Timing", &format!("total;dur={:.1}", dur))?;
     Ok(resp)
+}
+
 /// Shared helper: ingest a vec of GraphEvents into bronze + silver layers.
 /// Returns the number of events ingested.
 async fn ingest_events_bronze_silver(
