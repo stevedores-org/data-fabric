@@ -21,6 +21,7 @@ cargo test
 - `docs/ARCHITECTURE.md`
 - `docs/MISSION_PLAN.md`
 - `docs/CONTRIBUTING_WORKFLOW.md`
+- `docs/TDD-MIGRATION-NODE-NPM-TO-BUN-BUNX.md`
 - `docs/ws1/README.md`
 - `docs/WS5_RETRIEVAL_MEMORY.md`
 - `docs/WS4_POLICY_GOVERNANCE.md`
