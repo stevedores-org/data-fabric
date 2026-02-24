@@ -1,0 +1,27 @@
+{
+  "name": "data-fabric-mcp",
+  "version": "1.0.0",
+  "description": "Data Fabric MCP Server - AI-driven testing for data-fabric via Gemini CLI",
+  "type": "mcp",
+  "command": "node",
+  "args": ["data-fabric-mcp.js"],
+  "environment": {
+    "FABRIC_URL": "${FABRIC_URL:-http://localhost:8787}",
+    "TENANT_ID": "${TENANT_ID:-test-tenant}",
+    "TENANT_ROLE": "${TENANT_ROLE:-admin}"
+  },
+  "prompts": [
+    {
+      "name": "test-fabric-health",
+      "description": "Test data-fabric health and report status"
+    },
+    {
+      "name": "test-fabric-workflow",
+      "description": "Run a complete data-fabric workflow test (create run -> ingest event -> query)"
+    },
+    {
+      "name": "test-governance-integration",
+      "description": "Test governance rules with data-fabric"
+    }
+  ]
+}

@@ -1,0 +1,133 @@
+version: '3.9'
+
+services:
+  # ────────────────────────────────────────────────────────────────
+  # data-fabric worker (containerized development, OCI-standard)
+  # Supports: Docker, Podman, Buildah (any OCI-compliant engine)
+  # ────────────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Containerfile
+      args:
+        BUILDKIT_INLINE_CACHE: '1'
+    container_name: data-fabric-worker
+    ports:
+      - "8787:8787"
+    environment:
+      # Worker environment
+      APP_ENV: development
+      SERVICE_NAME: data-fabric
+      RUST_LOG: info
+      # Database (D1 SQLite via CloudFlare connector)
+      DATABASE_URL: sqlite:///data/data-fabric.db
+    volumes:
+      # Persist database across container restarts
+      - data-fabric-db:/data
+      # Mount source for live reload (Rust hot-reload)
+      - .:/workspace
+    depends_on:
+      - sqlite-init
+    command: >
+      sh -c "
+        echo 'Waiting for database initialization...' &&
+        sleep 2 &&
+        echo 'Starting data-fabric worker on :8787' &&
+        bunx wrangler dev --local --host 0.0.0.0 --port 8787
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8787/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - data-fabric
+
+  # ────────────────────────────────────────────────────────────────
+  # SQLite database initialization
+  # ────────────────────────────────────────────────────────────────
+  sqlite-init:
+    image: sqlite:3.45-bookworm
+    container_name: data-fabric-sqlite-init
+    volumes:
+      - data-fabric-db:/data
+      - ./migrations:/migrations:ro
+    command: >
+      sh -c "
+        set -e
+        DB_FILE=/data/data-fabric.db
+        if [ ! -f $$DB_FILE ]; then
+          echo '📦 Creating SQLite database...'
+          touch $$DB_FILE
+          sqlite3 $$DB_FILE < /migrations/0001_ws2_domain_model.sql
+          sqlite3 $$DB_FILE < /migrations/0002_orchestration.sql
+          sqlite3 $$DB_FILE < /migrations/0005_ws8_multi_tenant.sql
+          echo '✅ Database initialized with schema'
+        else
+          echo '✅ Database already exists'
+        fi
+      "
+    networks:
+      - data-fabric
+
+  # ────────────────────────────────────────────────────────────────
+  # Optional: PostgreSQL for advanced features (future)
+  # Uncomment to use PostgreSQL instead of SQLite
+  # ────────────────────────────────────────────────────────────────
+  # postgres:
+  #   image: postgres:16-bookworm
+  #   container_name: data-fabric-postgres
+  #   environment:
+  #     POSTGRES_DB: data_fabric
+  #     POSTGRES_USER: fabric
+  #     POSTGRES_PASSWORD: localdev
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - data-fabric-postgres:/var/lib/postgresql/data
+  #     - ./migrations:/docker-entrypoint-initdb.d:ro
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U fabric"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   networks:
+  #     - data-fabric
+
+  # ────────────────────────────────────────────────────────────────
+  # Redis for caching (optional, for KV simulation)
+  # ────────────────────────────────────────────────────────────────
+  # redis:
+  #   image: redis:7-bookworm
+  #   container_name: data-fabric-redis
+  #   ports:
+  #     - "6379:6379"
+  #   command: redis-server --appendonly yes
+  #   volumes:
+  #     - data-fabric-redis:/data
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   networks:
+  #     - data-fabric
+
+# ────────────────────────────────────────────────────────────────
+# Docker volumes
+# ────────────────────────────────────────────────────────────────
+volumes:
+  data-fabric-db:
+    driver: local
+  # data-fabric-postgres:
+  #   driver: local
+  # data-fabric-redis:
+  #   driver: local
+
+# ────────────────────────────────────────────────────────────────
+# Docker network
+# ────────────────────────────────────────────────────────────────
+networks:
+  data-fabric:
+    driver: bridge

@@ -1,0 +1,35 @@
+{
+  "name": "@data-fabric/mcp-server",
+  "version": "1.0.0",
+  "description": "Data Fabric MCP Server for Gemini CLI and AI agents",
+  "type": "module",
+  "main": "data-fabric-mcp.js",
+  "bin": {
+    "data-fabric-mcp": "data-fabric-mcp.js"
+  },
+  "scripts": {
+    "start": "node data-fabric-mcp.js",
+    "test": "echo 'Tests would go here'",
+    "dev": "FABRIC_URL=http://localhost:8787 node data-fabric-mcp.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "data-fabric",
+    "gemini-cli",
+    "ai-agent",
+    "testing"
+  ],
+  "author": "Stevedores Org",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^0.10.0",
+    "node-fetch": "^3.3.0"
+  },
+  "devDependencies": {
+    "prettier": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
