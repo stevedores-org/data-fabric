@@ -7,7 +7,7 @@ set -euo pipefail
 
 # Configuration
 REMOTE_USER="${REMOTE_USER:-aivcs}"
-REMOTE_HOST="${REMOTE_HOST:-studio}"
+REMOTE_HOST="${REMOTE_HOST:-aivcs.local}"
 TMUX_SESSION="${TMUX_SESSION:-onion}"
 REMOTE_WORK_DIR="${REMOTE_WORK_DIR:-/tmp/data-fabric}"
 LOCAL_REPO="${LOCAL_REPO:-.}"

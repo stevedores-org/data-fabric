@@ -1,4 +1,4 @@
-# Data Fabric — Remote Deployment (Studio Machine)
+# Data Fabric — Remote Deployment (aivcs.local)
 
 Deploy and run data-fabric on a remote machine via autossh + tmux.
 
@@ -9,7 +9,7 @@ Deploy and run data-fabric on a remote machine via autossh + tmux.
 ```bash
 cd /path/to/data-fabric
 
-# Deploy to studio machine
+# Deploy to aivcs.local
 bash deploy-remote.sh
 ```
 
@@ -23,7 +23,7 @@ This will:
 #### Step 1: Copy Repository
 
 ```bash
-rsync -avz --delete ./ aivcs@studio:/tmp/data-fabric/ \
+rsync -avz --delete ./ aivcs@aivcs.local:/tmp/data-fabric/ \
   --exclude=.git \
   --exclude=.wrangler \
   --exclude=build \
@@ -33,7 +33,7 @@ rsync -avz --delete ./ aivcs@studio:/tmp/data-fabric/ \
 #### Step 2: Connect via autossh
 
 ```bash
-autossh -M 0 -t aivcs@studio "/opt/homebrew/bin/tmux new-session -A -s onion"
+autossh -M 0 -t aivcs@aivcs.local "/opt/homebrew/bin/tmux new-session -A -s onion"
 ```
 
 #### Step 3: Start data-fabric in the session
@@ -51,13 +51,13 @@ bunx wrangler dev --local
 
 ```bash
 # List sessions
-ssh aivcs@studio "tmux list-sessions"
+ssh aivcs@aivcs.local "tmux list-sessions"
 
 # View logs in session
-ssh aivcs@studio "tmux capture-pane -t onion -p"
+ssh aivcs@aivcs.local "tmux capture-pane -t onion -p"
 
 # Attach to session
-autossh -M 0 -t aivcs@studio "/opt/homebrew/bin/tmux attach-session -t onion"
+autossh -M 0 -t aivcs@aivcs.local "/opt/homebrew/bin/tmux attach-session -t onion"
 ```
 
 ### Stop/Restart
@@ -67,16 +67,16 @@ autossh -M 0 -t aivcs@studio "/opt/homebrew/bin/tmux attach-session -t onion"
 Ctrl+C
 
 # Or remotely
-ssh aivcs@studio "tmux send-keys -t onion C-c"
+ssh aivcs@aivcs.local "tmux send-keys -t onion C-c"
 
 # Restart
-ssh aivcs@studio "tmux send-keys -t onion 'bunx wrangler dev --local' Enter"
+ssh aivcs@aivcs.local "tmux send-keys -t onion 'bunx wrangler dev --local' Enter"
 ```
 
 ### Kill Session
 
 ```bash
-ssh aivcs@studio "tmux kill-session -t onion"
+ssh aivcs@aivcs.local "tmux kill-session -t onion"
 ```
 
 ## Testing Remote Instance
@@ -90,7 +90,7 @@ Once running, test from your local machine:
 curl http://localhost:8787/health
 
 # Or SSH tunnel to it
-ssh -L 8787:localhost:8787 aivcs@studio
+ssh -L 8787:localhost:8787 aivcs@aivcs.local
 
 # Then in another terminal
 curl http://localhost:8787/health
@@ -112,7 +112,7 @@ gemini
 
 ```bash
 # Keep a tunnel open in background
-autossh -M 20000 -N -L 8787:localhost:8787 aivcs@studio
+autossh -M 20000 -N -L 8787:localhost:8787 aivcs@aivcs.local
 
 # Then access from your machine
 curl http://localhost:8787/health
@@ -174,13 +174,13 @@ tmux kill-session -t onion
 
 ```bash
 # Check if session is running
-ssh aivcs@studio "tmux list-sessions"
+ssh aivcs@aivcs.local "tmux list-sessions"
 
 # Check if port is being used
-ssh aivcs@studio "lsof -i :8787"
+ssh aivcs@aivcs.local "lsof -i :8787"
 
 # Check logs
-ssh aivcs@studio "tmux capture-pane -t onion -p | tail -50"
+ssh aivcs@aivcs.local "tmux capture-pane -t onion -p | tail -50"
 ```
 
 ### "autossh connection lost"
@@ -188,10 +188,10 @@ ssh aivcs@studio "tmux capture-pane -t onion -p | tail -50"
 ```bash
 # autossh will automatically reconnect
 # But check your SSH config
-ssh -v aivcs@studio "echo OK"
+ssh -v aivcs@aivcs.local "echo OK"
 
 # Verify keys are working
-ssh -i ~/.ssh/id_rsa aivcs@studio "echo OK"
+ssh -i ~/.ssh/id_rsa aivcs@aivcs.local "echo OK"
 ```
 
 ### "Rust not found"
@@ -237,7 +237,7 @@ FABRIC_URL=http://studio.local:8787 cargo test --test integration_with_fabric
 
 ```bash
 # Keep watching logs
-watch -n 2 'ssh aivcs@studio "tmux capture-pane -t onion -p | tail -20"'
+watch -n 2 'ssh aivcs@aivcs.local "tmux capture-pane -t onion -p | tail -20"'
 ```
 
 ### Health Check Loop
