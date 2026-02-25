@@ -10,10 +10,10 @@ pattern = "data-fabric.stevedores.org/*"
 zone_name = "stevedores.org"
 
 [build]
-command = "cargo install worker-build && worker-build --release"
+command = "bash scripts/build-worker.sh"
 
-# deploy: npx wrangler deploy
-# dev:    npx wrangler dev
+# deploy: bun run deploy
+# dev:    bun run dev
 
 [vars]
 APP_ENV = "dev"
@@ -42,10 +42,10 @@ preview_id = "placeholder-provision-with-wrangler-kv-namespace-create"
 
 # ── Queues: provenance event bus, enrichment consumer ─────────────
 # Create queue: wrangler queues create data-fabric-events
-# [[queues.producers]]
-# binding = "EVENTS"
-# queue = "data-fabric-events"
-#
+[[queues.producers]]
+binding = "EVENTS"
+queue = "data-fabric-events"
+
 [[queues.consumers]]
 queue = "data-fabric-events"
 max_batch_size = 50

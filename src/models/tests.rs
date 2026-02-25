@@ -540,10 +540,23 @@ fn graph_event_ack_serializes() {
     let ack = GraphEventAck {
         accepted: 5,
         queued: true,
+        duration_ms: Some(12.5),
     };
     let json = serde_json::to_value(&ack).unwrap();
     assert_eq!(json["accepted"], 5);
     assert_eq!(json["queued"], true);
+    assert_eq!(json["duration_ms"], 12.5);
+}
+
+#[test]
+fn graph_event_ack_omits_none_duration() {
+    let ack = GraphEventAck {
+        accepted: 1,
+        queued: false,
+        duration_ms: None,
+    };
+    let json = serde_json::to_value(&ack).unwrap();
+    assert!(json.get("duration_ms").is_none());
 }
 
 #[test]
@@ -709,6 +722,20 @@ fn memory_created_serializes() {
     assert_eq!(json["key"], "summary");
 }
 
+#[test]
+fn trace_response_serializes_with_metadata() {
+    let resp = TraceResponse {
+        run_id: "r1".into(),
+        events: vec![],
+        total: Some(150),
+        truncated: Some(true),
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["run_id"], "r1");
+    assert_eq!(json["total"], 150);
+    assert_eq!(json["truncated"], true);
+}
+
 // ── WS5: Retrieval & Memory ────────────────────────────────────
 
 #[test]
@@ -761,4 +788,115 @@ fn retrieval_feedback_round_trip() {
     assert!(parsed.success);
     assert!(parsed.cache_hit);
     assert_eq!(parsed.latency_ms, Some(120));
+}
+
+// ── WS3: Gold Layer & Queue (issue #58) ────────────────────────
+
+#[test]
+fn queue_envelope_round_trip() {
+    let envelope = QueueEnvelope {
+        tenant_id: "tenant-1".into(),
+        event: GraphEvent {
+            run_id: Some("r1".into()),
+            thread_id: Some("t1".into()),
+            event_type: "node.start".into(),
+            node_id: Some("n1".into()),
+            actor: Some("agent-1".into()),
+            payload: Some(serde_json::json!({"plan_id": "p1"})),
+        },
+    };
+    let json = serde_json::to_string(&envelope).unwrap();
+    let parsed: QueueEnvelope = serde_json::from_str(&json).unwrap();
+    assert_eq!(envelope, parsed);
+    assert_eq!(parsed.tenant_id, "tenant-1");
+    assert_eq!(parsed.event.event_type, "node.start");
+}
+
+#[test]
+fn task_dependency_edge_round_trip() {
+    let edge = TaskDependencyEdge {
+        run_id: "r1".into(),
+        task_id: "t2".into(),
+        depends_on_task_id: "t1".into(),
+        created_at: Some("2026-02-22T12:00:00Z".into()),
+    };
+    let json = serde_json::to_string(&edge).unwrap();
+    let parsed: TaskDependencyEdge = serde_json::from_str(&json).unwrap();
+    assert_eq!(edge, parsed);
+}
+
+#[test]
+fn task_dependency_edge_omits_none_created_at() {
+    let edge = TaskDependencyEdge {
+        run_id: "r1".into(),
+        task_id: "t2".into(),
+        depends_on_task_id: "t1".into(),
+        created_at: None,
+    };
+    let json = serde_json::to_value(&edge).unwrap();
+    assert!(json.get("created_at").is_none());
+}
+
+#[test]
+fn replay_plan_request_round_trip() {
+    let req = ReplayPlanRequest {
+        run_id: "r1".into(),
+        from_event_id: Some("ev5".into()),
+        to_event_id: None,
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    let parsed: ReplayPlanRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(req, parsed);
+    // Ensure None fields are omitted
+    let val = serde_json::to_value(&req).unwrap();
+    assert!(val.get("to_event_id").is_none());
+}
+
+#[test]
+fn replay_plan_request_minimal() {
+    let input = r#"{"run_id":"r1"}"#;
+    let parsed: ReplayPlanRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.run_id, "r1");
+    assert!(parsed.from_event_id.is_none());
+    assert!(parsed.to_event_id.is_none());
+}
+
+#[test]
+fn replay_step_round_trip() {
+    let step = ReplayStep {
+        sequence: 1,
+        event_type: "node.start".into(),
+        node_id: Some("n1".into()),
+        actor: Some("agent-1".into()),
+    };
+    let json = serde_json::to_string(&step).unwrap();
+    let parsed: ReplayStep = serde_json::from_str(&json).unwrap();
+    assert_eq!(step, parsed);
+}
+
+#[test]
+fn replay_plan_response_round_trip() {
+    let resp = ReplayPlanResponse {
+        run_id: "r1".into(),
+        steps: vec![
+            ReplayStep {
+                sequence: 1,
+                event_type: "run.start".into(),
+                node_id: None,
+                actor: Some("ci-bot".into()),
+            },
+            ReplayStep {
+                sequence: 2,
+                event_type: "node.start".into(),
+                node_id: Some("n1".into()),
+                actor: None,
+            },
+        ],
+        status: "stub".into(),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: ReplayPlanResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+    assert_eq!(parsed.steps.len(), 2);
+    assert_eq!(parsed.status, "stub");
 }

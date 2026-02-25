@@ -104,7 +104,7 @@ pub struct CheckpointCreated {
 
 // ── Graph Events (M3: event pipeline) ───────────────────────────
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphEvent {
     pub run_id: Option<String>,
     pub thread_id: Option<String>,
@@ -123,6 +123,60 @@ pub struct GraphEventBatch {
 pub struct GraphEventAck {
     pub accepted: usize,
     pub queued: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<f64>,
+}
+
+// ── Queue Envelope (WS3: issue #58) ─────────────────────────────
+
+/// Envelope wrapping a GraphEvent with tenant context for queue transport.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct QueueEnvelope {
+    pub tenant_id: String,
+    pub event: GraphEvent,
+}
+
+// ── Gold Layer: Task Dependencies (WS3: issue #58) ──────────────
+
+/// Edge in the task dependency graph (gold layer).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct TaskDependencyEdge {
+    pub run_id: String,
+    pub task_id: String,
+    pub depends_on_task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+}
+
+// ── Replay Contract Stub (WS3: issue #58) ───────────────────────
+
+/// Request to build a replay plan for a run.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReplayPlanRequest {
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_event_id: Option<String>,
+}
+
+/// A single step in a replay plan.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReplayStep {
+    pub sequence: usize,
+    pub event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+}
+
+/// Response containing the replay plan.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReplayPlanResponse {
+    pub run_id: String,
+    pub steps: Vec<ReplayStep>,
+    pub status: String,
 }
 
 // ── Common ─────────────────────────────────────────────────────
@@ -149,6 +203,7 @@ pub struct TraceEvent {
 }
 
 /// Trace slice for a run: ordered events for debugging and replay.
+/// When `?limit=` or `?hops=` is used, `total` and `truncated` indicate there may be more events (issue #61).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct TraceResponse {
     pub run_id: String,

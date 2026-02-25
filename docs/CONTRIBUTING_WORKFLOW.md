@@ -1,5 +1,7 @@
 # Contributing Workflow
 
+**Tooling:** This repo uses [Bun](https://bun.sh) for any JS/TS tooling (e.g. `bunx wrangler`). Use Bun only; no Node/npm required. See `.bun-version` for the pinned version.
+
 ## Default Workflow (PR-First)
 
 1. Sync often:

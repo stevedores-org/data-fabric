@@ -16,11 +16,14 @@ cargo test
 # worker-build --release
 # bunx wrangler deploy
 ```
+**Tooling:** We use [Bun](https://bun.sh) for JS/TS tooling (e.g. `bunx wrangler`). No Node/npm required; install Bun and use `bunx` for one-off commands.
 
 ## Docs
 - `docs/ARCHITECTURE.md`
 - `docs/MISSION_PLAN.md`
 - `docs/CONTRIBUTING_WORKFLOW.md`
+- `docs/TDD-MIGRATION-NODE-NPM-TO-BUN-BUNX.md`
+- `docs/TDD-BUN-BUNX-EXECUTION-PLAN.md`
 - `docs/ws1/README.md`
 - `docs/WS5_RETRIEVAL_MEMORY.md`
 - `docs/WS4_POLICY_GOVERNANCE.md`
