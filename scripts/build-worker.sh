@@ -18,5 +18,5 @@ if ! rustc --print target-libdir --target wasm32-unknown-unknown >/dev/null 2>&1
 	fi
 fi
 
-cargo install worker-build --locked --root "$TOOLS_DIR"
+cargo install worker-build --locked --force --root "$TOOLS_DIR"
 "$TOOLS_DIR/bin/worker-build" --release
