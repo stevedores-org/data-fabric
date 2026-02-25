@@ -2905,11 +2905,7 @@ pub async fn update_integration(
     Ok(true)
 }
 
-pub async fn delete_integration(
-    db: &D1Database,
-    tenant_id: &str,
-    id: &str,
-) -> Result<()> {
+pub async fn delete_integration(db: &D1Database, tenant_id: &str, id: &str) -> Result<()> {
     db.prepare("DELETE FROM integrations WHERE tenant_id = ?1 AND id = ?2")
         .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
         .run()

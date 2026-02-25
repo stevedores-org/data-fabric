@@ -908,14 +908,21 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let now = db::now_iso();
 
                 let owned_events = integrations::oxidizedgraph::adapt_to_graph_events(&batch);
-                let event_count = match
-                    ingest_events_bronze_silver(&d1, &tenant_ctx.tenant_id, owned_events, &now)
-                        .await
+                let event_count = match ingest_events_bronze_silver(
+                    &d1,
+                    &tenant_ctx.tenant_id,
+                    owned_events,
+                    &now,
+                )
+                .await
                 {
                     Ok(c) => c,
                     Err(e) => {
                         worker::console_log!("ERROR: oxidizedgraph event ingest failed: {e:?}");
-                        return degraded_response("oxidizedgraph", "event ingestion temporarily unavailable");
+                        return degraded_response(
+                            "oxidizedgraph",
+                            "event ingestion temporarily unavailable",
+                        );
                     }
                 };
 
@@ -971,7 +978,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let fabric_evt = integrations::aivcs::adapt_to_event(&evt);
             let evt_id = generate_id()?;
-            if let Err(e) = db::ingest_event(&d1, &tenant_ctx.tenant_id, &evt_id, &fabric_evt).await {
+            if let Err(e) = db::ingest_event(&d1, &tenant_ctx.tenant_id, &evt_id, &fabric_evt).await
+            {
                 worker::console_log!("ERROR: aivcs ingest_event failed: {e:?}");
                 return degraded_response("aivcs", "event ingestion temporarily unavailable");
             }
@@ -980,10 +988,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let mut artifact_count = 0usize;
             if let Some(ref artifacts) = evt.artifacts {
                 for art in artifacts {
-                    let r2_key = format!(
-                        "{}/artifacts/{}",
-                        tenant_ctx.tenant_id, art.key
-                    );
+                    let r2_key = format!("{}/artifacts/{}", tenant_ctx.tenant_id, art.key);
                     let meta = serde_json::to_vec(&serde_json::json!({
                         "pipeline_id": evt.pipeline_id,
                         "key": art.key,
@@ -1077,7 +1082,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let d1 = ctx.env.d1("DB")?;
 
                 let pack_req = integrations::llama_rs::adapt_to_context_pack(&body);
-                let response = db::build_context_pack(&d1, &tenant_ctx.tenant_id, &pack_req).await?;
+                let response =
+                    db::build_context_pack(&d1, &tenant_ctx.tenant_id, &pack_req).await?;
 
                 if let Err(e) =
                     db::touch_integration(&d1, &tenant_ctx.tenant_id, "llama_rs", None).await
