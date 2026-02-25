@@ -1294,4 +1294,21 @@ mod tests {
             (None, Some(true)),
         );
     }
+
+    // ── is_public_path ─────────────────────────────────────────
+
+    #[test]
+    fn is_public_path_root_and_health() {
+        assert!(super::is_public_path("/"));
+        assert!(super::is_public_path("/health"));
+    }
+
+    #[test]
+    fn is_public_path_rejects_other_paths() {
+        assert!(!super::is_public_path("/v1/artifacts"));
+        assert!(!super::is_public_path("/v1/tenants/provision"));
+        assert!(!super::is_public_path("/healthcheck"));
+        assert!(!super::is_public_path("/health/"));
+        assert!(!super::is_public_path(""));
+    }
 }
