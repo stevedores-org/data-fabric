@@ -554,7 +554,14 @@ mod tests {
 
     #[test]
     fn risk_critical_keywords() {
-        for keyword in ["wipe", "destroy", "terminate", "root-key", "irreversible", "hard-delete"] {
+        for keyword in [
+            "wipe",
+            "destroy",
+            "terminate",
+            "root-key",
+            "irreversible",
+            "hard-delete",
+        ] {
             assert_eq!(
                 classify_risk(keyword, None, None),
                 RiskLevel::Critical,
@@ -566,8 +573,16 @@ mod tests {
     #[test]
     fn risk_high_keywords() {
         for keyword in [
-            "deploy", "delete", "drop", "credential", "secret", "production", "prod", "revoke",
-            "merge-main", "push-main",
+            "deploy",
+            "delete",
+            "drop",
+            "credential",
+            "secret",
+            "production",
+            "prod",
+            "revoke",
+            "merge-main",
+            "push-main",
         ] {
             assert_eq!(
                 classify_risk(keyword, None, None),
@@ -579,7 +594,9 @@ mod tests {
 
     #[test]
     fn risk_medium_keywords() {
-        for keyword in ["create", "update", "write", "put", "patch", "commit", "index"] {
+        for keyword in [
+            "create", "update", "write", "put", "patch", "commit", "index",
+        ] {
             assert_eq!(
                 classify_risk(keyword, None, None),
                 RiskLevel::Medium,
@@ -603,17 +620,17 @@ mod tests {
 
     #[test]
     fn risk_unknown_action_defaults_to_medium() {
-        assert_eq!(
-            classify_risk("frobnicate", None, None),
-            RiskLevel::Medium
-        );
+        assert_eq!(classify_risk("frobnicate", None, None), RiskLevel::Medium);
     }
 
     #[test]
     fn risk_is_case_insensitive() {
         assert_eq!(classify_risk("DEPLOY", None, None), RiskLevel::High);
         assert_eq!(classify_risk("Read", None, None), RiskLevel::Low);
-        assert_eq!(classify_risk("HARD-DELETE", None, None), RiskLevel::Critical);
+        assert_eq!(
+            classify_risk("HARD-DELETE", None, None),
+            RiskLevel::Critical
+        );
     }
 
     #[test]
@@ -627,10 +644,7 @@ mod tests {
     #[test]
     fn risk_picks_up_keywords_from_context() {
         let ctx = serde_json::json!({"env": "production"});
-        assert_eq!(
-            classify_risk("run-job", None, Some(&ctx)),
-            RiskLevel::High,
-        );
+        assert_eq!(classify_risk("run-job", None, Some(&ctx)), RiskLevel::High,);
     }
 
     #[test]
@@ -655,21 +669,39 @@ mod tests {
 
     #[test]
     fn action_class_deploy() {
-        assert_eq!(classify_action_class("deploy-prod", RiskLevel::High), "deploy");
+        assert_eq!(
+            classify_action_class("deploy-prod", RiskLevel::High),
+            "deploy"
+        );
     }
 
     #[test]
     fn action_class_delete() {
-        assert_eq!(classify_action_class("delete-user", RiskLevel::High), "delete");
-        assert_eq!(classify_action_class("drop-table", RiskLevel::High), "delete");
+        assert_eq!(
+            classify_action_class("delete-user", RiskLevel::High),
+            "delete"
+        );
+        assert_eq!(
+            classify_action_class("drop-table", RiskLevel::High),
+            "delete"
+        );
     }
 
     #[test]
     fn action_class_falls_back_to_risk() {
         assert_eq!(classify_action_class("frobnicate", RiskLevel::Low), "read");
-        assert_eq!(classify_action_class("frobnicate", RiskLevel::Medium), "write");
-        assert_eq!(classify_action_class("frobnicate", RiskLevel::High), "high_risk");
-        assert_eq!(classify_action_class("frobnicate", RiskLevel::Critical), "critical");
+        assert_eq!(
+            classify_action_class("frobnicate", RiskLevel::Medium),
+            "write"
+        );
+        assert_eq!(
+            classify_action_class("frobnicate", RiskLevel::High),
+            "high_risk"
+        );
+        assert_eq!(
+            classify_action_class("frobnicate", RiskLevel::Critical),
+            "critical"
+        );
     }
 
     // ── default_rate_limit_for ─────────────────────────────────
@@ -689,9 +721,18 @@ mod tests {
     #[test]
     fn default_rate_limit_action_classes() {
         assert_eq!(default_rate_limit_for(RiskLevel::Low).action_class, "read");
-        assert_eq!(default_rate_limit_for(RiskLevel::Medium).action_class, "write");
-        assert_eq!(default_rate_limit_for(RiskLevel::High).action_class, "high_risk");
-        assert_eq!(default_rate_limit_for(RiskLevel::Critical).action_class, "critical");
+        assert_eq!(
+            default_rate_limit_for(RiskLevel::Medium).action_class,
+            "write"
+        );
+        assert_eq!(
+            default_rate_limit_for(RiskLevel::High).action_class,
+            "high_risk"
+        );
+        assert_eq!(
+            default_rate_limit_for(RiskLevel::Critical).action_class,
+            "critical"
+        );
     }
 
     // ── wildcard_match ─────────────────────────────────────────
@@ -754,7 +795,11 @@ mod tests {
 
     // ── first_matching_rule ────────────────────────────────────
 
-    fn make_request(action: &str, actor: &str, resource: Option<&str>) -> models::PolicyCheckRequest {
+    fn make_request(
+        action: &str,
+        actor: &str,
+        resource: Option<&str>,
+    ) -> models::PolicyCheckRequest {
         models::PolicyCheckRequest {
             action: action.to_string(),
             actor: actor.to_string(),
@@ -822,7 +867,9 @@ mod tests {
         ];
         let req = make_request("anything", "anyone", None);
         assert_eq!(
-            first_matching_rule(&rules, &req, RiskLevel::Medium).unwrap().id,
+            first_matching_rule(&rules, &req, RiskLevel::Medium)
+                .unwrap()
+                .id,
             "first"
         );
     }
@@ -880,15 +927,9 @@ mod tests {
     #[test]
     fn risk_substring_collisions() {
         // "readiness-check" contains "read" → Low (substring match is by design)
-        assert_eq!(
-            classify_risk("readiness-check", None, None),
-            RiskLevel::Low,
-        );
+        assert_eq!(classify_risk("readiness-check", None, None), RiskLevel::Low,);
         // "undelete" contains "delete" → High
-        assert_eq!(
-            classify_risk("undelete", None, None),
-            RiskLevel::High,
-        );
+        assert_eq!(classify_risk("undelete", None, None), RiskLevel::High,);
         // "production-index" contains "production" (High) and "index" (Medium) → High wins
         assert_eq!(
             classify_risk("production-index", None, None),
@@ -916,7 +957,12 @@ mod tests {
 
     #[test]
     fn risk_level_serde_roundtrip() {
-        for level in [RiskLevel::Low, RiskLevel::Medium, RiskLevel::High, RiskLevel::Critical] {
+        for level in [
+            RiskLevel::Low,
+            RiskLevel::Medium,
+            RiskLevel::High,
+            RiskLevel::Critical,
+        ] {
             let json = serde_json::to_string(&level).unwrap();
             let back: RiskLevel = serde_json::from_str(&json).unwrap();
             assert_eq!(back, level);
@@ -926,7 +972,10 @@ mod tests {
     #[test]
     fn risk_level_serde_snake_case() {
         assert_eq!(serde_json::to_string(&RiskLevel::Low).unwrap(), "\"low\"");
-        assert_eq!(serde_json::to_string(&RiskLevel::Critical).unwrap(), "\"critical\"");
+        assert_eq!(
+            serde_json::to_string(&RiskLevel::Critical).unwrap(),
+            "\"critical\""
+        );
     }
 
     #[test]

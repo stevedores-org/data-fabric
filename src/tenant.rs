@@ -144,46 +144,86 @@ mod tests {
 
     #[test]
     fn admin_can_access_tenant_provisioning() {
-        assert!(authorize(&ctx(TenantRole::Admin), Method::Post, "/v1/tenants/provision").is_ok());
+        assert!(authorize(
+            &ctx(TenantRole::Admin),
+            Method::Post,
+            "/v1/tenants/provision"
+        )
+        .is_ok());
     }
 
     #[test]
     fn viewer_cannot_access_tenant_provisioning() {
-        assert!(authorize(&ctx(TenantRole::Viewer), Method::Post, "/v1/tenants/provision").is_err());
+        assert!(authorize(
+            &ctx(TenantRole::Viewer),
+            Method::Post,
+            "/v1/tenants/provision"
+        )
+        .is_err());
     }
 
     #[test]
     fn viewer_cannot_get_admin_only_paths() {
         // Admin-only paths deny all non-admin roles regardless of HTTP method
         assert!(authorize(&ctx(TenantRole::Viewer), Method::Get, "/v1/tenants/list").is_err());
-        assert!(authorize(&ctx(TenantRole::Viewer), Method::Get, "/v1/policies/activate/v1").is_err());
+        assert!(authorize(
+            &ctx(TenantRole::Viewer),
+            Method::Get,
+            "/v1/policies/activate/v1"
+        )
+        .is_err());
     }
 
     #[test]
     fn builder_cannot_get_admin_only_paths() {
         assert!(authorize(&ctx(TenantRole::Builder), Method::Get, "/v1/tenants/list").is_err());
-        assert!(authorize(&ctx(TenantRole::Builder), Method::Get, "/v1/policies/activate/v1").is_err());
+        assert!(authorize(
+            &ctx(TenantRole::Builder),
+            Method::Get,
+            "/v1/policies/activate/v1"
+        )
+        .is_err());
     }
 
     #[test]
     fn admin_can_get_admin_only_paths() {
         assert!(authorize(&ctx(TenantRole::Admin), Method::Get, "/v1/tenants/list").is_ok());
-        assert!(authorize(&ctx(TenantRole::Admin), Method::Get, "/v1/policies/activate/v1").is_ok());
+        assert!(authorize(
+            &ctx(TenantRole::Admin),
+            Method::Get,
+            "/v1/policies/activate/v1"
+        )
+        .is_ok());
     }
 
     #[test]
     fn builder_cannot_access_tenant_provisioning() {
-        assert!(authorize(&ctx(TenantRole::Builder), Method::Post, "/v1/tenants/provision").is_err());
+        assert!(authorize(
+            &ctx(TenantRole::Builder),
+            Method::Post,
+            "/v1/tenants/provision"
+        )
+        .is_err());
     }
 
     #[test]
     fn admin_can_activate_policy() {
-        assert!(authorize(&ctx(TenantRole::Admin), Method::Post, "/v1/policies/activate/v1").is_ok());
+        assert!(authorize(
+            &ctx(TenantRole::Admin),
+            Method::Post,
+            "/v1/policies/activate/v1"
+        )
+        .is_ok());
     }
 
     #[test]
     fn viewer_cannot_activate_policy() {
-        assert!(authorize(&ctx(TenantRole::Viewer), Method::Post, "/v1/policies/activate/v1").is_err());
+        assert!(authorize(
+            &ctx(TenantRole::Viewer),
+            Method::Post,
+            "/v1/policies/activate/v1"
+        )
+        .is_err());
     }
 
     // ── authorize: policy rules paths ──────────────────────────
@@ -195,7 +235,12 @@ mod tests {
 
     #[test]
     fn builder_cannot_write_policy_rules() {
-        assert!(authorize(&ctx(TenantRole::Builder), Method::Post, "/v1/policies/rules").is_err());
+        assert!(authorize(
+            &ctx(TenantRole::Builder),
+            Method::Post,
+            "/v1/policies/rules"
+        )
+        .is_err());
     }
 
     #[test]
