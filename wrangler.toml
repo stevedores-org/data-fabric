@@ -9,11 +9,15 @@ workers_dev = true
 pattern = "data-fabric.stevedores.org/*"
 zone_name = "stevedores.org"
 
+# NOTE: Cloudflare Workers Builds (GitHub integration) does NOT honor this
+# [build] section. The build command must be set in the CF dashboard:
+#   Settings > Build > Build command: bash scripts/build-worker.sh
+#   Settings > Build > Deploy command: bunx wrangler@3 deploy
 [build]
 command = "bash scripts/build-worker.sh"
 
-# deploy: bun run deploy
-# dev:    bun run dev
+# deploy: bunx wrangler@3 deploy
+# dev:    bunx wrangler@3 dev
 
 [vars]
 APP_ENV = "dev"
@@ -25,7 +29,7 @@ SERVICE_NAME = "data-fabric"
 [[d1_databases]]
 binding = "DB"
 database_name = "data-fabric"
-database_id = "placeholder-provision-with-wrangler-d1-create"
+database_id = "6afcdc53-3d1c-4e99-941c-76b5d1a6fda2"
 migrations_dir = "migrations"
 
 # ── R2: artifact / blob store ────────────────────────────────────
@@ -35,21 +39,20 @@ binding = "ARTIFACTS"
 bucket_name = "data-fabric-artifacts"
 
 # ── KV: policies, config, fast context lookups ───────────────────
-# Create namespace: wrangler kv namespace create "POLICY_KV"
-# Then set id (and preview_id) below and redeploy.
-# [[kv_namespaces]]
-# binding = "POLICY_KV"
-# id = "<your-kv-namespace-id>"
-# preview_id = "<your-kv-preview-id>"
+[[kv_namespaces]]
+binding = "POLICY_KV"
+id = "33e3087e865c4230b8673ac86dc2dc7d"
+preview_id = "45b7cf03cd984f0aaa5a6da2f7a30721"
 
 # ── Queues: provenance event bus, enrichment consumer ─────────────
-# Create queue: wrangler queues create data-fabric-events
-# Then uncomment the consumer block below and redeploy.
-# [[queues.producers]]
-# binding = "EVENTS"
-# queue = "data-fabric-events"
-#
-# [[queues.consumers]]
-# queue = "data-fabric-events"
-# max_batch_size = 50
-# max_batch_timeout = 5
+# Provision queue: bunx wrangler@3 queues create data-fabric-events
+# Producer is best-effort in code (graceful fallback if queue unavailable).
+# Consumer requires the binding for the #[event(queue)] handler.
+[[queues.producers]]
+binding = "EVENTS"
+queue = "data-fabric-events"
+
+[[queues.consumers]]
+queue = "data-fabric-events"
+max_batch_size = 50
+max_batch_timeout = 5
