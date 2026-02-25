@@ -7,6 +7,7 @@ mod models;
 mod policy;
 mod storage;
 mod tenant;
+mod verification;
 
 #[derive(Serialize)]
 struct HealthResponse<'a> {
@@ -840,6 +841,88 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     run_id: body.run_id,
                     steps,
                     status: "stub".into(),
+                },
+            )
+        })
+        .post_async("/v1/replay", |mut req, ctx| async move {
+            let started = js_sys::Date::now();
+            let body: models::ReplayExecuteRequest = req.json().await?;
+            if body.run_id.trim().is_empty() {
+                return Response::error("run_id is required", 400);
+            }
+
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let d1 = ctx.env.d1("DB")?;
+
+            let steps = db::build_replay_plan(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &body.run_id,
+                body.from_event_id.as_deref(),
+                body.to_event_id.as_deref(),
+            )
+            .await?;
+
+            let baseline_steps = match body.baseline_run_id.as_deref() {
+                Some(baseline_run_id) if !baseline_run_id.trim().is_empty() => {
+                    db::build_replay_plan(
+                        &d1,
+                        &tenant_ctx.tenant_id,
+                        baseline_run_id,
+                        body.from_event_id.as_deref(),
+                        body.to_event_id.as_deref(),
+                    )
+                    .await?
+                }
+                _ => Vec::new(),
+            };
+
+            let has_baseline = !baseline_steps.is_empty();
+            let (drift_count, drift_ratio_percent) = if has_baseline {
+                verification::compute_replay_drift_percent(&steps, &baseline_steps)
+            } else {
+                (0, 0.0)
+            };
+            let within_variance =
+                !has_baseline || drift_ratio_percent <= f64::from(body.variance_tolerance_percent);
+
+            let tests_passed = body.tests_passed.unwrap_or(true);
+            let policy_approved = body.policy_approved.unwrap_or(true);
+            let provenance_complete = body
+                .provenance_complete
+                .unwrap_or(!steps.is_empty() && within_variance);
+            let verification = verification::evaluate_verification_gates(
+                tests_passed,
+                policy_approved,
+                provenance_complete,
+            );
+
+            let failure_classification = if has_baseline {
+                Some(verification::classify_failure_from_drift_ratio(
+                    drift_ratio_percent,
+                ))
+            } else {
+                None
+            };
+
+            let status = if verification.eligible_for_promotion && within_variance {
+                "verified"
+            } else {
+                "needs_review"
+            };
+
+            timed_json_response(
+                started,
+                &models::ReplayExecuteResponse {
+                    run_id: body.run_id,
+                    baseline_run_id: body.baseline_run_id,
+                    status: status.into(),
+                    step_count: steps.len(),
+                    drift_count,
+                    drift_ratio_percent,
+                    within_variance,
+                    failure_classification,
+                    verification,
                 },
             )
         })

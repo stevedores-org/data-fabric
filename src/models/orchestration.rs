@@ -179,6 +179,66 @@ pub struct ReplayPlanResponse {
     pub status: String,
 }
 
+/// Request to execute replay verification for a trace slice.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReplayExecuteRequest {
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tests_passed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_approved: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance_complete: Option<bool>,
+    #[serde(default = "default_variance_tolerance_percent")]
+    pub variance_tolerance_percent: u8,
+}
+
+fn default_variance_tolerance_percent() -> u8 {
+    10
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    Transient,
+    Deterministic,
+    Environmental,
+    Logical,
+    Unknown,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct VerificationGateResult {
+    pub tests_passed: bool,
+    pub policy_approved: bool,
+    pub provenance_complete: bool,
+    pub eligible_for_promotion: bool,
+    pub confidence_score: u8,
+    pub failed_gates: Vec<String>,
+}
+
+/// Replay verification response with variance and gate evaluation.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReplayExecuteResponse {
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_run_id: Option<String>,
+    pub status: String,
+    pub step_count: usize,
+    pub drift_count: usize,
+    pub drift_ratio_percent: f64,
+    pub within_variance: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_classification: Option<FailureClass>,
+    pub verification: VerificationGateResult,
+}
+
 // ── Common ─────────────────────────────────────────────────────
 
 #[allow(dead_code)]
