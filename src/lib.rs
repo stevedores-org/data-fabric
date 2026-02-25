@@ -820,10 +820,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 &serde_json::json!({ "run_id": run_id, "edges": edges }),
             )
         })
-        // ── Replay Contract Stub (WS3: #58) ─────────────────────
+        // ── Replay Plan (WS3: #58) ────────────────────────────────
         .post_async("/v1/replay/plan", |mut req, ctx| async move {
             let started = js_sys::Date::now();
             let body: models::ReplayPlanRequest = req.json().await?;
+            if body.run_id.trim().is_empty() {
+                return Response::error("run_id is required", 400);
+            }
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let steps = db::build_replay_plan(
@@ -834,13 +837,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 body.to_event_id.as_deref(),
             )
             .await?;
-            // TODO: replace hardcoded "stub" status once replay execution is implemented
+            let status = if steps.is_empty() { "empty" } else { "planned" };
             timed_json_response(
                 started,
                 &models::ReplayPlanResponse {
                     run_id: body.run_id,
                     steps,
-                    status: "stub".into(),
+                    status: status.into(),
                 },
             )
         })

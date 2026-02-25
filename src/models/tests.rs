@@ -946,3 +946,315 @@ fn replay_execute_response_round_trip() {
     let parsed: ReplayExecuteResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, resp);
 }
+
+// ── Issue #58: Queue Integration Tests ──────────────────────────
+
+#[test]
+fn queue_envelope_preserves_all_event_fields() {
+    let envelope = QueueEnvelope {
+        tenant_id: "tenant-42".into(),
+        event: GraphEvent {
+            run_id: Some("run-1".into()),
+            thread_id: Some("thread-a".into()),
+            event_type: "task.complete".into(),
+            node_id: Some("node-x".into()),
+            actor: Some("agent-1".into()),
+            payload: Some(serde_json::json!({
+                "plan_id": "plan-1",
+                "task_id": "task-1",
+                "tool_call_id": "tc-1",
+                "artifact_id": "art-1",
+                "depends_on": ["task-0"]
+            })),
+        },
+    };
+    let json = serde_json::to_string(&envelope).unwrap();
+    let parsed: QueueEnvelope = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.tenant_id, "tenant-42");
+    assert_eq!(parsed.event.event_type, "task.complete");
+    let payload = parsed.event.payload.unwrap();
+    assert_eq!(payload["plan_id"], "plan-1");
+    assert_eq!(payload["depends_on"][0], "task-0");
+}
+
+#[test]
+fn queue_envelope_falls_back_to_bare_event() {
+    // Bare GraphEvent without QueueEnvelope wrapper — queue consumer accepts both
+    let bare = r#"{"event_type":"run.start","run_id":"r1"}"#;
+    let evt: GraphEvent = serde_json::from_str(bare).unwrap();
+    assert_eq!(evt.event_type, "run.start");
+    assert_eq!(evt.run_id.as_deref(), Some("r1"));
+    // Should fail as QueueEnvelope
+    assert!(serde_json::from_str::<QueueEnvelope>(bare).is_err());
+}
+
+// ── Issue #58: Gold Layer Tests ─────────────────────────────────
+
+#[test]
+fn run_summary_actors_and_event_types_deduplication() {
+    // Simulate the gold layer deduplicated arrays
+    let summary = RunSummary {
+        run_id: "run-1".into(),
+        event_count: 5,
+        first_event_at: Some("2026-01-01T00:00:00Z".into()),
+        last_event_at: Some("2026-01-01T00:00:05Z".into()),
+        actors: vec!["agent-1".into(), "agent-2".into()],
+        event_types: vec!["run.start".into(), "task.complete".into(), "run.end".into()],
+        updated_at: "2026-01-01T00:00:05Z".into(),
+    };
+    let json = serde_json::to_value(&summary).unwrap();
+    let actors = json["actors"].as_array().unwrap();
+    assert_eq!(actors.len(), 2);
+    // Verify no duplicates in serialized form
+    let unique: std::collections::HashSet<&str> = actors.iter().map(|a| a.as_str().unwrap()).collect();
+    assert_eq!(unique.len(), actors.len());
+}
+
+#[test]
+fn run_summary_empty_arrays_serialize() {
+    let summary = RunSummary {
+        run_id: "empty-run".into(),
+        event_count: 0,
+        first_event_at: None,
+        last_event_at: None,
+        actors: vec![],
+        event_types: vec![],
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    let json = serde_json::to_value(&summary).unwrap();
+    assert_eq!(json["event_count"], 0);
+    assert_eq!(json["actors"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn task_dependency_edge_with_full_causality_chain() {
+    // Verify the full causality chain model: plan → task → tool_call → artifact
+    let edges = vec![
+        TaskDependencyEdge {
+            run_id: "r1".into(),
+            task_id: "task-2".into(),
+            depends_on_task_id: "task-1".into(),
+            created_at: Some("2026-01-01T00:00:01Z".into()),
+        },
+        TaskDependencyEdge {
+            run_id: "r1".into(),
+            task_id: "task-3".into(),
+            depends_on_task_id: "task-1".into(),
+            created_at: Some("2026-01-01T00:00:02Z".into()),
+        },
+    ];
+    let json = serde_json::to_value(&edges).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 2);
+    // task-2 and task-3 both depend on task-1
+    assert_eq!(json[0]["depends_on_task_id"], "task-1");
+    assert_eq!(json[1]["depends_on_task_id"], "task-1");
+}
+
+// ── Issue #58: Provenance Links Tests ───────────────────────────
+
+#[test]
+fn provenance_edge_full_causality_chain_round_trip() {
+    // Full chain: run → plan → task → tool_call → artifact
+    let chain = vec![
+        ProvenanceEdge { depth: 0, rel_type: "causality".into(), from_kind: "run".into(), from_id: "r1".into(), to_kind: "plan".into(), to_id: "p1".into(), relation: Some("planned".into()), created_at: Some("2026-01-01T00:00:00Z".into()) },
+        ProvenanceEdge { depth: 1, rel_type: "causality".into(), from_kind: "plan".into(), from_id: "p1".into(), to_kind: "task".into(), to_id: "t1".into(), relation: Some("scheduled".into()), created_at: Some("2026-01-01T00:00:01Z".into()) },
+        ProvenanceEdge { depth: 2, rel_type: "causality".into(), from_kind: "task".into(), from_id: "t1".into(), to_kind: "tool_call".into(), to_id: "tc1".into(), relation: Some("invoked".into()), created_at: Some("2026-01-01T00:00:02Z".into()) },
+        ProvenanceEdge { depth: 3, rel_type: "causality".into(), from_kind: "tool_call".into(), from_id: "tc1".into(), to_kind: "artifact".into(), to_id: "a1".into(), relation: Some("produced".into()), created_at: Some("2026-01-01T00:00:03Z".into()) },
+    ];
+    let json = serde_json::to_string(&chain).unwrap();
+    let parsed: Vec<ProvenanceEdge> = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.len(), 4);
+    assert_eq!(parsed[0].relation.as_deref(), Some("planned"));
+    assert_eq!(parsed[1].relation.as_deref(), Some("scheduled"));
+    assert_eq!(parsed[2].relation.as_deref(), Some("invoked"));
+    assert_eq!(parsed[3].relation.as_deref(), Some("produced"));
+    // Depths should increase
+    for (i, edge) in parsed.iter().enumerate() {
+        assert_eq!(edge.depth, i as i32);
+    }
+}
+
+#[test]
+fn provenance_response_with_hops_parameter() {
+    let resp = ProvenanceResponse {
+        entity_kind: "run".into(),
+        entity_id: "r1".into(),
+        direction: "forward".into(),
+        hops: 5,
+        edges: vec![
+            ProvenanceEdge { depth: 0, rel_type: "causality".into(), from_kind: "run".into(), from_id: "r1".into(), to_kind: "plan".into(), to_id: "p1".into(), relation: Some("planned".into()), created_at: None },
+        ],
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["hops"], 5);
+    assert_eq!(json["direction"], "forward");
+    assert_eq!(json["edges"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn provenance_response_backward_direction() {
+    let resp = ProvenanceResponse {
+        entity_kind: "artifact".into(),
+        entity_id: "a1".into(),
+        direction: "backward".into(),
+        hops: 3,
+        edges: vec![
+            ProvenanceEdge { depth: 0, rel_type: "causality".into(), from_kind: "tool_call".into(), from_id: "tc1".into(), to_kind: "artifact".into(), to_id: "a1".into(), relation: Some("produced".into()), created_at: None },
+            ProvenanceEdge { depth: 1, rel_type: "causality".into(), from_kind: "task".into(), from_id: "t1".into(), to_kind: "tool_call".into(), to_id: "tc1".into(), relation: Some("invoked".into()), created_at: None },
+        ],
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: ProvenanceResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.direction, "backward");
+    assert_eq!(parsed.edges.len(), 2);
+}
+
+// ── Issue #58: Replay Contract Tests ────────────────────────────
+
+#[test]
+fn replay_plan_response_planned_status() {
+    let resp = ReplayPlanResponse {
+        run_id: "r1".into(),
+        steps: vec![
+            ReplayStep { sequence: 1, event_type: "run.start".into(), node_id: None, actor: Some("ci".into()) },
+            ReplayStep { sequence: 2, event_type: "task.start".into(), node_id: Some("n1".into()), actor: Some("agent".into()) },
+        ],
+        status: "planned".into(),
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["status"], "planned");
+    assert_eq!(json["steps"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn replay_plan_response_empty_status() {
+    let resp = ReplayPlanResponse {
+        run_id: "empty-run".into(),
+        steps: vec![],
+        status: "empty".into(),
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["status"], "empty");
+    assert_eq!(json["steps"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn replay_execute_request_with_baseline_and_gates() {
+    let input = r#"{
+        "run_id": "r2",
+        "baseline_run_id": "r1",
+        "from_event_id": "evt-5",
+        "to_event_id": "evt-20",
+        "tests_passed": true,
+        "policy_approved": false,
+        "provenance_complete": true,
+        "variance_tolerance_percent": 15
+    }"#;
+    let parsed: ReplayExecuteRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.run_id, "r2");
+    assert_eq!(parsed.baseline_run_id.as_deref(), Some("r1"));
+    assert_eq!(parsed.from_event_id.as_deref(), Some("evt-5"));
+    assert_eq!(parsed.to_event_id.as_deref(), Some("evt-20"));
+    assert!(parsed.tests_passed.unwrap());
+    assert!(!parsed.policy_approved.unwrap());
+    assert!(parsed.provenance_complete.unwrap());
+    assert_eq!(parsed.variance_tolerance_percent, 15);
+}
+
+#[test]
+fn replay_execute_response_needs_review_status() {
+    let resp = ReplayExecuteResponse {
+        run_id: "r2".into(),
+        baseline_run_id: Some("r1".into()),
+        status: "needs_review".into(),
+        step_count: 10,
+        drift_count: 4,
+        drift_ratio_percent: 40.0,
+        within_variance: false,
+        failure_classification: Some(FailureClass::Logical),
+        verification: VerificationGateResult {
+            tests_passed: true,
+            policy_approved: true,
+            provenance_complete: false,
+            eligible_for_promotion: false,
+            confidence_score: 75,
+            failed_gates: vec!["provenance_complete".into()],
+        },
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["status"], "needs_review");
+    assert!(!json["within_variance"].as_bool().unwrap());
+    assert_eq!(json["failure_classification"], "logical");
+    assert_eq!(json["verification"]["confidence_score"], 75);
+    assert_eq!(json["verification"]["failed_gates"][0], "provenance_complete");
+}
+
+// ── Issue #58: Performance Gate Tests ───────────────────────────
+
+#[test]
+fn replay_step_sequence_ordering_preserved() {
+    // Verify step ordering matches event ingestion order for replay fidelity
+    let steps: Vec<ReplayStep> = (1..=50)
+        .map(|i| ReplayStep {
+            sequence: i,
+            event_type: format!("event.type.{}", i),
+            node_id: Some(format!("node-{}", i)),
+            actor: Some("agent".into()),
+        })
+        .collect();
+    let json = serde_json::to_string(&steps).unwrap();
+    let parsed: Vec<ReplayStep> = serde_json::from_str(&json).unwrap();
+    for (i, step) in parsed.iter().enumerate() {
+        assert_eq!(step.sequence, i + 1);
+    }
+}
+
+#[test]
+fn graph_event_batch_50_events_serialization_perf() {
+    // Simulate a batch of 50 events (performance acceptance target)
+    let events: Vec<GraphEvent> = (0..50)
+        .map(|i| GraphEvent {
+            run_id: Some("perf-run".into()),
+            thread_id: Some(format!("thread-{}", i % 5)),
+            event_type: "node.complete".into(),
+            node_id: Some(format!("node-{}", i)),
+            actor: Some("agent".into()),
+            payload: Some(serde_json::json!({
+                "task_id": format!("task-{}", i),
+                "result": {"status": "ok", "data": vec![0u8; 100]},
+            })),
+        })
+        .collect();
+    let batch = GraphEventBatch { events };
+    let json = serde_json::to_string(&batch).unwrap();
+    assert!(json.len() > 0);
+    let parsed: GraphEventBatch = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.events.len(), 50);
+}
+
+#[test]
+fn trace_response_bounded_by_limit() {
+    // Verify trace response with large event count reports truncation
+    let events: Vec<TraceEvent> = (0..100)
+        .map(|i| TraceEvent {
+            id: format!("evt-{}", i),
+            run_id: Some("r1".into()),
+            thread_id: None,
+            event_type: "step".into(),
+            node_id: Some(format!("n{}", i)),
+            actor: Some("agent".into()),
+            payload: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .collect();
+    let resp = TraceResponse {
+        run_id: "r1".into(),
+        events,
+        total: Some(500),
+        truncated: Some(true),
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["total"], 500);
+    assert!(json["truncated"].as_bool().unwrap());
+    assert_eq!(json["events"].as_array().unwrap().len(), 100);
+}

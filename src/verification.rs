@@ -163,4 +163,61 @@ mod tests {
             vec!["tests_passed", "provenance_complete"]
         );
     }
+
+    #[test]
+    fn evaluate_verification_gates_all_fail() {
+        let result = evaluate_verification_gates(false, false, false);
+        assert!(!result.eligible_for_promotion);
+        assert_eq!(result.confidence_score, 0);
+        assert_eq!(result.failed_gates.len(), 3);
+    }
+
+    #[test]
+    fn compute_replay_drift_percent_empty_steps() {
+        let empty: Vec<models::ReplayStep> = vec![];
+        let (drift_count, drift_ratio) = compute_replay_drift_percent(&empty, &empty);
+        assert_eq!(drift_count, 0);
+        assert!((drift_ratio - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_replay_drift_percent_full_mismatch() {
+        let replay = vec![
+            models::ReplayStep { sequence: 1, event_type: "a".into(), node_id: None, actor: None },
+            models::ReplayStep { sequence: 2, event_type: "b".into(), node_id: None, actor: None },
+        ];
+        let baseline = vec![
+            models::ReplayStep { sequence: 1, event_type: "x".into(), node_id: None, actor: None },
+            models::ReplayStep { sequence: 2, event_type: "y".into(), node_id: None, actor: None },
+        ];
+        let (drift_count, drift_ratio) = compute_replay_drift_percent(&replay, &baseline);
+        assert_eq!(drift_count, 2);
+        assert!((drift_ratio - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn classify_failure_boundary_at_ten_percent() {
+        // Exactly 10% should be Transient (<=10)
+        assert_eq!(
+            classify_failure_from_drift_ratio(10.0),
+            models::FailureClass::Transient
+        );
+        // Just above should be Environmental
+        assert_eq!(
+            classify_failure_from_drift_ratio(10.01),
+            models::FailureClass::Environmental
+        );
+    }
+
+    #[test]
+    fn classify_failure_boundary_at_thirtyfive_percent() {
+        assert_eq!(
+            classify_failure_from_drift_ratio(35.0),
+            models::FailureClass::Environmental
+        );
+        assert_eq!(
+            classify_failure_from_drift_ratio(35.01),
+            models::FailureClass::Logical
+        );
+    }
 }
