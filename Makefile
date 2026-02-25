@@ -1,4 +1,4 @@
-.PHONY: help test build dev-worker setup-local db-reset db-clean-setup fmt lint check test-integration deploy-prod deploy-staging logs-remote logs-local install clean ci dev status
+.PHONY: help test build dev-worker setup-local db-reset db-clean-setup fmt lint check test-integration deploy-prod deploy-staging logs-remote logs-local install clean ci dev status coverage coverage-html
 
 # Default target
 .DEFAULT_GOAL := help
@@ -80,6 +80,24 @@ test-integration: build ## Integration test with worker running in background
 	echo ""; \
 	echo "✅ Integration tests complete"; \
 	exit $$TEST_RESULT
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Coverage Targets (requires: cargo install cargo-llvm-cov)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+COV_THRESHOLD := 75
+
+coverage: ## Run coverage and print summary (75% threshold)
+	cargo llvm-cov --summary-only --fail-under-lines $(COV_THRESHOLD)
+
+coverage-html: ## Generate HTML coverage report and open it
+	cargo llvm-cov --html
+	@echo "Opening coverage report..."
+	@open target/llvm-cov/html/index.html 2>/dev/null || xdg-open target/llvm-cov/html/index.html 2>/dev/null || echo "Report at target/llvm-cov/html/index.html"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Deployment & Infrastructure
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 deploy-prod: ## Deploy to Cloudflare production
 	@echo "⚠️  Deploying to production..."
