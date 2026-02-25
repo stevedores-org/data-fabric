@@ -1227,7 +1227,7 @@ fn graph_event_batch_50_events_serialization_perf() {
         .collect();
     let batch = GraphEventBatch { events };
     let json = serde_json::to_string(&batch).unwrap();
-    assert!(json.len() > 0);
+    assert!(!json.is_empty());
     let parsed: GraphEventBatch = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.events.len(), 50);
 }
