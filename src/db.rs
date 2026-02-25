@@ -2077,6 +2077,7 @@ pub struct CheckpointRow {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 struct MemoryGcRow {
     id: String,
     status: String,
@@ -2247,6 +2248,7 @@ pub struct Ws2TaskResponse {
 
 // ── Provenance Links (WS3: causality chain) ─────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_relationship(
     db: &D1Database,
     tenant_id: &str,
@@ -2355,13 +2357,31 @@ pub async fn insert_causality_from_event(
 
         // run → plan
         if let (Some(rid), Some(pid)) = (run_id, plan_id) {
-            insert_relationship(db, tenant_id, "causality", "run", rid, "plan", pid, Some("planned"))
-                .await?;
+            insert_relationship(
+                db,
+                tenant_id,
+                "causality",
+                "run",
+                rid,
+                "plan",
+                pid,
+                Some("planned"),
+            )
+            .await?;
         }
         // plan → task
         if let (Some(pid), Some(tid)) = (plan_id, task_id) {
-            insert_relationship(db, tenant_id, "causality", "plan", pid, "task", tid, Some("scheduled"))
-                .await?;
+            insert_relationship(
+                db,
+                tenant_id,
+                "causality",
+                "plan",
+                pid,
+                "task",
+                tid,
+                Some("scheduled"),
+            )
+            .await?;
         }
         // task → tool_call
         if let (Some(tid), Some(tcid)) = (task_id, tool_call_id) {
@@ -2499,7 +2519,9 @@ pub async fn list_run_summaries(
     limit: u32,
 ) -> Result<Vec<models::RunSummary>> {
     let result: D1Result = db
-        .prepare("SELECT * FROM run_summaries WHERE tenant_id = ?1 ORDER BY updated_at DESC LIMIT ?2")
+        .prepare(
+            "SELECT * FROM run_summaries WHERE tenant_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+        )
         .bind(&[JsValue::from_str(tenant_id), JsValue::from(limit)])?
         .all()
         .await?;
