@@ -893,8 +893,12 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let id = ctx.param("id").unwrap().to_string();
             let d1 = ctx.env.d1("DB")?;
-            db::delete_integration(&d1, &tenant_ctx.tenant_id, &id).await?;
-            Response::from_json(&serde_json::json!({ "id": id, "deleted": true }))
+            let deleted = db::delete_integration(&d1, &tenant_ctx.tenant_id, &id).await?;
+            if deleted {
+                Response::from_json(&serde_json::json!({ "id": id, "deleted": true }))
+            } else {
+                Response::error("integration not found", 404)
+            }
         })
         // ── WS6: oxidizedgraph intake ───────────────────────
         .post_async(

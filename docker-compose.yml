@@ -48,7 +48,7 @@ services:
   # SQLite database initialization
   # ────────────────────────────────────────────────────────────────
   sqlite-init:
-    image: sqlite:3.45-bookworm
+    image: debian:bookworm-slim
     container_name: data-fabric-sqlite-init
     volumes:
       - data-fabric-db:/data
@@ -56,6 +56,7 @@ services:
     command: >
       sh -c "
         set -e
+        apt-get update -qq && apt-get install -y -qq sqlite3 >/dev/null 2>&1
         DB_FILE=/data/data-fabric.db
         if [ ! -f $$DB_FILE ]; then
           echo '📦 Creating SQLite database...'

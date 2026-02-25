@@ -54,9 +54,10 @@ COPY --from=builder /build/build ./build/
 COPY --from=builder /build/Cargo.toml ./
 COPY --from=builder /build/migrations ./migrations/
 
-# Create data directories with proper permissions
-RUN mkdir -p /data .wrangler/state/v3/d1 && \
-    chmod 755 /data .wrangler
+# Create non-root user and data directories with proper permissions
+RUN groupadd -r appuser && useradd -r -g appuser -u 1000 appuser && \
+    mkdir -p /data .wrangler/state/v3/d1 && \
+    chown -R 1000:1000 /app /data
 
 # Copy configuration
 COPY wrangler.toml ./
@@ -73,8 +74,7 @@ HEALTHCHECK --interval=10s --timeout=5s --retries=3 --start-period=20s \
     CMD curl -f http://localhost:8787/health || exit 1
 
 # OCI Standard: User specification (non-root for security)
-# Note: bun image runs as root by default; for production, consider:
-# USER 1000:1000
+USER 1000:1000
 
 # OCI Standard: Entry point
 ENTRYPOINT ["/bin/sh", "-c"]
