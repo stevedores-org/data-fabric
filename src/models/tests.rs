@@ -900,3 +900,49 @@ fn replay_plan_response_round_trip() {
     assert_eq!(parsed.steps.len(), 2);
     assert_eq!(parsed.status, "stub");
 }
+
+#[test]
+fn replay_execute_request_defaults_variance_tolerance() {
+    let input = r#"{"run_id":"r1"}"#;
+    let parsed: ReplayExecuteRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.run_id, "r1");
+    assert_eq!(parsed.variance_tolerance_percent, 10);
+    assert!(parsed.baseline_run_id.is_none());
+}
+
+#[test]
+fn failure_class_serializes_snake_case() {
+    assert_eq!(
+        serde_json::to_string(&FailureClass::Deterministic).unwrap(),
+        "\"deterministic\""
+    );
+    assert_eq!(
+        serde_json::to_string(&FailureClass::Environmental).unwrap(),
+        "\"environmental\""
+    );
+}
+
+#[test]
+fn replay_execute_response_round_trip() {
+    let resp = ReplayExecuteResponse {
+        run_id: "r1".into(),
+        baseline_run_id: Some("r0".into()),
+        status: "verified".into(),
+        step_count: 12,
+        drift_count: 1,
+        drift_ratio_percent: 8.33,
+        within_variance: true,
+        failure_classification: Some(FailureClass::Transient),
+        verification: VerificationGateResult {
+            tests_passed: true,
+            policy_approved: true,
+            provenance_complete: true,
+            eligible_for_promotion: true,
+            confidence_score: 100,
+            failed_gates: vec![],
+        },
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: ReplayExecuteResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, resp);
+}
