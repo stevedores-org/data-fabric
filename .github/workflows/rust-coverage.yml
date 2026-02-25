@@ -25,7 +25,7 @@ jobs:
 
       - name: Run coverage
         run: |
-          cargo llvm-cov --summary-only --output-path coverage-summary.txt --fail-under-lines 25
+          cargo llvm-cov --summary-only --output-path coverage-summary.txt --fail-under-lines 75
           echo "### Coverage Summary" > coverage-report.md
           echo "" >> coverage-report.md
           echo '```' >> coverage-report.md

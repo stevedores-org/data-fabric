@@ -2108,13 +2108,6 @@ pub struct CheckpointRow {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)]
-struct MemoryGcRow {
-    id: String,
-    status: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
 struct PercentileRow {
     latency_ms: Option<i64>,
 }
@@ -2965,16 +2958,20 @@ pub async fn update_integration(
     let bound = stmt.bind(&bind_vals)?;
     bound.run().await?;
 
-    // D1 doesn't return affected rows easily; check existence
-    Ok(true)
+    // D1 doesn't return affected rows easily; verify the row exists
+    let exists = get_integration(db, tenant_id, id).await?.is_some();
+    Ok(exists)
 }
 
-pub async fn delete_integration(db: &D1Database, tenant_id: &str, id: &str) -> Result<()> {
-    db.prepare("DELETE FROM integrations WHERE tenant_id = ?1 AND id = ?2")
-        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
-        .run()
-        .await?;
-    Ok(())
+pub async fn delete_integration(db: &D1Database, tenant_id: &str, id: &str) -> Result<bool> {
+    let existed = get_integration(db, tenant_id, id).await?.is_some();
+    if existed {
+        db.prepare("DELETE FROM integrations WHERE tenant_id = ?1 AND id = ?2")
+            .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
+            .run()
+            .await?;
+    }
+    Ok(existed)
 }
 
 #[derive(Debug, serde::Deserialize)]
