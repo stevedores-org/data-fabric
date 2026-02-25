@@ -51,6 +51,15 @@ pub struct RegisterIntegration {
     pub config: Option<serde_json::Value>,
 }
 
+/// Partial update for an existing integration.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct UpdateIntegration {
+    pub name: Option<String>,
+    pub endpoint: Option<String>,
+    pub status: Option<String>,
+    pub config: Option<serde_json::Value>,
+}
+
 // ── oxidizedgraph contract ──────────────────────────────────────
 
 /// oxidizedgraph sends graph execution state via this contract.
@@ -456,6 +465,37 @@ pub mod llama_rs {
         }
 
         events
+    }
+
+    /// A context retrieval request from llama.rs for prior inference results.
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct ContextRequest {
+        pub query: String,
+        pub model: Option<String>,
+        pub run_id: Option<String>,
+        pub task_id: Option<String>,
+        pub thread_id: Option<String>,
+        pub top_k: Option<usize>,
+        pub token_budget: Option<usize>,
+    }
+
+    /// Adapt a llama.rs context request into a fabric context-pack request.
+    pub fn adapt_to_context_pack(req: &ContextRequest) -> crate::models::ContextPackRequest {
+        crate::models::ContextPackRequest {
+            retrieval: crate::models::RetrieveMemoryRequest {
+                repo: req.model.clone().unwrap_or_else(|| "llama_rs".into()),
+                query: req.query.clone(),
+                task_id: req.task_id.clone(),
+                run_id: req.run_id.clone(),
+                thread_id: req.thread_id.clone(),
+                related_repos: vec![],
+                top_k: req.top_k.unwrap_or(8),
+                include_stale: false,
+                include_unsafe: false,
+                include_conflicted: false,
+            },
+            token_budget: req.token_budget.unwrap_or(4096),
+        }
     }
 }
 

@@ -1,0 +1,423 @@
+openapi: 3.1.0
+info:
+  title: Data Fabric — WS6 Integration API
+  version: "1.0"
+  description: |
+    Integration contracts for external system adapters (oxidizedgraph, aivcs, llama.rs).
+    All endpoints require tenant authentication via `Authorization: Bearer <token>`.
+servers:
+  - url: https://data-fabric.stevedores.org
+    description: Production
+paths:
+  /v1/integrations:
+    post:
+      summary: Register an integration
+      operationId: registerIntegration
+      tags: [Integrations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterIntegration"
+      responses:
+        "200":
+          description: Integration registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  target: { $ref: "#/components/schemas/IntegrationTarget" }
+                  name: { type: string }
+                  status: { type: string }
+    get:
+      summary: List active integrations
+      operationId: listIntegrations
+      tags: [Integrations]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: Integration list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  integrations:
+                    type: array
+                    items: { $ref: "#/components/schemas/Integration" }
+
+  /v1/integrations/{id}:
+    get:
+      summary: Get integration by ID
+      operationId: getIntegration
+      tags: [Integrations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Integration details
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Integration" }
+        "404":
+          description: Integration not found
+    patch:
+      summary: Update integration
+      operationId: updateIntegration
+      tags: [Integrations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateIntegration"
+      responses:
+        "200":
+          description: Updated integration
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Integration" }
+    delete:
+      summary: Delete integration
+      operationId: deleteIntegration
+      tags: [Integrations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  deleted: { type: boolean }
+
+  /v1/integrations/oxidizedgraph/events:
+    post:
+      summary: Ingest oxidizedgraph execution events
+      operationId: ingestOxidizedgraphEvents
+      tags: [oxidizedgraph]
+      description: |
+        Accepts a batch of graph execution events. Events are stored in the
+        bronze + silver event layers. CheckpointSave events additionally
+        persist state to R2 and create checkpoint records.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GraphExecBatch"
+      responses:
+        "200":
+          description: Events ingested
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  source: { type: string, const: oxidizedgraph }
+                  events_ingested: { type: integer }
+                  checkpoints_created: { type: integer }
+        "400":
+          description: Batch exceeds 100 events
+        "503":
+          description: Fabric temporarily unavailable (graceful degradation)
+          headers:
+            Retry-After: { schema: { type: integer } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DegradedResponse" }
+
+  /v1/integrations/aivcs/events:
+    post:
+      summary: Ingest aivcs pipeline event
+      operationId: ingestAivcsEvent
+      tags: [aivcs]
+      description: |
+        Accepts a pipeline lifecycle event. PipelineStart events also create
+        a fabric run. Artifacts referenced in the event are stored to R2.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PipelineEvent"
+      responses:
+        "200":
+          description: Event ingested
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  source: { type: string, const: aivcs }
+                  event_id: { type: string }
+                  run_id: { type: string, nullable: true }
+                  artifacts_stored: { type: integer }
+        "503":
+          description: Fabric temporarily unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DegradedResponse" }
+
+  /v1/integrations/llama-rs/inference:
+    post:
+      summary: Submit inference request as MCP task
+      operationId: submitLlamaInference
+      tags: [llama.rs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InferenceRequest"
+      responses:
+        "200":
+          description: Task created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  source: { type: string, const: llama_rs }
+                  task_id: { type: string }
+                  status: { type: string }
+
+  /v1/integrations/llama-rs/telemetry:
+    post:
+      summary: Ingest inference telemetry
+      operationId: ingestLlamaTelemetry
+      tags: [llama.rs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InferenceTelemetry"
+      responses:
+        "200":
+          description: Telemetry ingested
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  source: { type: string, const: llama_rs }
+                  events_ingested: { type: integer }
+
+  /v1/integrations/llama-rs/context:
+    post:
+      summary: Retrieve prior inference context
+      operationId: getLlamaContext
+      tags: [llama.rs]
+      description: |
+        Query the fabric memory/retrieval API for prior inference results,
+        returning a context pack scoped to the requesting model.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContextRequest"
+      responses:
+        "200":
+          description: Context pack
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContextPackResponse"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  schemas:
+    IntegrationTarget:
+      type: string
+      enum: [oxidizedgraph, aivcs, llama_rs]
+
+    RegisterIntegration:
+      type: object
+      required: [target, name]
+      properties:
+        target: { $ref: "#/components/schemas/IntegrationTarget" }
+        name: { type: string, minLength: 1, maxLength: 256 }
+        endpoint: { type: string }
+        api_version: { type: string, default: v1 }
+        config: { type: object }
+
+    UpdateIntegration:
+      type: object
+      properties:
+        name: { type: string }
+        endpoint: { type: string }
+        status: { type: string }
+        config: { type: object }
+
+    Integration:
+      type: object
+      properties:
+        id: { type: string }
+        target: { $ref: "#/components/schemas/IntegrationTarget" }
+        name: { type: string }
+        endpoint: { type: string, nullable: true }
+        api_version: { type: string }
+        status: { type: string }
+        config: { type: object, nullable: true }
+        created_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+
+    GraphExecBatch:
+      type: object
+      required: [graph_id, thread_id, events]
+      properties:
+        graph_id: { type: string }
+        thread_id: { type: string }
+        events:
+          type: array
+          maxItems: 100
+          items: { $ref: "#/components/schemas/GraphExecEvent" }
+
+    GraphExecEvent:
+      type: object
+      required: [event_type, node_id]
+      properties:
+        event_type:
+          type: string
+          enum: [node_start, node_end, node_error, edge_traversal, checkpoint_save, checkpoint_restore, graph_start, graph_end]
+        node_id: { type: string }
+        node_type: { type: string }
+        parent_node_id: { type: string }
+        state: { type: object }
+        error: { type: string }
+        duration_ms: { type: integer }
+        metadata: { type: object }
+
+    PipelineEvent:
+      type: object
+      required: [pipeline_id, repo, event_type, actor]
+      properties:
+        pipeline_id: { type: string }
+        repo: { type: string }
+        event_type:
+          type: string
+          enum: [pipeline_start, pipeline_end, stage_start, stage_end, test_result, build_complete, deploy_start, deploy_end]
+        commit_sha: { type: string }
+        branch: { type: string }
+        actor: { type: string }
+        artifacts:
+          type: array
+          items: { $ref: "#/components/schemas/PipelineArtifact" }
+        metadata: { type: object }
+
+    PipelineArtifact:
+      type: object
+      required: [key]
+      properties:
+        key: { type: string }
+        content_type: { type: string }
+        size_bytes: { type: integer }
+        checksum: { type: string }
+
+    InferenceRequest:
+      type: object
+      required: [model]
+      properties:
+        model: { type: string }
+        prompt: { type: string }
+        messages: { type: array }
+        temperature: { type: number }
+        max_tokens: { type: integer }
+        tools: { type: array, items: { type: string } }
+        run_id: { type: string }
+        metadata: { type: object }
+
+    InferenceTelemetry:
+      type: object
+      required: [task_id, event_type, model]
+      properties:
+        task_id: { type: string }
+        event_type:
+          type: string
+          enum: [inference_start, inference_end, tool_use, token_stream, inference_error]
+        model: { type: string }
+        tokens_in: { type: integer }
+        tokens_out: { type: integer }
+        duration_ms: { type: integer }
+        tool_calls:
+          type: array
+          items: { $ref: "#/components/schemas/InferenceToolCall" }
+        error: { type: string }
+        metadata: { type: object }
+
+    InferenceToolCall:
+      type: object
+      required: [tool_name, input]
+      properties:
+        tool_name: { type: string }
+        input: { type: object }
+        output: { type: object }
+        duration_ms: { type: integer }
+
+    ContextRequest:
+      type: object
+      required: [query]
+      properties:
+        query: { type: string }
+        model: { type: string }
+        run_id: { type: string }
+        task_id: { type: string }
+        thread_id: { type: string }
+        top_k: { type: integer, default: 8 }
+        token_budget: { type: integer, default: 4096 }
+
+    ContextPackResponse:
+      type: object
+      properties:
+        query_id: { type: string }
+        latency_ms: { type: integer }
+        token_budget: { type: integer }
+        used_tokens: { type: integer }
+        dropped_due_to_budget: { type: integer }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              kind: { type: string }
+              summary: { type: string }
+              score: { type: number }
+              estimated_tokens: { type: integer }
+
+    DegradedResponse:
+      type: object
+      properties:
+        source: { type: string }
+        status: { type: string, const: degraded }
+        detail: { type: string }
+        retry_after_seconds: { type: integer }
+
+security:
+  - bearerAuth: []
