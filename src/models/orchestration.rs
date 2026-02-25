@@ -209,7 +209,7 @@ pub struct TraceResponse {
     pub run_id: String,
     pub events: Vec<TraceEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub total: Option<usize>,
+    pub total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
 }

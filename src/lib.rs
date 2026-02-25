@@ -704,9 +704,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if truncated {
                 events.truncate(limit as usize);
             }
-            let total = db::get_trace_count_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
+            let total = db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
             let (total_meta, truncated_meta) =
-                build_trace_response_metadata(total as usize, truncated, has_valid_limit_param);
+                build_trace_response_metadata(total, truncated, has_valid_limit_param);
             timed_json_response(
                 started,
                 &models::TraceResponse {
@@ -733,9 +733,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if truncated {
                 events.truncate(limit as usize);
             }
-            let total = db::get_trace_count_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
+            let total = db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
             let (total_meta, truncated_meta) =
-                build_trace_response_metadata(total as usize, truncated, has_valid_hops_param);
+                build_trace_response_metadata(total, truncated, has_valid_hops_param);
             Response::from_json(&models::TraceResponse {
                 run_id,
                 total: total_meta,
@@ -1203,10 +1203,10 @@ fn parse_limit_query_with_valid_presence(
 /// - `total` is emitted only when the caller supplied a valid bound and the result is not truncated.
 /// - `truncated` is emitted when truncation happened or when the caller supplied a valid bound.
 fn build_trace_response_metadata(
-    event_count: usize,
+    event_count: u64,
     truncated: bool,
     has_valid_bound_param: bool,
-) -> (Option<usize>, Option<bool>) {
+) -> (Option<u64>, Option<bool>) {
     let total = if has_valid_bound_param && !truncated {
         Some(event_count)
     } else {

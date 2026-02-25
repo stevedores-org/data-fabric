@@ -575,7 +575,7 @@ fn trace_response_with_total_truncated() {
     let resp = TraceResponse {
         run_id: "r1".into(),
         events: vec![],
-        total: Some(100),
+        total: Some(100u64),
         truncated: Some(true),
     };
     let json = serde_json::to_value(&resp).unwrap();
@@ -687,7 +687,7 @@ fn trace_response_serializes() {
             payload: None,
             created_at: "2026-02-22T12:00:00Z".into(),
         }],
-        total: Some(1),
+        total: Some(1u64),
         truncated: Some(false),
     };
     let json = serde_json::to_value(&resp).unwrap();
