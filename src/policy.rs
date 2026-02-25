@@ -398,8 +398,35 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
         return p == v;
     }
     let parts: Vec<&str> = p.split('*').collect();
+    // parts[0] is the prefix (empty if pattern starts with '*')
+    // parts[last] is the suffix (empty if pattern ends with '*')
     let mut pos = 0usize;
-    for part in parts.iter().filter(|s| !s.is_empty()) {
+    let end = v.len();
+
+    // Anchor prefix: if pattern does not start with '*', value must start with first segment.
+    if !parts[0].is_empty() {
+        if !v.starts_with(parts[0]) {
+            return false;
+        }
+        pos = parts[0].len();
+    }
+
+    // Anchor suffix: if pattern does not end with '*', value must end with last segment.
+    let last = parts[parts.len() - 1];
+    if !last.is_empty() {
+        if !v.ends_with(last) {
+            return false;
+        }
+        // Prevent suffix region from being consumed by interior matches.
+        let suffix_start = end - last.len();
+        if suffix_start < pos {
+            return false;
+        }
+    }
+
+    // Match interior segments (skip first and last, they are anchored above).
+    let interior = &parts[1..parts.len().saturating_sub(1)];
+    for part in interior.iter().filter(|s| !s.is_empty()) {
         if let Some(found) = v[pos..].find(part) {
             pos += found + part.len();
         } else {
@@ -527,7 +554,7 @@ mod tests {
 
     #[test]
     fn risk_critical_keywords() {
-        for keyword in ["wipe", "destroy", "terminate", "root-key", "irreversible"] {
+        for keyword in ["wipe", "destroy", "terminate", "root-key", "irreversible", "hard-delete"] {
             assert_eq!(
                 classify_risk(keyword, None, None),
                 RiskLevel::Critical,
@@ -706,6 +733,25 @@ mod tests {
         assert!(!wildcard_match("", "nonempty"));
     }
 
+    #[test]
+    fn wildcard_prefix_anchored() {
+        assert!(wildcard_match("agent-*", "agent-1"));
+        assert!(!wildcard_match("agent-*", "rogue-agent-1"));
+    }
+
+    #[test]
+    fn wildcard_suffix_anchored() {
+        assert!(wildcard_match("*-prod", "staging-prod"));
+        assert!(!wildcard_match("*-prod", "prod-staging"));
+    }
+
+    #[test]
+    fn wildcard_prefix_and_suffix_anchored() {
+        assert!(wildcard_match("admin-*-prod", "admin-deploy-prod"));
+        assert!(!wildcard_match("admin-*-prod", "rogue-admin-deploy-prod"));
+        assert!(!wildcard_match("admin-*-prod", "admin-deploy-prod-extra"));
+    }
+
     // ── first_matching_rule ────────────────────────────────────
 
     fn make_request(action: &str, actor: &str, resource: Option<&str>) -> models::PolicyCheckRequest {
@@ -803,6 +849,51 @@ mod tests {
     fn first_matching_rule_no_rules_returns_none() {
         let req = make_request("read", "user-1", None);
         assert!(first_matching_rule(&[], &req, RiskLevel::Low).is_none());
+    }
+
+    #[test]
+    fn first_matching_rule_filters_by_resource() {
+        let rules = vec![PolicyRule {
+            id: "prod-only".into(),
+            effect: RuleEffect::Escalate,
+            action: "*".into(),
+            resource: "prod-*".into(),
+            actor: "*".into(),
+            min_risk: None,
+            reason: "prod resources require escalation".into(),
+        }];
+        // Exact prefix match
+        let req_prod = make_request("deploy", "user-1", Some("prod-db"));
+        assert!(first_matching_rule(&rules, &req_prod, RiskLevel::High).is_some());
+
+        // Should NOT match — "staging-prod-mirror" doesn't start with "prod-"
+        let req_staging = make_request("deploy", "user-1", Some("staging-prod-mirror"));
+        assert!(first_matching_rule(&rules, &req_staging, RiskLevel::High).is_none());
+
+        // No resource provided — empty string doesn't start with "prod-"
+        let req_none = make_request("deploy", "user-1", None);
+        assert!(first_matching_rule(&rules, &req_none, RiskLevel::High).is_none());
+    }
+
+    // ── classify_risk substring edge cases ─────────────────────
+
+    #[test]
+    fn risk_substring_collisions() {
+        // "readiness-check" contains "read" → Low (substring match is by design)
+        assert_eq!(
+            classify_risk("readiness-check", None, None),
+            RiskLevel::Low,
+        );
+        // "undelete" contains "delete" → High
+        assert_eq!(
+            classify_risk("undelete", None, None),
+            RiskLevel::High,
+        );
+        // "production-index" contains "production" (High) and "index" (Medium) → High wins
+        assert_eq!(
+            classify_risk("production-index", None, None),
+            RiskLevel::High,
+        );
     }
 
     // ── default_bundle ─────────────────────────────────────────
