@@ -36,6 +36,7 @@ jobs:
 
       - name: Post coverage comment on PR
         if: github.event_name == 'pull_request'
+        continue-on-error: true
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: coverage
