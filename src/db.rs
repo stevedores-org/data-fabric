@@ -91,7 +91,7 @@ pub async fn claim_next_task(
     };
 
     // Claim it atomically: only succeeds if still pending
-    db.prepare(
+    let res: D1Result = db.prepare(
         "UPDATE mcp_tasks SET status = 'running', agent_id = ?1, lease_expires_at = ?2 WHERE tenant_id = ?3 AND id = ?4 AND status = 'pending'",
     )
     .bind(&[
@@ -102,6 +102,14 @@ pub async fn claim_next_task(
     ])?
     .run()
     .await?;
+
+    let changed = res
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+    if !changed {
+        return Ok(None);
+    }
 
     // Update agent heartbeat
     db.prepare("UPDATE agents SET last_heartbeat = ?1 WHERE tenant_id = ?2 AND id = ?3")
@@ -435,25 +443,6 @@ pub async fn insert_events_bronze(
 /// Default max events per trace query (avoids unbounded result sets).
 pub const TRACE_DEFAULT_LIMIT: u32 = 1000;
 
-/// Total event count for a run (for trace response metadata). Issue #61. Scoped by tenant.
-pub async fn get_trace_count_for_run(
-    db: &D1Database,
-    tenant_id: &str,
-    run_id: &str,
-) -> Result<u32> {
-    let result: Option<TraceCountRow> = db
-        .prepare("SELECT COUNT(*) AS cnt FROM events_bronze WHERE tenant_id = ?1 AND run_id = ?2")
-        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
-        .first(None)
-        .await?;
-    Ok(result.map(|r| r.cnt as u32).unwrap_or(0))
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct TraceCountRow {
-    cnt: i64,
-}
-
 /// Fetch trace slice for a run (ordered by created_at). WS3 provenance. Limited by `limit` (default TRACE_DEFAULT_LIMIT).
 pub async fn get_trace_for_run(
     db: &D1Database,
@@ -476,6 +465,31 @@ pub async fn get_trace_for_run(
 
     let rows: Vec<TraceEventRow> = result.results()?;
     Ok(rows.into_iter().map(|r| r.into_trace_event()).collect())
+}
+
+/// Count total trace events for a run.
+pub async fn count_trace_events_for_run(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+) -> Result<u64> {
+    #[derive(Debug, serde::Deserialize)]
+    struct CountRow {
+        total: i64,
+    }
+
+    let result: D1Result = db
+        .prepare(
+            "SELECT COUNT(*) AS total
+             FROM events_bronze
+             WHERE tenant_id = ?1 AND run_id = ?2",
+        )
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
+        .all()
+        .await?;
+
+    let rows: Vec<CountRow> = result.results()?;
+    Ok(rows.first().map(|r| r.total.max(0) as u64).unwrap_or(0))
 }
 
 /// Insert into silver layer (sync promotion). Each row has its own id, bronze_id FK, entity_refs from event.
@@ -536,10 +550,27 @@ fn build_entity_refs(evt: &models::GraphEvent) -> Option<String> {
     if let Some(ref n) = evt.node_id {
         obj.insert("node_id".into(), serde_json::Value::String(n.clone()));
     }
+    if let Some(v) = payload_string_ref(evt.payload.as_ref(), "task_id") {
+        obj.insert("task_id".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = payload_string_ref(evt.payload.as_ref(), "artifact_id") {
+        obj.insert("artifact_id".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = payload_string_ref(evt.payload.as_ref(), "plan_id") {
+        obj.insert("plan_id".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = payload_string_ref(evt.payload.as_ref(), "tool_call_id") {
+        obj.insert("tool_call_id".into(), serde_json::Value::String(v));
+    }
     if obj.is_empty() {
         return None;
     }
     serde_json::to_string(&serde_json::Value::Object(obj)).ok()
+}
+
+fn payload_string_ref(payload: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    let obj = payload?.as_object()?;
+    obj.get(key)?.as_str().map(str::to_owned)
 }
 
 // ── WS2 Domain: Runs ─────────────────────────────────────────────
@@ -997,46 +1028,32 @@ pub async fn run_memory_gc(
     let now = now_iso();
     let limit = req.limit.clamp(1, 10_000) as i32;
 
-    let rows: Vec<MemoryGcRow> = db
+    // Use a single DELETE statement with a subquery to avoid D1 batch limits (max 100 statements).
+    // This efficiently removes up to `limit` expired or retired items in one round trip.
+    let res: D1Result = db
         .prepare(
-            "SELECT id, status FROM memory_index
-             WHERE tenant_id = ?1 AND (status = 'retired' OR (expires_at IS NOT NULL AND expires_at <= ?2))
-             ORDER BY indexed_at ASC
-             LIMIT ?3",
+            "DELETE FROM memory_index
+             WHERE tenant_id = ?1 AND id IN (
+                 SELECT id FROM memory_index
+                 WHERE tenant_id = ?1 AND (status = 'retired' OR (expires_at IS NOT NULL AND expires_at <= ?2))
+                 ORDER BY indexed_at ASC
+                 LIMIT ?3
+             )",
         )
         .bind(&[
             JsValue::from_str(tenant_id),
             JsValue::from_str(&now),
             JsValue::from(limit),
         ])?
-        .all()
-        .await?
-        .results()?;
+        .run()
+        .await?;
 
-    let scanned = rows.len();
-    if scanned == 0 {
-        return Ok(models::MemoryGcResponse {
-            scanned: 0,
-            retired: 0,
-            deleted: 0,
-        });
-    }
-
-    let retired_count = rows.iter().filter(|r| r.status == "retired").count();
-
-    let mut stmts = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let stmt = db
-            .prepare("DELETE FROM memory_index WHERE tenant_id = ?1 AND id = ?2")
-            .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(&row.id)])?;
-        stmts.push(stmt);
-    }
-    db.batch(stmts).await?;
+    let deleted = res.meta()?.and_then(|m| m.changes).unwrap_or(0) as usize;
 
     Ok(models::MemoryGcResponse {
-        scanned,
-        retired: retired_count,
-        deleted: scanned,
+        scanned: deleted,
+        retired: 0, // No longer distinguishing retired vs expired in the single-pass DELETE
+        deleted,
     })
 }
 
@@ -2091,12 +2108,6 @@ pub struct CheckpointRow {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct MemoryGcRow {
-    id: String,
-    status: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
 struct PercentileRow {
     latency_ms: Option<i64>,
 }
@@ -2261,8 +2272,10 @@ pub struct Ws2TaskResponse {
 
 // ── Provenance Links (WS3: causality chain) ─────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_relationship(
     db: &D1Database,
+    tenant_id: &str,
     rel_type: &str,
     from_kind: &str,
     from_id: &str,
@@ -2272,10 +2285,11 @@ pub async fn insert_relationship(
 ) -> Result<()> {
     let now = now_iso();
     db.prepare(
-        "INSERT OR IGNORE INTO relationships (rel_type, from_kind, from_id, to_kind, to_id, relation, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR IGNORE INTO relationships (tenant_id, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(rel_type),
         JsValue::from_str(from_kind),
         JsValue::from_str(from_id),
@@ -2295,6 +2309,7 @@ pub async fn insert_relationship(
 /// Walk the provenance chain from an entity. Direction "forward" follows from→to; "backward" follows to→from.
 pub async fn get_provenance_chain(
     db: &D1Database,
+    tenant_id: &str,
     kind: &str,
     id: &str,
     direction: &str,
@@ -2303,26 +2318,27 @@ pub async fn get_provenance_chain(
     let query = if direction == "backward" {
         "WITH RECURSIVE chain(depth, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at) AS (
            SELECT 0, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at
-             FROM relationships WHERE to_kind = ?1 AND to_id = ?2
+             FROM relationships WHERE tenant_id = ?1 AND to_kind = ?2 AND to_id = ?3
            UNION
            SELECT c.depth + 1, r.rel_type, r.from_kind, r.from_id, r.to_kind, r.to_id, r.relation, r.created_at
-             FROM relationships r JOIN chain c ON r.to_kind = c.from_kind AND r.to_id = c.from_id
-             WHERE c.depth < ?3
+             FROM relationships r JOIN chain c ON r.tenant_id = ?1 AND r.to_kind = c.from_kind AND r.to_id = c.from_id
+             WHERE c.depth < ?4
          ) SELECT * FROM chain ORDER BY depth"
     } else {
         "WITH RECURSIVE chain(depth, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at) AS (
            SELECT 0, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at
-             FROM relationships WHERE from_kind = ?1 AND from_id = ?2
+             FROM relationships WHERE tenant_id = ?1 AND from_kind = ?2 AND from_id = ?3
            UNION
            SELECT c.depth + 1, r.rel_type, r.from_kind, r.from_id, r.to_kind, r.to_id, r.relation, r.created_at
-             FROM relationships r JOIN chain c ON r.from_kind = c.to_kind AND r.from_id = c.to_id
-             WHERE c.depth < ?3
+             FROM relationships r JOIN chain c ON r.tenant_id = ?1 AND r.from_kind = c.to_kind AND r.from_id = c.to_id
+             WHERE c.depth < ?4
          ) SELECT * FROM chain ORDER BY depth"
     };
 
     let result: D1Result = db
         .prepare(query)
         .bind(&[
+            JsValue::from_str(tenant_id),
             JsValue::from_str(kind),
             JsValue::from_str(id),
             JsValue::from(max_hops),
@@ -2335,11 +2351,16 @@ pub async fn get_provenance_chain(
 }
 
 /// Extract implicit causality edges from a GraphEvent and insert them.
-pub async fn insert_causality_from_event(db: &D1Database, evt: &models::GraphEvent) -> Result<()> {
+pub async fn insert_causality_from_event(
+    db: &D1Database,
+    tenant_id: &str,
+    evt: &models::GraphEvent,
+) -> Result<()> {
     // run → node causality (original)
     if let (Some(ref run_id), Some(ref node_id)) = (&evt.run_id, &evt.node_id) {
         insert_relationship(
             db,
+            tenant_id,
             "causality",
             "run",
             run_id,
@@ -2360,17 +2381,37 @@ pub async fn insert_causality_from_event(db: &D1Database, evt: &models::GraphEve
 
         // run → plan
         if let (Some(rid), Some(pid)) = (run_id, plan_id) {
-            insert_relationship(db, "causality", "run", rid, "plan", pid, Some("planned")).await?;
+            insert_relationship(
+                db,
+                tenant_id,
+                "causality",
+                "run",
+                rid,
+                "plan",
+                pid,
+                Some("planned"),
+            )
+            .await?;
         }
         // plan → task
         if let (Some(pid), Some(tid)) = (plan_id, task_id) {
-            insert_relationship(db, "causality", "plan", pid, "task", tid, Some("scheduled"))
-                .await?;
+            insert_relationship(
+                db,
+                tenant_id,
+                "causality",
+                "plan",
+                pid,
+                "task",
+                tid,
+                Some("scheduled"),
+            )
+            .await?;
         }
         // task → tool_call
         if let (Some(tid), Some(tcid)) = (task_id, tool_call_id) {
             insert_relationship(
                 db,
+                tenant_id,
                 "causality",
                 "task",
                 tid,
@@ -2384,6 +2425,7 @@ pub async fn insert_causality_from_event(db: &D1Database, evt: &models::GraphEve
         if let (Some(tcid), Some(aid)) = (tool_call_id, artifact_id) {
             insert_relationship(
                 db,
+                tenant_id,
                 "causality",
                 "tool_call",
                 tcid,
@@ -2397,14 +2439,15 @@ pub async fn insert_causality_from_event(db: &D1Database, evt: &models::GraphEve
         if let Some(depends_on) = payload.get("depends_on").and_then(|v| v.as_array()) {
             if let Some(tid) = task_id {
                 let now = now_iso();
-                let mut stmts = Vec::with_capacity(depends_on.len());
-                for dep in depends_on {
+                let mut stmts = Vec::with_capacity(depends_on.len().min(INTEGRATION_BATCH_LIMIT));
+                for dep in depends_on.iter().take(INTEGRATION_BATCH_LIMIT) {
                     if let Some(dep_id) = dep.as_str() {
                         let stmt = db.prepare(
-                            "INSERT OR IGNORE INTO relationships (rel_type, from_kind, from_id, to_kind, to_id, relation, created_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            "INSERT OR IGNORE INTO relationships (tenant_id, rel_type, from_kind, from_id, to_kind, to_id, relation, created_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         )
                         .bind(&[
+                            JsValue::from_str(tenant_id),
                             JsValue::from_str("dependency"),
                             JsValue::from_str("task"),
                             JsValue::from_str(tid),
@@ -2429,6 +2472,7 @@ pub async fn insert_causality_from_event(db: &D1Database, evt: &models::GraphEve
 
 pub async fn upsert_run_summary(
     db: &D1Database,
+    tenant_id: &str,
     run_id: &str,
     actor: Option<&str>,
     event_type: &str,
@@ -2441,9 +2485,9 @@ pub async fn upsert_run_summary(
     // Atomic upsert: INSERT on first event, ON CONFLICT merge arrays + update counts.
     // json_group_array(DISTINCT ...) via subquery deduplicates actors/event_types.
     db.prepare(
-        "INSERT INTO run_summaries (run_id, event_count, first_event_at, last_event_at, actors, event_types, updated_at)
-         VALUES (?1, 1, ?2, ?2, ?3, ?4, ?5)
-         ON CONFLICT(run_id) DO UPDATE SET
+        "INSERT INTO run_summaries (tenant_id, run_id, event_count, first_event_at, last_event_at, actors, event_types, updated_at)
+         VALUES (?1, ?2, 1, ?3, ?3, ?4, ?5, ?6)
+         ON CONFLICT(tenant_id, run_id) DO UPDATE SET
            event_count = event_count + 1,
            first_event_at = MIN(first_event_at, excluded.first_event_at),
            last_event_at = MAX(last_event_at, excluded.last_event_at),
@@ -2468,6 +2512,7 @@ pub async fn upsert_run_summary(
            updated_at = excluded.updated_at",
     )
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(run_id),
         JsValue::from_str(created_at),
         JsValue::from_str(&serde_json::to_string(&actor_json).unwrap()),
@@ -2479,19 +2524,29 @@ pub async fn upsert_run_summary(
     Ok(())
 }
 
-pub async fn get_run_summary(db: &D1Database, run_id: &str) -> Result<Option<models::RunSummary>> {
+pub async fn get_run_summary(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+) -> Result<Option<models::RunSummary>> {
     let row: Option<RunSummaryRow> = db
-        .prepare("SELECT * FROM run_summaries WHERE run_id = ?1")
-        .bind(&[JsValue::from_str(run_id)])?
+        .prepare("SELECT * FROM run_summaries WHERE tenant_id = ?1 AND run_id = ?2")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
         .first(None)
         .await?;
     Ok(row.map(|r| r.into_summary()))
 }
 
-pub async fn list_run_summaries(db: &D1Database, limit: u32) -> Result<Vec<models::RunSummary>> {
+pub async fn list_run_summaries(
+    db: &D1Database,
+    tenant_id: &str,
+    limit: u32,
+) -> Result<Vec<models::RunSummary>> {
     let result: D1Result = db
-        .prepare("SELECT * FROM run_summaries ORDER BY updated_at DESC LIMIT ?1")
-        .bind(&[JsValue::from(limit)])?
+        .prepare(
+            "SELECT * FROM run_summaries WHERE tenant_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+        )
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from(limit)])?
         .all()
         .await?;
     let rows: Vec<RunSummaryRow> = result.results()?;
@@ -2631,6 +2686,8 @@ impl ProvenanceEdgeRow {
 
 #[derive(Debug, serde::Deserialize)]
 struct RunSummaryRow {
+    #[allow(dead_code)]
+    tenant_id: String,
     run_id: String,
     event_count: i32,
     first_event_at: Option<String>,
@@ -2837,6 +2894,86 @@ pub async fn touch_integration(
     Ok(())
 }
 
+pub async fn get_integration(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<crate::integrations::Integration>> {
+    let result: D1Result = db
+        .prepare(
+            "SELECT id, target, name, endpoint, api_version, status, config, created_at, last_seen_at
+             FROM integrations WHERE tenant_id = ?1 AND id = ?2",
+        )
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
+        .all()
+        .await?;
+
+    let rows: Vec<IntegrationRow> = result.results()?;
+    Ok(rows.into_iter().next().map(|r| r.into_integration()))
+}
+
+pub async fn update_integration(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &crate::integrations::UpdateIntegration,
+) -> Result<bool> {
+    let now = now_iso();
+    let mut sets = vec!["updated_at = ?3".to_string()];
+    let mut bind_idx = 4u32;
+    let mut bind_vals: Vec<JsValue> = vec![
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(id),
+        JsValue::from_str(&now),
+    ];
+
+    if let Some(ref name) = body.name {
+        sets.push(format!("name = ?{bind_idx}"));
+        bind_vals.push(JsValue::from_str(name));
+        bind_idx += 1;
+    }
+    if let Some(ref endpoint) = body.endpoint {
+        sets.push(format!("endpoint = ?{bind_idx}"));
+        bind_vals.push(JsValue::from_str(endpoint));
+        bind_idx += 1;
+    }
+    if let Some(ref status) = body.status {
+        sets.push(format!("status = ?{bind_idx}"));
+        bind_vals.push(JsValue::from_str(status));
+        bind_idx += 1;
+    }
+    if let Some(ref config) = body.config {
+        let json = serde_json::to_string(config)
+            .map_err(|e| Error::RustError(format!("config serialization: {e}")))?;
+        sets.push(format!("config = ?{bind_idx}"));
+        bind_vals.push(JsValue::from_str(&json));
+        let _ = bind_idx; // suppress unused warning
+    }
+
+    let sql = format!(
+        "UPDATE integrations SET {} WHERE tenant_id = ?1 AND id = ?2",
+        sets.join(", ")
+    );
+    let stmt = db.prepare(&sql);
+    let bound = stmt.bind(&bind_vals)?;
+    bound.run().await?;
+
+    // D1 doesn't return affected rows easily; verify the row exists
+    let exists = get_integration(db, tenant_id, id).await?.is_some();
+    Ok(exists)
+}
+
+pub async fn delete_integration(db: &D1Database, tenant_id: &str, id: &str) -> Result<bool> {
+    let existed = get_integration(db, tenant_id, id).await?.is_some();
+    if existed {
+        db.prepare("DELETE FROM integrations WHERE tenant_id = ?1 AND id = ?2")
+            .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
+            .run()
+            .await?;
+    }
+    Ok(existed)
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct IntegrationRow {
     id: String,
@@ -2967,5 +3104,46 @@ mod tests {
         let b = tokenize("graph event replay state");
         let c = tokenize("unrelated topic");
         assert!(jaccard_similarity(&a, &b) > jaccard_similarity(&a, &c));
+    }
+
+    #[test]
+    fn build_entity_refs_includes_payload_link_ids() {
+        let evt = models::GraphEvent {
+            run_id: Some("run-1".into()),
+            thread_id: Some("thread-1".into()),
+            event_type: "task.completed".into(),
+            node_id: Some("node-1".into()),
+            actor: Some("agent".into()),
+            payload: Some(serde_json::json!({
+                "task_id": "task-9",
+                "artifact_id": "artifact-2",
+                "plan_id": "plan-4",
+                "tool_call_id": "tool-call-7"
+            })),
+        };
+
+        let refs = build_entity_refs(&evt).expect("refs expected");
+        let parsed: serde_json::Value = serde_json::from_str(&refs).expect("valid json");
+        assert_eq!(parsed["run_id"], "run-1");
+        assert_eq!(parsed["thread_id"], "thread-1");
+        assert_eq!(parsed["node_id"], "node-1");
+        assert_eq!(parsed["task_id"], "task-9");
+        assert_eq!(parsed["artifact_id"], "artifact-2");
+        assert_eq!(parsed["plan_id"], "plan-4");
+        assert_eq!(parsed["tool_call_id"], "tool-call-7");
+    }
+
+    #[test]
+    fn build_entity_refs_returns_none_when_no_supported_refs() {
+        let evt = models::GraphEvent {
+            run_id: None,
+            thread_id: None,
+            event_type: "noop".into(),
+            node_id: None,
+            actor: None,
+            payload: Some(serde_json::json!({ "status": "ok" })),
+        };
+
+        assert!(build_entity_refs(&evt).is_none());
     }
 }

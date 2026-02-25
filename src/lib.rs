@@ -704,9 +704,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if truncated {
                 events.truncate(limit as usize);
             }
-            let total = db::get_trace_count_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
+            let total = db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
             let (total_meta, truncated_meta) =
-                build_trace_response_metadata(total as usize, truncated, has_valid_limit_param);
+                build_trace_response_metadata(total, truncated, has_valid_limit_param);
             timed_json_response(
                 started,
                 &models::TraceResponse {
@@ -724,8 +724,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("missing run_id", 400),
             };
             let url = req.url().ok();
-            let (limit, has_valid_hops_param) =
-                parse_limit_query_with_valid_presence(url, "hops", 100);
+            let (limit, has_valid_limit_param) =
+                parse_limit_query_with_valid_presence(url, "limit", 100);
             let d1 = ctx.env.d1("DB")?;
             let mut events =
                 db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
@@ -733,9 +733,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if truncated {
                 events.truncate(limit as usize);
             }
-            let total = db::get_trace_count_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
+            let total = db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
             let (total_meta, truncated_meta) =
-                build_trace_response_metadata(total as usize, truncated, has_valid_hops_param);
+                build_trace_response_metadata(total, truncated, has_valid_limit_param);
             Response::from_json(&models::TraceResponse {
                 run_id,
                 total: total_meta,
@@ -746,6 +746,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── Provenance Chain (WS3) ──────────────────────────────
         .get_async("/v1/provenance/:kind/:id", |req, ctx| async move {
             let started = js_sys::Date::now();
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let kind = match ctx.param("kind") {
                 Some(k) => k.to_string(),
                 None => return Response::error("missing kind", 400),
@@ -772,7 +773,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .unwrap_or(5u32)
                 .min(100);
             let d1 = ctx.env.d1("DB")?;
-            let edges = db::get_provenance_chain(&d1, &kind, &id, direction, hops).await?;
+            let edges =
+                db::get_provenance_chain(&d1, &tenant_ctx.tenant_id, &kind, &id, direction, hops)
+                    .await?;
             timed_json_response(
                 started,
                 &models::ProvenanceResponse {
@@ -785,21 +788,23 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             )
         })
         // ── Gold Layer: Run Summaries (WS3) ─────────────────────
-        .get_async("/v1/runs/:run_id/summary", |_req, ctx| async move {
+        .get_async("/v1/runs/:run_id/summary", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let run_id = ctx.param("run_id").unwrap().to_string();
             let d1 = ctx.env.d1("DB")?;
-            match db::get_run_summary(&d1, &run_id).await? {
+            match db::get_run_summary(&d1, &tenant_ctx.tenant_id, &run_id).await? {
                 Some(summary) => Response::from_json(&summary),
                 None => Response::error("run summary not found", 404),
             }
         })
         .get_async("/v1/gold/run-summaries", |req, ctx| async move {
             let started = js_sys::Date::now();
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
             let limit = parse_limit_query(req.url().ok(), "limit")
                 .unwrap_or(50)
                 .min(200);
             let d1 = ctx.env.d1("DB")?;
-            let summaries = db::list_run_summaries(&d1, limit).await?;
+            let summaries = db::list_run_summaries(&d1, &tenant_ctx.tenant_id, limit).await?;
             timed_json_response(started, &serde_json::json!({ "summaries": summaries }))
         })
         // ── Gold Layer: Task Dependency Graph (WS3: #58) ────────
@@ -864,6 +869,37 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let list = db::list_integrations(&d1, &tenant_ctx.tenant_id, limit).await?;
             Response::from_json(&serde_json::json!({ "integrations": list }))
         })
+        .get_async("/v1/integrations/:id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let id = ctx.param("id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            match db::get_integration(&d1, &tenant_ctx.tenant_id, &id).await? {
+                Some(integration) => Response::from_json(&integration),
+                None => Response::error("integration not found", 404),
+            }
+        })
+        .patch_async("/v1/integrations/:id", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let id = ctx.param("id").unwrap().to_string();
+            let body: integrations::UpdateIntegration = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            db::update_integration(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
+            match db::get_integration(&d1, &tenant_ctx.tenant_id, &id).await? {
+                Some(integration) => Response::from_json(&integration),
+                None => Response::error("integration not found", 404),
+            }
+        })
+        .delete_async("/v1/integrations/:id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let id = ctx.param("id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            let deleted = db::delete_integration(&d1, &tenant_ctx.tenant_id, &id).await?;
+            if deleted {
+                Response::from_json(&serde_json::json!({ "id": id, "deleted": true }))
+            } else {
+                Response::error("integration not found", 404)
+            }
+        })
         // ── WS6: oxidizedgraph intake ───────────────────────
         .post_async(
             "/v1/integrations/oxidizedgraph/events",
@@ -881,9 +917,23 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let now = db::now_iso();
 
                 let owned_events = integrations::oxidizedgraph::adapt_to_graph_events(&batch);
-                let event_count =
-                    ingest_events_bronze_silver(&d1, &tenant_ctx.tenant_id, owned_events, &now)
-                        .await?;
+                let event_count = match ingest_events_bronze_silver(
+                    &d1,
+                    &tenant_ctx.tenant_id,
+                    owned_events,
+                    &now,
+                )
+                .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        worker::console_log!("ERROR: oxidizedgraph event ingest failed: {e:?}");
+                        return degraded_response(
+                            "oxidizedgraph",
+                            "event ingestion temporarily unavailable",
+                        );
+                    }
+                };
 
                 let mut checkpoint_count = 0usize;
                 for evt in &batch.events {
@@ -921,17 +971,46 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let evt: integrations::aivcs::PipelineEvent = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
+            let bucket = ctx.env.bucket("ARTIFACTS")?;
 
             let mut run_id = None;
             if let Some(run) = integrations::aivcs::adapt_to_run(&evt) {
                 let id = generate_id()?;
-                db::create_run(&d1, &tenant_ctx.tenant_id, &id, &run).await?;
-                run_id = Some(id);
+                match db::create_run(&d1, &tenant_ctx.tenant_id, &id, &run).await {
+                    Ok(()) => run_id = Some(id),
+                    Err(e) => {
+                        worker::console_log!("ERROR: aivcs create_run failed: {e:?}");
+                        return degraded_response("aivcs", "run creation temporarily unavailable");
+                    }
+                }
             }
 
             let fabric_evt = integrations::aivcs::adapt_to_event(&evt);
             let evt_id = generate_id()?;
-            db::ingest_event(&d1, &tenant_ctx.tenant_id, &evt_id, &fabric_evt).await?;
+            if let Err(e) = db::ingest_event(&d1, &tenant_ctx.tenant_id, &evt_id, &fabric_evt).await
+            {
+                worker::console_log!("ERROR: aivcs ingest_event failed: {e:?}");
+                return degraded_response("aivcs", "event ingestion temporarily unavailable");
+            }
+
+            // Write artifact metadata to R2 so fabric tracks pipeline artifacts
+            let mut artifact_count = 0usize;
+            if let Some(ref artifacts) = evt.artifacts {
+                for art in artifacts {
+                    let r2_key = format!("{}/artifacts/{}", tenant_ctx.tenant_id, art.key);
+                    let meta = serde_json::to_vec(&serde_json::json!({
+                        "pipeline_id": evt.pipeline_id,
+                        "key": art.key,
+                        "content_type": art.content_type,
+                        "size_bytes": art.size_bytes,
+                        "checksum": art.checksum,
+                        "source": "aivcs",
+                    }))
+                    .map_err(|e| Error::RustError(e.to_string()))?;
+                    storage::put_blob(&bucket, &r2_key, meta).await?;
+                    artifact_count += 1;
+                }
+            }
 
             if let Err(e) = db::touch_integration(&d1, &tenant_ctx.tenant_id, "aivcs", None).await {
                 worker::console_log!("WARN: touch_integration(aivcs) failed: {e:?}");
@@ -941,6 +1020,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "source": "aivcs",
                 "event_id": evt_id,
                 "run_id": run_id,
+                "artifacts_stored": artifact_count,
             }))
         })
         // ── WS6: llama.rs intake ────────────────────────────
@@ -1002,10 +1082,37 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }))
             },
         )
+        // ── WS6: llama.rs context retrieval ──────────────────
+        .post_async(
+            "/v1/integrations/llama-rs/context",
+            |mut req, ctx| async move {
+                let tenant_ctx = tenant::tenant_from_request(&req)?;
+                let body: integrations::llama_rs::ContextRequest = req.json().await?;
+                let d1 = ctx.env.d1("DB")?;
+
+                let pack_req = integrations::llama_rs::adapt_to_context_pack(&body);
+                let response =
+                    db::build_context_pack(&d1, &tenant_ctx.tenant_id, &pack_req).await?;
+
+                if let Err(e) =
+                    db::touch_integration(&d1, &tenant_ctx.tenant_id, "llama_rs", None).await
+                {
+                    worker::console_log!("WARN: touch_integration(llama_rs) failed: {e:?}");
+                }
+
+                Response::from_json(&response)
+            },
+        )
         // ── Graph Events (M3) ─────────────────────────────────
         .post_async("/v1/graph-events", |mut req, ctx| async move {
             let started = js_sys::Date::now();
             let body: models::GraphEventBatch = req.json().await?;
+            if body.events.len() > db::INTEGRATION_BATCH_LIMIT {
+                return Response::error(
+                    format!("batch exceeds max {} events", db::INTEGRATION_BATCH_LIMIT),
+                    400,
+                );
+            }
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let now = js_sys::Date::new_0().to_iso_string().as_string().unwrap();
@@ -1090,7 +1197,7 @@ pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Conte
         // The queue consumer handles only causality edges and gold layer summaries.
 
         // Causality edges
-        if let Err(e) = db::insert_causality_from_event(&d1, &evt).await {
+        if let Err(e) = db::insert_causality_from_event(&d1, &tenant_id, &evt).await {
             worker::console_log!("[queue {}] causality insert error: {}", queue_name, e);
         }
 
@@ -1118,9 +1225,15 @@ pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Conte
 
         // Gold layer summary
         if let Some(ref run_id) = evt.run_id {
-            if let Err(e) =
-                db::upsert_run_summary(&d1, run_id, evt.actor.as_deref(), &evt.event_type, &now)
-                    .await
+            if let Err(e) = db::upsert_run_summary(
+                &d1,
+                &tenant_id,
+                run_id,
+                evt.actor.as_deref(),
+                &evt.event_type,
+                &now,
+            )
+            .await
             {
                 worker::console_log!("[queue {}] run summary upsert error: {}", queue_name, e);
             }
@@ -1181,6 +1294,22 @@ async fn ingest_events_bronze_silver(
     Ok(count)
 }
 
+/// Build a 503 response for graceful degradation when the fabric is unavailable.
+/// Used by integration intake handlers to signal temporary unavailability
+/// so clients can retry rather than treating the failure as permanent.
+fn degraded_response(source: &str, detail: &str) -> Result<Response> {
+    let body = serde_json::json!({
+        "source": source,
+        "status": "degraded",
+        "detail": detail,
+        "retry_after_seconds": 5,
+    });
+    let mut resp = Response::from_json(&body)?;
+    let _ = resp.headers_mut().set("Retry-After", "5");
+    // Override status to 503
+    Ok(resp.with_status(503))
+}
+
 /// Parse a numeric query param (e.g. limit, hops). Returns None if URL is None or param missing/invalid.
 fn parse_limit_query(url: Option<worker::Url>, param: &str) -> Option<u32> {
     let url = url?;
@@ -1203,10 +1332,10 @@ fn parse_limit_query_with_valid_presence(
 /// - `total` is emitted only when the caller supplied a valid bound and the result is not truncated.
 /// - `truncated` is emitted when truncation happened or when the caller supplied a valid bound.
 fn build_trace_response_metadata(
-    event_count: usize,
+    event_count: u64,
     truncated: bool,
     has_valid_bound_param: bool,
-) -> (Option<usize>, Option<bool>) {
+) -> (Option<u64>, Option<bool>) {
     let total = if has_valid_bound_param && !truncated {
         Some(event_count)
     } else {
