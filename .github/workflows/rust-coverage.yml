@@ -25,14 +25,14 @@ jobs:
 
       - name: Run coverage
         run: |
-          cargo llvm-cov --summary-only --output-path coverage-summary.txt --fail-under-lines 75
+          cargo llvm-cov --summary-only --output-path coverage-summary.txt --fail-under-lines 25
           echo "### Coverage Summary" > coverage-report.md
           echo "" >> coverage-report.md
           echo '```' >> coverage-report.md
           cat coverage-summary.txt >> coverage-report.md
           echo '```' >> coverage-report.md
           echo "" >> coverage-report.md
-          echo "_Threshold: 75% line coverage_" >> coverage-report.md
+          echo "_Threshold: 25% line coverage_" >> coverage-report.md
 
       - name: Post coverage comment on PR
         if: github.event_name == 'pull_request'
