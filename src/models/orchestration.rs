@@ -226,6 +226,7 @@ pub struct VerificationGateResult {
 /// Replay verification response with variance and gate evaluation.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ReplayExecuteResponse {
+    pub evidence_id: String,
     pub run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_run_id: Option<String>,
@@ -237,6 +238,29 @@ pub struct ReplayExecuteResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_classification: Option<FailureClass>,
     pub verification: VerificationGateResult,
+}
+
+/// Persisted verification evidence for replay and promotion decisions.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct VerificationEvidence {
+    pub id: String,
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_run_id: Option<String>,
+    pub status: String,
+    pub step_count: i32,
+    pub drift_count: i32,
+    pub drift_ratio_percent: f64,
+    pub within_variance: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_classification: Option<FailureClass>,
+    pub tests_passed: bool,
+    pub policy_approved: bool,
+    pub provenance_complete: bool,
+    pub eligible_for_promotion: bool,
+    pub confidence_score: i32,
+    pub failed_gates: Vec<String>,
+    pub created_at: String,
 }
 
 // ── Common ─────────────────────────────────────────────────────

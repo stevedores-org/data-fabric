@@ -1787,6 +1787,95 @@ pub async fn list_policy_decisions(
     result.results()
 }
 
+pub async fn create_verification_evidence(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    response: &models::ReplayExecuteResponse,
+) -> Result<()> {
+    let now = now_iso();
+    let failure_classification = response
+        .failure_classification
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| Error::RustError(format!("failure_classification serialization: {e}")))?
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
+    let failed_gates_json = serde_json::to_string(&response.verification.failed_gates)
+        .map_err(|e| Error::RustError(format!("failed_gates serialization: {e}")))?;
+
+    db.prepare(
+        "INSERT INTO verification_evidence (
+            tenant_id, id, run_id, baseline_run_id, status,
+            step_count, drift_count, drift_ratio_percent, within_variance,
+            failure_classification,
+            tests_passed, policy_approved, provenance_complete,
+            eligible_for_promotion, confidence_score, failed_gates,
+            created_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            ?6, ?7, ?8, ?9,
+            ?10,
+            ?11, ?12, ?13,
+            ?14, ?15, ?16,
+            ?17
+         )",
+    )
+    .bind(&[
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(id),
+        JsValue::from_str(&response.run_id),
+        response
+            .baseline_run_id
+            .as_ref()
+            .map(|s| JsValue::from_str(s))
+            .unwrap_or(JsValue::NULL),
+        JsValue::from_str(&response.status),
+        JsValue::from(response.step_count as i32),
+        JsValue::from(response.drift_count as i32),
+        JsValue::from(response.drift_ratio_percent),
+        JsValue::from(response.within_variance),
+        failure_classification
+            .as_ref()
+            .map(|s| JsValue::from_str(s))
+            .unwrap_or(JsValue::NULL),
+        JsValue::from(response.verification.tests_passed),
+        JsValue::from(response.verification.policy_approved),
+        JsValue::from(response.verification.provenance_complete),
+        JsValue::from(response.verification.eligible_for_promotion),
+        JsValue::from(response.verification.confidence_score as i32),
+        JsValue::from_str(&failed_gates_json),
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
+}
+
+pub async fn list_verification_evidence(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: Option<&str>,
+    limit: u32,
+) -> Result<Vec<VerificationEvidenceRow>> {
+    let mut bindings: Vec<JsValue> = vec![JsValue::from_str(tenant_id)];
+    let mut idx = 2u32;
+    let mut where_clause = "WHERE tenant_id = ?1".to_string();
+    if let Some(run_id) = run_id {
+        where_clause.push_str(&format!(" AND run_id = ?{idx}"));
+        bindings.push(JsValue::from_str(run_id));
+        idx += 1;
+    }
+
+    let query = format!(
+        "SELECT * FROM verification_evidence {where_clause} ORDER BY created_at DESC LIMIT ?{idx}"
+    );
+    bindings.push(JsValue::from(limit));
+    let result: D1Result = db.prepare(&query).bind(&bindings)?.all().await?;
+    result.results()
+}
+
 pub async fn provision_tenant(
     db: &D1Database,
     body: &models::TenantProvisionRequest,
@@ -2783,6 +2872,57 @@ impl PolicyDecisionRow {
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct VerificationEvidenceRow {
+    pub id: String,
+    pub run_id: String,
+    pub baseline_run_id: Option<String>,
+    pub status: String,
+    pub step_count: i32,
+    pub drift_count: i32,
+    pub drift_ratio_percent: f64,
+    pub within_variance: i32,
+    pub failure_classification: Option<String>,
+    pub tests_passed: i32,
+    pub policy_approved: i32,
+    pub provenance_complete: i32,
+    pub eligible_for_promotion: i32,
+    pub confidence_score: i32,
+    pub failed_gates: Option<String>,
+    pub created_at: String,
+}
+
+impl VerificationEvidenceRow {
+    pub fn into_response(self) -> models::VerificationEvidence {
+        let failure_classification = self.failure_classification.and_then(|value| {
+            serde_json::from_value::<models::FailureClass>(serde_json::Value::String(value)).ok()
+        });
+
+        models::VerificationEvidence {
+            id: self.id,
+            run_id: self.run_id,
+            baseline_run_id: self.baseline_run_id,
+            status: self.status,
+            step_count: self.step_count,
+            drift_count: self.drift_count,
+            drift_ratio_percent: self.drift_ratio_percent,
+            within_variance: self.within_variance != 0,
+            failure_classification,
+            tests_passed: self.tests_passed != 0,
+            policy_approved: self.policy_approved != 0,
+            provenance_complete: self.provenance_complete != 0,
+            eligible_for_promotion: self.eligible_for_promotion != 0,
+            confidence_score: self.confidence_score,
+            failed_gates: self
+                .failed_gates
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .unwrap_or_default(),
+            created_at: self.created_at,
+        }
+    }
+}
+
 fn lease_time(seconds: u64) -> String {
     let now = js_sys::Date::now();
     let future = js_sys::Date::new(&JsValue::from_f64(now + (seconds as f64 * 1000.0)));
@@ -3104,6 +3244,37 @@ mod tests {
         let b = tokenize("graph event replay state");
         let c = tokenize("unrelated topic");
         assert!(jaccard_similarity(&a, &b) > jaccard_similarity(&a, &c));
+    }
+
+    #[test]
+    fn verification_evidence_row_into_response_parses_fields() {
+        let row = VerificationEvidenceRow {
+            id: "ve1".into(),
+            run_id: "r1".into(),
+            baseline_run_id: Some("r0".into()),
+            status: "needs_review".into(),
+            step_count: 8,
+            drift_count: 2,
+            drift_ratio_percent: 25.0,
+            within_variance: 0,
+            failure_classification: Some("environmental".into()),
+            tests_passed: 1,
+            policy_approved: 1,
+            provenance_complete: 0,
+            eligible_for_promotion: 0,
+            confidence_score: 75,
+            failed_gates: Some("[\"provenance_complete\"]".into()),
+            created_at: "2026-02-25T00:00:00.000Z".into(),
+        };
+
+        let parsed = row.into_response();
+        assert_eq!(parsed.id, "ve1");
+        assert_eq!(
+            parsed.failure_classification,
+            Some(models::FailureClass::Environmental)
+        );
+        assert_eq!(parsed.failed_gates, vec!["provenance_complete"]);
+        assert!(!parsed.within_variance);
     }
 
     #[test]
