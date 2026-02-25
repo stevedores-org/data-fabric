@@ -11,8 +11,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  cargo-ci:
-    name: cargo-ci (fmt, clippy, check, test)
+  local-ci:
+    name: local-ci (fmt, clippy, check, test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,14 +23,32 @@ jobs:
           target: wasm32-unknown-unknown
           components: rustfmt, clippy
 
-      - name: Run fmt
-        run: cargo fmt --all -- --check
+      - name: Install local-ci
+        run: go install github.com/stevedores-org/local-ci@latest
 
-      - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Run local-ci
+        run: local-ci --no-cache --json | tee local-ci-results.json
 
-      - name: Run wasm check
-        run: cargo check --target wasm32-unknown-unknown
+      - name: Post results to GitHub Actions
+        if: always()
+        run: |
+          if [ -f local-ci-results.json ]; then
+            jq -r '.results[] | if .status == "pass" then "::notice title=\(.name)::✓ \(.name) passed (\(.duration_ms)ms)\(if .cache_hit then " [cached]" else "" end)"
+            elif .status == "fail" then "::error title=\(.name)::✗ \(.name) failed (\(.duration_ms)ms)\n\(.error // .output // "")"
+            else "::warning title=\(.name)::\(.name) status: \(.status)" end' local-ci-results.json
 
-      - name: Run tests
-        run: cargo test
+            passed=$(jq '.passed' local-ci-results.json)
+            failed=$(jq '.failed' local-ci-results.json)
+            duration=$(jq '.duration_ms' local-ci-results.json)
+            echo "### local-ci Summary" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Passed | $passed |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Failed | $failed |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Duration | ${duration}ms |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+
+            jq -r '.results[] | "| \(.name) | \(.status) | \(.duration_ms)ms | \(if .cache_hit then "cached" else "executed" end) |"' local-ci-results.json | \
+              (echo "| Stage | Status | Duration | Cache |"; echo "|-------|--------|----------|-------|"; cat) >> "$GITHUB_STEP_SUMMARY"
+          fi
