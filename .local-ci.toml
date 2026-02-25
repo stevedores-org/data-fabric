@@ -2,21 +2,28 @@
 # See: https://github.com/stevedores-org/local-ci
 
 [cache]
-enabled = true
-dir = ".local-ci-cache"
+skip_dirs = [".git", "target", ".github", "scripts", ".claude"]
+include_patterns = ["*.rs", "*.toml"]
 
 [stages.fmt]
+command = ["cargo", "fmt", "--all", "--", "--check"]
+fix_command = ["cargo", "fmt", "--all"]
+timeout = 120
 enabled = true
 
 [stages.clippy]
+command = ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]
+timeout = 600
 enabled = true
 
 [stages.check]
+command = ["cargo", "check", "--target", "wasm32-unknown-unknown"]
+timeout = 600
 enabled = true
-# wasm32 target check
-cmd = ["cargo", "check", "--target", "wasm32-unknown-unknown"]
 
 [stages.test]
+command = ["cargo", "test"]
+timeout = 1200
 enabled = true
 
 # Optional cargo tools — disabled until installed
@@ -31,3 +38,10 @@ enabled = false
 
 [stages.taplo]
 enabled = false
+
+[dependencies]
+required = []
+optional = []
+
+[workspace]
+exclude = []
