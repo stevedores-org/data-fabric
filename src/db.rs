@@ -91,7 +91,7 @@ pub async fn claim_next_task(
     };
 
     // Claim it atomically: only succeeds if still pending
-    db.prepare(
+    let res: D1Result = db.prepare(
         "UPDATE mcp_tasks SET status = 'running', agent_id = ?1, lease_expires_at = ?2 WHERE tenant_id = ?3 AND id = ?4 AND status = 'pending'",
     )
     .bind(&[
@@ -102,6 +102,14 @@ pub async fn claim_next_task(
     ])?
     .run()
     .await?;
+
+    let changed = res
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+    if !changed {
+        return Ok(None);
+    }
 
     // Update agent heartbeat
     db.prepare("UPDATE agents SET last_heartbeat = ?1 WHERE tenant_id = ?2 AND id = ?3")
