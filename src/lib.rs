@@ -724,8 +724,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("missing run_id", 400),
             };
             let url = req.url().ok();
-            let (limit, has_valid_hops_param) =
-                parse_limit_query_with_valid_presence(url, "hops", 100);
+            let (limit, has_valid_limit_param) =
+                parse_limit_query_with_valid_presence(url, "limit", 100);
             let d1 = ctx.env.d1("DB")?;
             let mut events =
                 db::get_trace_for_run(&d1, &tenant_ctx.tenant_id, &run_id, limit + 1).await?;
@@ -735,7 +735,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
             let total = db::count_trace_events_for_run(&d1, &tenant_ctx.tenant_id, &run_id).await?;
             let (total_meta, truncated_meta) =
-                build_trace_response_metadata(total, truncated, has_valid_hops_param);
+                build_trace_response_metadata(total, truncated, has_valid_limit_param);
             Response::from_json(&models::TraceResponse {
                 run_id,
                 total: total_meta,
