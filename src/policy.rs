@@ -398,8 +398,35 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
         return p == v;
     }
     let parts: Vec<&str> = p.split('*').collect();
+    // parts[0] is the prefix (empty if pattern starts with '*')
+    // parts[last] is the suffix (empty if pattern ends with '*')
     let mut pos = 0usize;
-    for part in parts.iter().filter(|s| !s.is_empty()) {
+    let end = v.len();
+
+    // Anchor prefix: if pattern does not start with '*', value must start with first segment.
+    if !parts[0].is_empty() {
+        if !v.starts_with(parts[0]) {
+            return false;
+        }
+        pos = parts[0].len();
+    }
+
+    // Anchor suffix: if pattern does not end with '*', value must end with last segment.
+    let last = parts[parts.len() - 1];
+    if !last.is_empty() {
+        if !v.ends_with(last) {
+            return false;
+        }
+        // Prevent suffix region from being consumed by interior matches.
+        let suffix_start = end - last.len();
+        if suffix_start < pos {
+            return false;
+        }
+    }
+
+    // Match interior segments (skip first and last, they are anchored above).
+    let interior = &parts[1..parts.len().saturating_sub(1)];
+    for part in interior.iter().filter(|s| !s.is_empty()) {
         if let Some(found) = v[pos..].find(part) {
             pos += found + part.len();
         } else {
@@ -506,6 +533,8 @@ fn random_hex_id() -> Result<String> {
 mod tests {
     use super::*;
 
+    // ── classify_risk ──────────────────────────────────────────
+
     #[test]
     fn risk_classification_matches_expected() {
         assert_eq!(
@@ -524,9 +553,398 @@ mod tests {
     }
 
     #[test]
+    fn risk_critical_keywords() {
+        for keyword in ["wipe", "destroy", "terminate", "root-key", "irreversible", "hard-delete"] {
+            assert_eq!(
+                classify_risk(keyword, None, None),
+                RiskLevel::Critical,
+                "expected Critical for action '{keyword}'"
+            );
+        }
+    }
+
+    #[test]
+    fn risk_high_keywords() {
+        for keyword in [
+            "deploy", "delete", "drop", "credential", "secret", "production", "prod", "revoke",
+            "merge-main", "push-main",
+        ] {
+            assert_eq!(
+                classify_risk(keyword, None, None),
+                RiskLevel::High,
+                "expected High for action '{keyword}'"
+            );
+        }
+    }
+
+    #[test]
+    fn risk_medium_keywords() {
+        for keyword in ["create", "update", "write", "put", "patch", "commit", "index"] {
+            assert_eq!(
+                classify_risk(keyword, None, None),
+                RiskLevel::Medium,
+                "expected Medium for action '{keyword}'"
+            );
+        }
+    }
+
+    #[test]
+    fn risk_low_keywords() {
+        for keyword in [
+            "read", "get", "list", "query", "search", "status", "health", "trace",
+        ] {
+            assert_eq!(
+                classify_risk(keyword, None, None),
+                RiskLevel::Low,
+                "expected Low for action '{keyword}'"
+            );
+        }
+    }
+
+    #[test]
+    fn risk_unknown_action_defaults_to_medium() {
+        assert_eq!(
+            classify_risk("frobnicate", None, None),
+            RiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn risk_is_case_insensitive() {
+        assert_eq!(classify_risk("DEPLOY", None, None), RiskLevel::High);
+        assert_eq!(classify_risk("Read", None, None), RiskLevel::Low);
+        assert_eq!(classify_risk("HARD-DELETE", None, None), RiskLevel::Critical);
+    }
+
+    #[test]
+    fn risk_picks_up_keywords_from_resource() {
+        assert_eq!(
+            classify_risk("unknown-action", Some("production-db"), None),
+            RiskLevel::High,
+        );
+    }
+
+    #[test]
+    fn risk_picks_up_keywords_from_context() {
+        let ctx = serde_json::json!({"env": "production"});
+        assert_eq!(
+            classify_risk("run-job", None, Some(&ctx)),
+            RiskLevel::High,
+        );
+    }
+
+    #[test]
+    fn risk_critical_overrides_high() {
+        // "hard-delete" is Critical, "prod" would be High — Critical wins.
+        assert_eq!(
+            classify_risk("hard-delete", Some("prod"), None),
+            RiskLevel::Critical,
+        );
+    }
+
+    // ── RiskLevel ordering ─────────────────────────────────────
+
+    #[test]
+    fn risk_level_ordering() {
+        assert!(RiskLevel::Low < RiskLevel::Medium);
+        assert!(RiskLevel::Medium < RiskLevel::High);
+        assert!(RiskLevel::High < RiskLevel::Critical);
+    }
+
+    // ── classify_action_class ──────────────────────────────────
+
+    #[test]
+    fn action_class_deploy() {
+        assert_eq!(classify_action_class("deploy-prod", RiskLevel::High), "deploy");
+    }
+
+    #[test]
+    fn action_class_delete() {
+        assert_eq!(classify_action_class("delete-user", RiskLevel::High), "delete");
+        assert_eq!(classify_action_class("drop-table", RiskLevel::High), "delete");
+    }
+
+    #[test]
+    fn action_class_falls_back_to_risk() {
+        assert_eq!(classify_action_class("frobnicate", RiskLevel::Low), "read");
+        assert_eq!(classify_action_class("frobnicate", RiskLevel::Medium), "write");
+        assert_eq!(classify_action_class("frobnicate", RiskLevel::High), "high_risk");
+        assert_eq!(classify_action_class("frobnicate", RiskLevel::Critical), "critical");
+    }
+
+    // ── default_rate_limit_for ─────────────────────────────────
+
+    #[test]
+    fn default_rate_limits_scale_with_risk() {
+        let low = default_rate_limit_for(RiskLevel::Low);
+        let med = default_rate_limit_for(RiskLevel::Medium);
+        let high = default_rate_limit_for(RiskLevel::High);
+        let crit = default_rate_limit_for(RiskLevel::Critical);
+
+        assert!(low.max_requests > med.max_requests);
+        assert!(med.max_requests > high.max_requests);
+        assert!(high.max_requests > crit.max_requests);
+    }
+
+    #[test]
+    fn default_rate_limit_action_classes() {
+        assert_eq!(default_rate_limit_for(RiskLevel::Low).action_class, "read");
+        assert_eq!(default_rate_limit_for(RiskLevel::Medium).action_class, "write");
+        assert_eq!(default_rate_limit_for(RiskLevel::High).action_class, "high_risk");
+        assert_eq!(default_rate_limit_for(RiskLevel::Critical).action_class, "critical");
+    }
+
+    // ── wildcard_match ─────────────────────────────────────────
+
+    #[test]
     fn wildcard_matching_works() {
         assert!(wildcard_match("*deploy*", "safe_deploy_prod"));
         assert!(wildcard_match("agent-*", "agent-1"));
         assert!(!wildcard_match("agent-*", "service-1"));
+    }
+
+    #[test]
+    fn wildcard_star_matches_everything() {
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("*", ""));
+    }
+
+    #[test]
+    fn wildcard_exact_match_no_star() {
+        assert!(wildcard_match("hello", "hello"));
+        assert!(!wildcard_match("hello", "world"));
+    }
+
+    #[test]
+    fn wildcard_case_insensitive() {
+        assert!(wildcard_match("DEPLOY*", "deploy-prod"));
+        assert!(wildcard_match("*PROD", "staging-prod"));
+    }
+
+    #[test]
+    fn wildcard_multiple_stars() {
+        assert!(wildcard_match("*deploy*prod*", "safe_deploy_to_prod_env"));
+        assert!(!wildcard_match("*deploy*prod*", "safe_stage_to_dev_env"));
+    }
+
+    #[test]
+    fn wildcard_empty_pattern_and_value() {
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "nonempty"));
+    }
+
+    #[test]
+    fn wildcard_prefix_anchored() {
+        assert!(wildcard_match("agent-*", "agent-1"));
+        assert!(!wildcard_match("agent-*", "rogue-agent-1"));
+    }
+
+    #[test]
+    fn wildcard_suffix_anchored() {
+        assert!(wildcard_match("*-prod", "staging-prod"));
+        assert!(!wildcard_match("*-prod", "prod-staging"));
+    }
+
+    #[test]
+    fn wildcard_prefix_and_suffix_anchored() {
+        assert!(wildcard_match("admin-*-prod", "admin-deploy-prod"));
+        assert!(!wildcard_match("admin-*-prod", "rogue-admin-deploy-prod"));
+        assert!(!wildcard_match("admin-*-prod", "admin-deploy-prod-extra"));
+    }
+
+    // ── first_matching_rule ────────────────────────────────────
+
+    fn make_request(action: &str, actor: &str, resource: Option<&str>) -> models::PolicyCheckRequest {
+        models::PolicyCheckRequest {
+            action: action.to_string(),
+            actor: actor.to_string(),
+            resource: resource.map(|s| s.to_string()),
+            context: None,
+            run_id: None,
+        }
+    }
+
+    #[test]
+    fn first_matching_rule_matches_action_wildcard() {
+        let rules = vec![PolicyRule {
+            id: "deny-all-deploys".into(),
+            effect: RuleEffect::Deny,
+            action: "*deploy*".into(),
+            resource: "*".into(),
+            actor: "*".into(),
+            min_risk: None,
+            reason: "no deploys".into(),
+        }];
+        let req = make_request("deploy-prod", "user-1", None);
+        let matched = first_matching_rule(&rules, &req, RiskLevel::High);
+        assert_eq!(matched.unwrap().id, "deny-all-deploys");
+    }
+
+    #[test]
+    fn first_matching_rule_skips_below_min_risk() {
+        let rules = vec![PolicyRule {
+            id: "high-only".into(),
+            effect: RuleEffect::Deny,
+            action: "*".into(),
+            resource: "*".into(),
+            actor: "*".into(),
+            min_risk: Some(RiskLevel::High),
+            reason: "only high risk".into(),
+        }];
+        let req = make_request("read-file", "user-1", None);
+        // Low risk should not match a rule with min_risk=High
+        assert!(first_matching_rule(&rules, &req, RiskLevel::Low).is_none());
+        // High risk should match
+        assert!(first_matching_rule(&rules, &req, RiskLevel::High).is_some());
+    }
+
+    #[test]
+    fn first_matching_rule_returns_first_match() {
+        let rules = vec![
+            PolicyRule {
+                id: "first".into(),
+                effect: RuleEffect::Allow,
+                action: "*".into(),
+                resource: "*".into(),
+                actor: "*".into(),
+                min_risk: None,
+                reason: "first rule".into(),
+            },
+            PolicyRule {
+                id: "second".into(),
+                effect: RuleEffect::Deny,
+                action: "*".into(),
+                resource: "*".into(),
+                actor: "*".into(),
+                min_risk: None,
+                reason: "second rule".into(),
+            },
+        ];
+        let req = make_request("anything", "anyone", None);
+        assert_eq!(
+            first_matching_rule(&rules, &req, RiskLevel::Medium).unwrap().id,
+            "first"
+        );
+    }
+
+    #[test]
+    fn first_matching_rule_filters_by_actor() {
+        let rules = vec![PolicyRule {
+            id: "admin-only".into(),
+            effect: RuleEffect::Allow,
+            action: "*".into(),
+            resource: "*".into(),
+            actor: "admin-*".into(),
+            min_risk: None,
+            reason: "admin only".into(),
+        }];
+        let req_user = make_request("read", "user-1", None);
+        assert!(first_matching_rule(&rules, &req_user, RiskLevel::Low).is_none());
+
+        let req_admin = make_request("read", "admin-bob", None);
+        assert!(first_matching_rule(&rules, &req_admin, RiskLevel::Low).is_some());
+    }
+
+    #[test]
+    fn first_matching_rule_no_rules_returns_none() {
+        let req = make_request("read", "user-1", None);
+        assert!(first_matching_rule(&[], &req, RiskLevel::Low).is_none());
+    }
+
+    #[test]
+    fn first_matching_rule_filters_by_resource() {
+        let rules = vec![PolicyRule {
+            id: "prod-only".into(),
+            effect: RuleEffect::Escalate,
+            action: "*".into(),
+            resource: "prod-*".into(),
+            actor: "*".into(),
+            min_risk: None,
+            reason: "prod resources require escalation".into(),
+        }];
+        // Exact prefix match
+        let req_prod = make_request("deploy", "user-1", Some("prod-db"));
+        assert!(first_matching_rule(&rules, &req_prod, RiskLevel::High).is_some());
+
+        // Should NOT match — "staging-prod-mirror" doesn't start with "prod-"
+        let req_staging = make_request("deploy", "user-1", Some("staging-prod-mirror"));
+        assert!(first_matching_rule(&rules, &req_staging, RiskLevel::High).is_none());
+
+        // No resource provided — empty string doesn't start with "prod-"
+        let req_none = make_request("deploy", "user-1", None);
+        assert!(first_matching_rule(&rules, &req_none, RiskLevel::High).is_none());
+    }
+
+    // ── classify_risk substring edge cases ─────────────────────
+
+    #[test]
+    fn risk_substring_collisions() {
+        // "readiness-check" contains "read" → Low (substring match is by design)
+        assert_eq!(
+            classify_risk("readiness-check", None, None),
+            RiskLevel::Low,
+        );
+        // "undelete" contains "delete" → High
+        assert_eq!(
+            classify_risk("undelete", None, None),
+            RiskLevel::High,
+        );
+        // "production-index" contains "production" (High) and "index" (Medium) → High wins
+        assert_eq!(
+            classify_risk("production-index", None, None),
+            RiskLevel::High,
+        );
+    }
+
+    // ── default_bundle ─────────────────────────────────────────
+
+    #[test]
+    fn default_bundle_has_expected_structure() {
+        let bundle = default_bundle();
+        assert!(!bundle.version.is_empty());
+        assert!(!bundle.rules.is_empty());
+        assert!(!bundle.rate_limits.is_empty());
+
+        // Verify known rule IDs exist
+        let rule_ids: Vec<&str> = bundle.rules.iter().map(|r| r.id.as_str()).collect();
+        assert!(rule_ids.contains(&"deny-credential-exfiltration"));
+        assert!(rule_ids.contains(&"escalate-prod-deploy"));
+        assert!(rule_ids.contains(&"allow-read"));
+    }
+
+    // ── serde round-trips ──────────────────────────────────────
+
+    #[test]
+    fn risk_level_serde_roundtrip() {
+        for level in [RiskLevel::Low, RiskLevel::Medium, RiskLevel::High, RiskLevel::Critical] {
+            let json = serde_json::to_string(&level).unwrap();
+            let back: RiskLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, level);
+        }
+    }
+
+    #[test]
+    fn risk_level_serde_snake_case() {
+        assert_eq!(serde_json::to_string(&RiskLevel::Low).unwrap(), "\"low\"");
+        assert_eq!(serde_json::to_string(&RiskLevel::Critical).unwrap(), "\"critical\"");
+    }
+
+    #[test]
+    fn policy_bundle_serde_roundtrip() {
+        let bundle = default_bundle();
+        let json = serde_json::to_string(&bundle).unwrap();
+        let back: PolicyBundle = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.version, bundle.version);
+        assert_eq!(back.rules.len(), bundle.rules.len());
+        assert_eq!(back.rate_limits.len(), bundle.rate_limits.len());
+    }
+
+    #[test]
+    fn policy_rule_default_fields_are_wildcard() {
+        let json = r#"{"id":"test","effect":"allow","reason":"test rule"}"#;
+        let rule: PolicyRule = serde_json::from_str(json).unwrap();
+        assert_eq!(rule.action, "*");
+        assert_eq!(rule.resource, "*");
+        assert_eq!(rule.actor, "*");
     }
 }

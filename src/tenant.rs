@@ -86,3 +86,151 @@ fn parse_role(v: &str) -> Result<TenantRole> {
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(role: TenantRole) -> TenantContext {
+        TenantContext {
+            tenant_id: "tenant-42".to_string(),
+            role,
+            federation_allowed: false,
+        }
+    }
+
+    // ── parse_role ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_role_valid_values() {
+        assert_eq!(parse_role("viewer").unwrap(), TenantRole::Viewer);
+        assert_eq!(parse_role("builder").unwrap(), TenantRole::Builder);
+        assert_eq!(parse_role("admin").unwrap(), TenantRole::Admin);
+    }
+
+    #[test]
+    fn parse_role_case_insensitive() {
+        assert_eq!(parse_role("VIEWER").unwrap(), TenantRole::Viewer);
+        assert_eq!(parse_role("Builder").unwrap(), TenantRole::Builder);
+        assert_eq!(parse_role("ADMIN").unwrap(), TenantRole::Admin);
+    }
+
+    #[test]
+    fn parse_role_invalid_returns_error() {
+        assert!(parse_role("superadmin").is_err());
+        assert!(parse_role("").is_err());
+        assert!(parse_role("root").is_err());
+    }
+
+    // ── TenantContext::r2_prefix ───────────────────────────────
+
+    #[test]
+    fn r2_prefix_format() {
+        let tc = ctx(TenantRole::Viewer);
+        assert_eq!(tc.r2_prefix(), "tenants/tenant-42/");
+    }
+
+    #[test]
+    fn r2_prefix_different_tenant() {
+        let tc = TenantContext {
+            tenant_id: "org-abc".to_string(),
+            role: TenantRole::Admin,
+            federation_allowed: true,
+        };
+        assert_eq!(tc.r2_prefix(), "tenants/org-abc/");
+    }
+
+    // ── authorize: admin paths ─────────────────────────────────
+
+    #[test]
+    fn admin_can_access_tenant_provisioning() {
+        assert!(authorize(&ctx(TenantRole::Admin), Method::Post, "/v1/tenants/provision").is_ok());
+    }
+
+    #[test]
+    fn viewer_cannot_access_tenant_provisioning() {
+        assert!(authorize(&ctx(TenantRole::Viewer), Method::Post, "/v1/tenants/provision").is_err());
+    }
+
+    #[test]
+    fn viewer_cannot_get_admin_only_paths() {
+        // Admin-only paths deny all non-admin roles regardless of HTTP method
+        assert!(authorize(&ctx(TenantRole::Viewer), Method::Get, "/v1/tenants/list").is_err());
+        assert!(authorize(&ctx(TenantRole::Viewer), Method::Get, "/v1/policies/activate/v1").is_err());
+    }
+
+    #[test]
+    fn builder_cannot_get_admin_only_paths() {
+        assert!(authorize(&ctx(TenantRole::Builder), Method::Get, "/v1/tenants/list").is_err());
+        assert!(authorize(&ctx(TenantRole::Builder), Method::Get, "/v1/policies/activate/v1").is_err());
+    }
+
+    #[test]
+    fn admin_can_get_admin_only_paths() {
+        assert!(authorize(&ctx(TenantRole::Admin), Method::Get, "/v1/tenants/list").is_ok());
+        assert!(authorize(&ctx(TenantRole::Admin), Method::Get, "/v1/policies/activate/v1").is_ok());
+    }
+
+    #[test]
+    fn builder_cannot_access_tenant_provisioning() {
+        assert!(authorize(&ctx(TenantRole::Builder), Method::Post, "/v1/tenants/provision").is_err());
+    }
+
+    #[test]
+    fn admin_can_activate_policy() {
+        assert!(authorize(&ctx(TenantRole::Admin), Method::Post, "/v1/policies/activate/v1").is_ok());
+    }
+
+    #[test]
+    fn viewer_cannot_activate_policy() {
+        assert!(authorize(&ctx(TenantRole::Viewer), Method::Post, "/v1/policies/activate/v1").is_err());
+    }
+
+    // ── authorize: policy rules paths ──────────────────────────
+
+    #[test]
+    fn admin_can_write_policy_rules() {
+        assert!(authorize(&ctx(TenantRole::Admin), Method::Post, "/v1/policies/rules").is_ok());
+    }
+
+    #[test]
+    fn builder_cannot_write_policy_rules() {
+        assert!(authorize(&ctx(TenantRole::Builder), Method::Post, "/v1/policies/rules").is_err());
+    }
+
+    #[test]
+    fn viewer_can_read_policy_rules() {
+        assert!(authorize(&ctx(TenantRole::Viewer), Method::Get, "/v1/policies/rules").is_ok());
+    }
+
+    // ── authorize: viewer read-only ────────────────────────────
+
+    #[test]
+    fn viewer_can_read_general_paths() {
+        assert!(authorize(&ctx(TenantRole::Viewer), Method::Get, "/v1/artifacts").is_ok());
+        assert!(authorize(&ctx(TenantRole::Viewer), Method::Head, "/v1/artifacts").is_ok());
+        assert!(authorize(&ctx(TenantRole::Viewer), Method::Options, "/v1/anything").is_ok());
+    }
+
+    #[test]
+    fn viewer_cannot_write_general_paths() {
+        assert!(authorize(&ctx(TenantRole::Viewer), Method::Post, "/v1/artifacts").is_err());
+        assert!(authorize(&ctx(TenantRole::Viewer), Method::Put, "/v1/artifacts").is_err());
+        assert!(authorize(&ctx(TenantRole::Viewer), Method::Delete, "/v1/artifacts").is_err());
+        assert!(authorize(&ctx(TenantRole::Viewer), Method::Patch, "/v1/artifacts").is_err());
+    }
+
+    // ── authorize: builder can write ───────────────────────────
+
+    #[test]
+    fn builder_can_write_general_paths() {
+        assert!(authorize(&ctx(TenantRole::Builder), Method::Post, "/v1/artifacts").is_ok());
+        assert!(authorize(&ctx(TenantRole::Builder), Method::Put, "/v1/artifacts").is_ok());
+        assert!(authorize(&ctx(TenantRole::Builder), Method::Delete, "/v1/artifacts").is_ok());
+    }
+
+    #[test]
+    fn builder_can_read_general_paths() {
+        assert!(authorize(&ctx(TenantRole::Builder), Method::Get, "/v1/artifacts").is_ok());
+    }
+}
