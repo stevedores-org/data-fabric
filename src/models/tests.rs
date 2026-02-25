@@ -925,6 +925,7 @@ fn failure_class_serializes_snake_case() {
 #[test]
 fn replay_execute_response_round_trip() {
     let resp = ReplayExecuteResponse {
+        evidence_id: "ve1".into(),
         run_id: "r1".into(),
         baseline_run_id: Some("r0".into()),
         status: "verified".into(),
@@ -945,6 +946,31 @@ fn replay_execute_response_round_trip() {
     let json = serde_json::to_string(&resp).unwrap();
     let parsed: ReplayExecuteResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, resp);
+}
+
+#[test]
+fn verification_evidence_round_trip() {
+    let evidence = VerificationEvidence {
+        id: "ve1".into(),
+        run_id: "r1".into(),
+        baseline_run_id: Some("r0".into()),
+        status: "needs_review".into(),
+        step_count: 10,
+        drift_count: 3,
+        drift_ratio_percent: 30.0,
+        within_variance: false,
+        failure_classification: Some(FailureClass::Environmental),
+        tests_passed: true,
+        policy_approved: true,
+        provenance_complete: false,
+        eligible_for_promotion: false,
+        confidence_score: 75,
+        failed_gates: vec!["provenance_complete".into()],
+        created_at: "2026-02-25T00:00:00.000Z".into(),
+    };
+    let json = serde_json::to_string(&evidence).unwrap();
+    let parsed: VerificationEvidence = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, evidence);
 }
 
 // ── Issue #58: Queue Integration Tests ──────────────────────────
@@ -1164,6 +1190,7 @@ fn replay_execute_request_with_baseline_and_gates() {
 #[test]
 fn replay_execute_response_needs_review_status() {
     let resp = ReplayExecuteResponse {
+        evidence_id: "ve-r2".into(),
         run_id: "r2".into(),
         baseline_run_id: Some("r1".into()),
         status: "needs_review".into(),
