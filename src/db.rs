@@ -435,25 +435,6 @@ pub async fn insert_events_bronze(
 /// Default max events per trace query (avoids unbounded result sets).
 pub const TRACE_DEFAULT_LIMIT: u32 = 1000;
 
-/// Total event count for a run (for trace response metadata). Issue #61. Scoped by tenant.
-pub async fn get_trace_count_for_run(
-    db: &D1Database,
-    tenant_id: &str,
-    run_id: &str,
-) -> Result<u32> {
-    let result: Option<TraceCountRow> = db
-        .prepare("SELECT COUNT(*) AS cnt FROM events_bronze WHERE tenant_id = ?1 AND run_id = ?2")
-        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
-        .first(None)
-        .await?;
-    Ok(result.map(|r| r.cnt as u32).unwrap_or(0))
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct TraceCountRow {
-    cnt: i64,
-}
-
 /// Fetch trace slice for a run (ordered by created_at). WS3 provenance. Limited by `limit` (default TRACE_DEFAULT_LIMIT).
 pub async fn get_trace_for_run(
     db: &D1Database,
@@ -476,6 +457,31 @@ pub async fn get_trace_for_run(
 
     let rows: Vec<TraceEventRow> = result.results()?;
     Ok(rows.into_iter().map(|r| r.into_trace_event()).collect())
+}
+
+/// Count total trace events for a run.
+pub async fn count_trace_events_for_run(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+) -> Result<u64> {
+    #[derive(Debug, serde::Deserialize)]
+    struct CountRow {
+        total: i64,
+    }
+
+    let result: D1Result = db
+        .prepare(
+            "SELECT COUNT(*) AS total
+             FROM events_bronze
+             WHERE tenant_id = ?1 AND run_id = ?2",
+        )
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
+        .all()
+        .await?;
+
+    let rows: Vec<CountRow> = result.results()?;
+    Ok(rows.first().map(|r| r.total.max(0) as u64).unwrap_or(0))
 }
 
 /// Insert into silver layer (sync promotion). Each row has its own id, bronze_id FK, entity_refs from event.
@@ -536,10 +542,27 @@ fn build_entity_refs(evt: &models::GraphEvent) -> Option<String> {
     if let Some(ref n) = evt.node_id {
         obj.insert("node_id".into(), serde_json::Value::String(n.clone()));
     }
+    if let Some(v) = payload_string_ref(evt.payload.as_ref(), "task_id") {
+        obj.insert("task_id".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = payload_string_ref(evt.payload.as_ref(), "artifact_id") {
+        obj.insert("artifact_id".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = payload_string_ref(evt.payload.as_ref(), "plan_id") {
+        obj.insert("plan_id".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = payload_string_ref(evt.payload.as_ref(), "tool_call_id") {
+        obj.insert("tool_call_id".into(), serde_json::Value::String(v));
+    }
     if obj.is_empty() {
         return None;
     }
     serde_json::to_string(&serde_json::Value::Object(obj)).ok()
+}
+
+fn payload_string_ref(payload: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    let obj = payload?.as_object()?;
+    obj.get(key)?.as_str().map(str::to_owned)
 }
 
 // ── WS2 Domain: Runs ─────────────────────────────────────────────
@@ -2967,5 +2990,46 @@ mod tests {
         let b = tokenize("graph event replay state");
         let c = tokenize("unrelated topic");
         assert!(jaccard_similarity(&a, &b) > jaccard_similarity(&a, &c));
+    }
+
+    #[test]
+    fn build_entity_refs_includes_payload_link_ids() {
+        let evt = models::GraphEvent {
+            run_id: Some("run-1".into()),
+            thread_id: Some("thread-1".into()),
+            event_type: "task.completed".into(),
+            node_id: Some("node-1".into()),
+            actor: Some("agent".into()),
+            payload: Some(serde_json::json!({
+                "task_id": "task-9",
+                "artifact_id": "artifact-2",
+                "plan_id": "plan-4",
+                "tool_call_id": "tool-call-7"
+            })),
+        };
+
+        let refs = build_entity_refs(&evt).expect("refs expected");
+        let parsed: serde_json::Value = serde_json::from_str(&refs).expect("valid json");
+        assert_eq!(parsed["run_id"], "run-1");
+        assert_eq!(parsed["thread_id"], "thread-1");
+        assert_eq!(parsed["node_id"], "node-1");
+        assert_eq!(parsed["task_id"], "task-9");
+        assert_eq!(parsed["artifact_id"], "artifact-2");
+        assert_eq!(parsed["plan_id"], "plan-4");
+        assert_eq!(parsed["tool_call_id"], "tool-call-7");
+    }
+
+    #[test]
+    fn build_entity_refs_returns_none_when_no_supported_refs() {
+        let evt = models::GraphEvent {
+            run_id: None,
+            thread_id: None,
+            event_type: "noop".into(),
+            node_id: None,
+            actor: None,
+            payload: Some(serde_json::json!({ "status": "ok" })),
+        };
+
+        assert!(build_entity_refs(&evt).is_none());
     }
 }
