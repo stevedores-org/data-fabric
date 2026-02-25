@@ -864,6 +864,33 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let list = db::list_integrations(&d1, &tenant_ctx.tenant_id, limit).await?;
             Response::from_json(&serde_json::json!({ "integrations": list }))
         })
+        .get_async("/v1/integrations/:id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let id = ctx.param("id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            match db::get_integration(&d1, &tenant_ctx.tenant_id, &id).await? {
+                Some(integration) => Response::from_json(&integration),
+                None => Response::error("integration not found", 404),
+            }
+        })
+        .patch_async("/v1/integrations/:id", |mut req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let id = ctx.param("id").unwrap().to_string();
+            let body: integrations::UpdateIntegration = req.json().await?;
+            let d1 = ctx.env.d1("DB")?;
+            db::update_integration(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
+            match db::get_integration(&d1, &tenant_ctx.tenant_id, &id).await? {
+                Some(integration) => Response::from_json(&integration),
+                None => Response::error("integration not found", 404),
+            }
+        })
+        .delete_async("/v1/integrations/:id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let id = ctx.param("id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            db::delete_integration(&d1, &tenant_ctx.tenant_id, &id).await?;
+            Response::from_json(&serde_json::json!({ "id": id, "deleted": true }))
+        })
         // ── WS6: oxidizedgraph intake ───────────────────────
         .post_async(
             "/v1/integrations/oxidizedgraph/events",
@@ -881,9 +908,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let now = db::now_iso();
 
                 let owned_events = integrations::oxidizedgraph::adapt_to_graph_events(&batch);
-                let event_count =
+                let event_count = match
                     ingest_events_bronze_silver(&d1, &tenant_ctx.tenant_id, owned_events, &now)
-                        .await?;
+                        .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        worker::console_log!("ERROR: oxidizedgraph event ingest failed: {e:?}");
+                        return degraded_response("oxidizedgraph", "event ingestion temporarily unavailable");
+                    }
+                };
 
                 let mut checkpoint_count = 0usize;
                 for evt in &batch.events {
@@ -921,17 +955,48 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let evt: integrations::aivcs::PipelineEvent = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
+            let bucket = ctx.env.bucket("ARTIFACTS")?;
 
             let mut run_id = None;
             if let Some(run) = integrations::aivcs::adapt_to_run(&evt) {
                 let id = generate_id()?;
-                db::create_run(&d1, &tenant_ctx.tenant_id, &id, &run).await?;
-                run_id = Some(id);
+                match db::create_run(&d1, &tenant_ctx.tenant_id, &id, &run).await {
+                    Ok(()) => run_id = Some(id),
+                    Err(e) => {
+                        worker::console_log!("ERROR: aivcs create_run failed: {e:?}");
+                        return degraded_response("aivcs", "run creation temporarily unavailable");
+                    }
+                }
             }
 
             let fabric_evt = integrations::aivcs::adapt_to_event(&evt);
             let evt_id = generate_id()?;
-            db::ingest_event(&d1, &tenant_ctx.tenant_id, &evt_id, &fabric_evt).await?;
+            if let Err(e) = db::ingest_event(&d1, &tenant_ctx.tenant_id, &evt_id, &fabric_evt).await {
+                worker::console_log!("ERROR: aivcs ingest_event failed: {e:?}");
+                return degraded_response("aivcs", "event ingestion temporarily unavailable");
+            }
+
+            // Write artifact metadata to R2 so fabric tracks pipeline artifacts
+            let mut artifact_count = 0usize;
+            if let Some(ref artifacts) = evt.artifacts {
+                for art in artifacts {
+                    let r2_key = format!(
+                        "{}/artifacts/{}",
+                        tenant_ctx.tenant_id, art.key
+                    );
+                    let meta = serde_json::to_vec(&serde_json::json!({
+                        "pipeline_id": evt.pipeline_id,
+                        "key": art.key,
+                        "content_type": art.content_type,
+                        "size_bytes": art.size_bytes,
+                        "checksum": art.checksum,
+                        "source": "aivcs",
+                    }))
+                    .map_err(|e| Error::RustError(e.to_string()))?;
+                    storage::put_blob(&bucket, &r2_key, meta).await?;
+                    artifact_count += 1;
+                }
+            }
 
             if let Err(e) = db::touch_integration(&d1, &tenant_ctx.tenant_id, "aivcs", None).await {
                 worker::console_log!("WARN: touch_integration(aivcs) failed: {e:?}");
@@ -941,6 +1006,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "source": "aivcs",
                 "event_id": evt_id,
                 "run_id": run_id,
+                "artifacts_stored": artifact_count,
             }))
         })
         // ── WS6: llama.rs intake ────────────────────────────
@@ -1000,6 +1066,26 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     "source": "llama_rs",
                     "events_ingested": count,
                 }))
+            },
+        )
+        // ── WS6: llama.rs context retrieval ──────────────────
+        .post_async(
+            "/v1/integrations/llama-rs/context",
+            |mut req, ctx| async move {
+                let tenant_ctx = tenant::tenant_from_request(&req)?;
+                let body: integrations::llama_rs::ContextRequest = req.json().await?;
+                let d1 = ctx.env.d1("DB")?;
+
+                let pack_req = integrations::llama_rs::adapt_to_context_pack(&body);
+                let response = db::build_context_pack(&d1, &tenant_ctx.tenant_id, &pack_req).await?;
+
+                if let Err(e) =
+                    db::touch_integration(&d1, &tenant_ctx.tenant_id, "llama_rs", None).await
+                {
+                    worker::console_log!("WARN: touch_integration(llama_rs) failed: {e:?}");
+                }
+
+                Response::from_json(&response)
             },
         )
         // ── Graph Events (M3) ─────────────────────────────────
@@ -1179,6 +1265,22 @@ async fn ingest_events_bronze_silver(
     }
     db::insert_events_silver(d1, tenant_id, &silver_events, now).await?;
     Ok(count)
+}
+
+/// Build a 503 response for graceful degradation when the fabric is unavailable.
+/// Used by integration intake handlers to signal temporary unavailability
+/// so clients can retry rather than treating the failure as permanent.
+fn degraded_response(source: &str, detail: &str) -> Result<Response> {
+    let body = serde_json::json!({
+        "source": source,
+        "status": "degraded",
+        "detail": detail,
+        "retry_after_seconds": 5,
+    });
+    let mut resp = Response::from_json(&body)?;
+    let _ = resp.headers_mut().set("Retry-After", "5");
+    // Override status to 503
+    Ok(resp.with_status(503))
 }
 
 /// Parse a numeric query param (e.g. limit, hops). Returns None if URL is None or param missing/invalid.
