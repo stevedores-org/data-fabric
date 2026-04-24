@@ -423,6 +423,26 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let responses: Vec<_> = decisions.into_iter().map(|d| d.into_response()).collect();
             Response::from_json(&serde_json::json!({ "decisions": responses }))
         })
+        // ── WS7 Verification Evidence ─────────────────────────
+        .get_async("/v1/verification/evidence", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let run_id = params.get("run_id").map(|s| s.as_str());
+            let limit = params
+                .get("limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50u32)
+                .min(200);
+            let d1 = ctx.env.d1("DB")?;
+            let evidence =
+                db::list_verification_evidence(&d1, &tenant_ctx.tenant_id, run_id, limit).await?;
+            let responses: Vec<_> = evidence.into_iter().map(|e| e.into_response()).collect();
+            Response::from_json(&serde_json::json!({ "evidence": responses }))
+        })
         // ── Policy Definitions & Retention (WS4) ────────────────
         .put_async(
             "/v1/policies/definitions/:version",
@@ -914,20 +934,29 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "needs_review"
             };
 
-            timed_json_response(
-                started,
-                &models::ReplayExecuteResponse {
-                    run_id: body.run_id,
-                    baseline_run_id: body.baseline_run_id,
-                    status: status.into(),
-                    step_count: steps.len(),
-                    drift_count,
-                    drift_ratio_percent,
-                    within_variance,
-                    failure_classification,
-                    verification,
-                },
+            let evidence_id = generate_id()?;
+            let replay_response = models::ReplayExecuteResponse {
+                evidence_id: evidence_id.clone(),
+                run_id: body.run_id,
+                baseline_run_id: body.baseline_run_id,
+                status: status.into(),
+                step_count: steps.len(),
+                drift_count,
+                drift_ratio_percent,
+                within_variance,
+                failure_classification,
+                verification,
+            };
+
+            db::create_verification_evidence(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &evidence_id,
+                &replay_response,
             )
+            .await?;
+
+            timed_json_response(started, &replay_response)
         })
         // ── WS6: Integration Registry ────────────────────────
         .post_async("/v1/integrations", |mut req, ctx| async move {
