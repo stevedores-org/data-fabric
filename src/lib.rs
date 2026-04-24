@@ -7,6 +7,8 @@ mod models;
 mod policy;
 mod storage;
 mod tenant;
+#[allow(dead_code)]
+mod tenant_security;
 mod verification;
 
 #[derive(Serialize)]
