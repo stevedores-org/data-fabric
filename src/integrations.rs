@@ -1,4 +1,4 @@
-//! WS6: Orchestration Integration — adapters for oxidizedgraph, aivcs, llama.rs.
+//! WS6: Orchestration Integration — adapters for oxidizedgraph, aivcs, llama.rs, mom.
 //!
 //! Each integration target has:
 //! 1. A typed contract (ingest schema) defining what the external system sends.
@@ -16,6 +16,7 @@ pub enum IntegrationTarget {
     Oxidizedgraph,
     Aivcs,
     LlamaRs,
+    Mom,
 }
 
 impl IntegrationTarget {
@@ -24,6 +25,7 @@ impl IntegrationTarget {
             Self::Oxidizedgraph => "oxidizedgraph",
             Self::Aivcs => "aivcs",
             Self::LlamaRs => "llama_rs",
+            Self::Mom => "mom",
         }
     }
 }
@@ -499,6 +501,151 @@ pub mod llama_rs {
     }
 }
 
+// ── mom contract ────────────────────────────────────────────────
+//
+// MOM is the event-sourced memory kernel for agents.
+// data-fabric queries MOM to retrieve relevant memories during task reasoning,
+// enabling agents to use past experience and specialized knowledge.
+
+pub mod mom {
+    use super::*;
+
+    /// Query for retrieving relevant memories from MOM.
+    /// Sent by data-fabric to retrieve agent memory during task reasoning.
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+    pub struct MemoryRecallRequest {
+        /// Text query to search memories (e.g., "similar task", "error pattern")
+        pub text: String,
+        /// Scoping: agent ID to retrieve only agent's memories
+        pub agent_id: Option<String>,
+        /// Scoping: tenant isolation
+        pub tenant_id: String,
+        /// Scoping: workspace/project for contextual memories
+        pub workspace_id: Option<String>,
+        /// Max results to return
+        pub limit: Option<usize>,
+        /// Memory type filter: "event", "summary", "fact", "preference"
+        pub kinds: Option<Vec<String>>,
+    }
+
+    /// A single scored memory item from MOM.
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+    pub struct ScoredMemoryItem {
+        /// Relevance score (0.0 to 1.0)
+        pub score: f64,
+        /// Memory identifier
+        pub id: String,
+        /// Memory kind (event, summary, fact, preference)
+        pub kind: String,
+        /// Text content of memory
+        pub content: String,
+        /// JSON metadata if applicable
+        pub metadata: Option<serde_json::Value>,
+        /// When memory was created (ms since epoch)
+        pub created_at_ms: i64,
+        /// Importance score (how important this memory is to agent)
+        pub importance: Option<f64>,
+    }
+
+    /// Response from MOM recall endpoint: ranked memories.
+    pub type MemoryRecallResponse = Vec<ScoredMemoryItem>;
+
+    /// Adapt a data-fabric task context into a memory recall request.
+    /// Enables agents to search their memories before reasoning on a task.
+    pub fn recall_request_for_task(
+        agent_id: &str,
+        tenant_id: &str,
+        task_description: &str,
+        workspace_id: Option<String>,
+        limit: Option<usize>,
+    ) -> MemoryRecallRequest {
+        MemoryRecallRequest {
+            text: task_description.to_string(),
+            agent_id: Some(agent_id.to_string()),
+            tenant_id: tenant_id.to_string(),
+            workspace_id,
+            limit: limit.or(Some(10)),
+            kinds: Some(vec![
+                "summary".to_string(),
+                "fact".to_string(),
+                "event".to_string(),
+            ]),
+        }
+    }
+
+    /// Format retrieved memories into an augmented prompt suffix for agent reasoning.
+    /// This is injected into the agent's task prompt to inform reasoning with past experience.
+    pub fn format_memory_augmentation(memories: &MemoryRecallResponse) -> String {
+        if memories.is_empty() {
+            return String::new();
+        }
+
+        let mut augmented = String::from("\n\n## Agent Memory Context (Relevant Past Experience)\n\n");
+
+        for (i, mem) in memories.iter().enumerate() {
+            augmented.push_str(&format!(
+                "{}. [{}] (confidence: {:.0}%) {}\n",
+                i + 1,
+                mem.kind.to_uppercase(),
+                mem.score * 100.0,
+                mem.content
+            ));
+
+            if let Some(meta) = &mem.metadata {
+                augmented.push_str(&format!("   Details: {}\n", serde_json::to_string(meta)
+                    .unwrap_or_else(|_| "...".to_string())));
+            }
+        }
+
+        augmented.push_str("\nUse these insights to inform your current task reasoning.\n");
+        augmented
+    }
+
+    /// MOM HTTP client for retrieving agent memories.
+    /// Communicates with MOM's /v1/recall endpoint to fetch relevant memories
+    /// during agent task reasoning.
+    pub struct MomClient {
+        pub endpoint: String,
+    }
+
+    impl MomClient {
+        /// Create a new MOM client with the given endpoint URL.
+        /// endpoint should be like "https://mom.example.com" (no trailing slash).
+        pub fn new(endpoint: String) -> Self {
+            Self {
+                endpoint: endpoint.trim_end_matches('/').to_string(),
+            }
+        }
+
+        /// Recall relevant memories from MOM.
+        /// Returns a vector of scored memory items ranked by relevance.
+        ///
+        /// # Note
+        /// This method will be called by data-fabric task reasoning to augment
+        /// agent prompts with relevant memories before execution.
+        pub async fn recall(
+            &self,
+            req: &MemoryRecallRequest,
+        ) -> Result<MemoryRecallResponse, String> {
+            let _url = format!("{}/v1/recall", self.endpoint);
+
+            // Serialize the request body for transmission
+            let _body = serde_json::to_string(req)
+                .map_err(|e| format!("Failed to serialize request: {}", e))?;
+
+            // TODO: Implement actual HTTP call via Cloudflare Worker fetch bindings
+            // This will use worker::Fetch when MOM deployment is available.
+            // The request will be:
+            //   POST {endpoint}/v1/recall
+            //   Content-Type: application/json
+            //   Body: serialized MemoryRecallRequest
+            //
+            // For now, return empty list (no-op for reasoning)
+            Ok(vec![])
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -761,12 +908,92 @@ mod tests {
 
     // ── Integration registry tests ──────────────────────────
 
+    // ── MOM integration tests ──────────────────────────────────
+
+    #[test]
+    fn mom_recall_request_creation() {
+        let req = mom::recall_request_for_task(
+            "agent-123",
+            "tenant-acme",
+            "How to fix concurrent access bugs in shared state?",
+            Some("workspace-1".to_string()),
+            Some(5),
+        );
+
+        assert_eq!(req.agent_id, Some("agent-123".to_string()));
+        assert_eq!(req.tenant_id, "tenant-acme");
+        assert_eq!(req.limit, Some(5));
+        assert!(req.text.contains("concurrent"));
+        assert!(req.kinds.as_ref().unwrap().contains(&"summary".to_string()));
+    }
+
+    #[test]
+    fn mom_memory_augmentation_formatting() {
+        let memories = vec![
+            mom::ScoredMemoryItem {
+                score: 0.95,
+                id: "mem-1".to_string(),
+                kind: "summary".to_string(),
+                content: "Previously solved race condition using Arc<Mutex<>>".to_string(),
+                metadata: None,
+                created_at_ms: 1609459200000,
+                importance: Some(0.9),
+            },
+            mom::ScoredMemoryItem {
+                score: 0.87,
+                id: "mem-2".to_string(),
+                kind: "fact".to_string(),
+                content: "DashMap provides atomic entry mutation for lock-free patterns".to_string(),
+                metadata: Some(serde_json::json!({"crate": "dashmap", "version": "5.x"})),
+                created_at_ms: 1609459200000,
+                importance: Some(0.7),
+            },
+        ];
+
+        let augmented = mom::format_memory_augmentation(&memories);
+
+        assert!(augmented.contains("Agent Memory Context"));
+        assert!(augmented.contains("Arc<Mutex<>>"));
+        assert!(augmented.contains("DashMap"));
+        assert!(augmented.contains("95%")); // score formatting
+        assert!(augmented.contains("SUMMARY"));
+        assert!(augmented.contains("FACT"));
+    }
+
+    #[test]
+    fn mom_client_creation() {
+        let client = mom::MomClient::new("https://mom.example.com/".to_string());
+        // Verify endpoint is normalized (no trailing slash)
+        assert_eq!(client.endpoint, "https://mom.example.com");
+
+        let client2 = mom::MomClient::new("https://mom.example.com".to_string());
+        assert_eq!(client.endpoint, client2.endpoint);
+    }
+
+    #[test]
+    fn mom_memory_serde_round_trip() {
+        let memory = mom::ScoredMemoryItem {
+            score: 0.92,
+            id: "mem-abc".to_string(),
+            kind: "summary".to_string(),
+            content: "Concurrency pattern for shared state".to_string(),
+            metadata: Some(serde_json::json!({"pattern": "Arc<Mutex>", "domain": "Rust"})),
+            created_at_ms: 1609459200000,
+            importance: Some(0.85),
+        };
+
+        let json = serde_json::to_string(&memory).unwrap();
+        let parsed: mom::ScoredMemoryItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(memory, parsed);
+    }
+
     #[test]
     fn integration_target_serde() {
         let targets = vec![
             IntegrationTarget::Oxidizedgraph,
             IntegrationTarget::Aivcs,
             IntegrationTarget::LlamaRs,
+            IntegrationTarget::Mom,
         ];
         for target in &targets {
             let json = serde_json::to_string(target).unwrap();
