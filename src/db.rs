@@ -2128,6 +2128,7 @@ impl TaskRow {
             lease_expires_at: self.lease_expires_at,
             created_at: self.created_at,
             completed_at: self.completed_at,
+            memory_context: None,
         }
     }
 }
