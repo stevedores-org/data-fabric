@@ -620,28 +620,65 @@ pub mod mom {
         /// Recall relevant memories from MOM.
         /// Returns a vector of scored memory items ranked by relevance.
         ///
+        /// Makes an HTTP POST request to MOM's /v1/recall endpoint.
+        /// If the request fails, returns an empty vector (graceful degradation).
+        ///
         /// # Note
-        /// This method will be called by data-fabric task reasoning to augment
+        /// This method is called by data-fabric task reasoning to augment
         /// agent prompts with relevant memories before execution.
         pub async fn recall(
             &self,
             req: &MemoryRecallRequest,
         ) -> Result<MemoryRecallResponse, String> {
-            let _url = format!("{}/v1/recall", self.endpoint);
+            use worker::wasm_bindgen::JsValue;
+
+            let url = format!("{}/v1/recall", self.endpoint);
 
             // Serialize the request body for transmission
-            let _body = serde_json::to_string(req)
+            let body = serde_json::to_string(req)
                 .map_err(|e| format!("Failed to serialize request: {}", e))?;
 
-            // TODO: Implement actual HTTP call via Cloudflare Worker fetch bindings
-            // This will use worker::Fetch when MOM deployment is available.
-            // The request will be:
-            //   POST {endpoint}/v1/recall
-            //   Content-Type: application/json
-            //   Body: serialized MemoryRecallRequest
-            //
-            // For now, return empty list (no-op for reasoning)
-            Ok(vec![])
+            // Prepare fetch options
+            let mut opts = worker::RequestInit::new();
+            opts.with_method(worker::Method::Post);
+
+            // Set Content-Type header
+            let headers = worker::Headers::new();
+            headers.append("Content-Type", "application/json")
+                .map_err(|e| format!("Failed to set header: {:?}", e))?;
+            opts.with_headers(headers);
+
+            // Set request body
+            opts.with_body(Some(JsValue::from_str(&body)));
+
+            // Create the HTTP request
+            let worker_req = worker::Request::new_with_init(&url, &opts)
+                .map_err(|e| format!("Failed to create request: {:?}", e))?;
+
+            // Make the HTTP request using worker's Fetch API
+            match worker::Fetch::Request(worker_req).send().await {
+                Ok(mut response) => {
+                    // Check response status code
+                    let status = response.status_code();
+                    if status < 200 || status >= 300 {
+                        // MOM returned error status - graceful degradation
+                        return Ok(vec![]);
+                    }
+
+                    // Parse response JSON
+                    let response_text = response
+                        .text()
+                        .await
+                        .map_err(|e| format!("Failed to read response: {:?}", e))?;
+
+                    serde_json::from_str::<MemoryRecallResponse>(&response_text)
+                        .map_err(|e| format!("Failed to parse response: {}", e))
+                }
+                Err(_) => {
+                    // Network error or MOM unavailable - graceful degradation
+                    Ok(vec![])
+                }
+            }
         }
     }
 }
@@ -985,6 +1022,74 @@ mod tests {
         let json = serde_json::to_string(&memory).unwrap();
         let parsed: mom::ScoredMemoryItem = serde_json::from_str(&json).unwrap();
         assert_eq!(memory, parsed);
+    }
+
+    #[test]
+    fn mom_client_endpoint_normalization() {
+        // Test that trailing slash is stripped from endpoints
+        let client1 = mom::MomClient::new("https://mom.example.com/".to_string());
+        let client2 = mom::MomClient::new("https://mom.example.com".to_string());
+        assert_eq!(client1.endpoint, "https://mom.example.com");
+        assert_eq!(client2.endpoint, "https://mom.example.com");
+
+        // Test that without trailing slash, no changes are made
+        let client3 = mom::MomClient::new("https://mom.example.com".to_string());
+        assert_eq!(client3.endpoint, "https://mom.example.com");
+    }
+
+    #[test]
+    fn mom_memory_recall_request_serialization() {
+        // Verify recall requests can be serialized to JSON for HTTP transmission
+        let req = mom::MemoryRecallRequest {
+            text: "How to fix concurrent access bugs?".to_string(),
+            agent_id: Some("agent-123".to_string()),
+            tenant_id: "tenant-acme".to_string(),
+            workspace_id: Some("workspace-1".to_string()),
+            limit: Some(5),
+            kinds: Some(vec!["summary".to_string(), "fact".to_string()]),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"text\""));
+        assert!(json.contains("\"agent_id\""));
+        assert!(json.contains("\"tenant_id\""));
+        assert!(json.contains("concurrent"));
+
+        // Verify round-trip
+        let parsed: mom::MemoryRecallRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.agent_id, Some("agent-123".to_string()));
+        assert_eq!(parsed.limit, Some(5));
+    }
+
+    #[test]
+    fn mom_memory_recall_response_parsing() {
+        // Verify response JSON can be parsed into MemoryRecallResponse
+        let json = r#"[
+            {
+                "score": 0.95,
+                "id": "mem-1",
+                "kind": "summary",
+                "content": "Arc<Mutex> pattern for shared state",
+                "metadata": null,
+                "created_at_ms": 1609459200000,
+                "importance": 0.9
+            },
+            {
+                "score": 0.87,
+                "id": "mem-2",
+                "kind": "fact",
+                "content": "DashMap for lock-free mutations",
+                "metadata": {"crate": "dashmap"},
+                "created_at_ms": 1609459200000,
+                "importance": 0.7
+            }
+        ]"#;
+
+        let memories: mom::MemoryRecallResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(memories.len(), 2);
+        assert_eq!(memories[0].score, 0.95);
+        assert_eq!(memories[1].kind, "fact");
+        assert!(memories[1].metadata.is_some());
     }
 
     #[test]
