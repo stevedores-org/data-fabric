@@ -33,6 +33,11 @@ pub struct AgentTask {
     pub lease_expires_at: Option<String>,
     pub created_at: String,
     pub completed_at: Option<String>,
+    /// Memory context augmentation: relevant past experiences for this agent.
+    /// Populated when task is claimed via /mcp/task/next with MOM available.
+    /// Contains formatted memories from agent's past executions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_context: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]

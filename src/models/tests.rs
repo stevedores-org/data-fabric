@@ -1216,6 +1216,101 @@ fn replay_execute_response_needs_review_status() {
     assert_eq!(json["verification"]["failed_gates"][0], "provenance_complete");
 }
 
+// ── Phase 4: Memory-Augmented Tasks (WS6) ────────────────────────
+
+#[test]
+fn agent_task_with_memory_context_none() {
+    // Task without memory context (graceful degradation)
+    let task = AgentTask {
+        id: "t1".into(),
+        job_id: "j1".into(),
+        task_type: "build".into(),
+        priority: 1,
+        status: "pending".into(),
+        params: None,
+        result: None,
+        agent_id: Some("agent-1".into()),
+        graph_ref: None,
+        play_id: None,
+        parent_task_id: None,
+        retry_count: 0,
+        max_retries: 3,
+        lease_expires_at: None,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        completed_at: None,
+        memory_context: None,
+    };
+    let json = serde_json::to_string(&task).unwrap();
+    let parsed: AgentTask = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.memory_context, None);
+    // Verify memory_context is not in JSON when None
+    assert!(!json.contains("memory_context"));
+}
+
+#[test]
+fn agent_task_with_memory_context_some() {
+    // Task with memory context populated from MOM
+    let task = AgentTask {
+        id: "t1".into(),
+        job_id: "j1".into(),
+        task_type: "build".into(),
+        priority: 1,
+        status: "pending".into(),
+        params: None,
+        result: None,
+        agent_id: Some("agent-1".into()),
+        graph_ref: None,
+        play_id: None,
+        parent_task_id: None,
+        retry_count: 0,
+        max_retries: 3,
+        lease_expires_at: None,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        completed_at: None,
+        memory_context: Some("## Memory: Past Experience\n- Fixed similar build issue with cargo cache".into()),
+    };
+    let json = serde_json::to_string(&task).unwrap();
+    let parsed: AgentTask = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        parsed.memory_context.as_deref(),
+        Some("## Memory: Past Experience\n- Fixed similar build issue with cargo cache")
+    );
+    // Verify memory_context IS in JSON when Some
+    assert!(json.contains("memory_context"));
+}
+
+#[test]
+fn agent_task_memory_context_round_trip() {
+    // Full round-trip with memory context
+    let task = AgentTask {
+        id: "t1".into(),
+        job_id: "j1".into(),
+        task_type: "analyze".into(),
+        priority: 2,
+        status: "pending".into(),
+        params: None,
+        result: None,
+        agent_id: Some("agent-2".into()),
+        graph_ref: None,
+        play_id: None,
+        parent_task_id: None,
+        retry_count: 0,
+        max_retries: 5,
+        lease_expires_at: None,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        completed_at: None,
+        memory_context: Some("## Memory Context\nPrevious analysis on similar codebase. Use AST traversal.".into()),
+    };
+    let json = serde_json::to_string(&task).unwrap();
+    let parsed: AgentTask = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.id, "t1");
+    assert_eq!(parsed.job_id, "j1");
+    assert!(parsed.memory_context.is_some());
+    let ctx = parsed.memory_context.as_ref().unwrap();
+    assert!(ctx.contains("Previous analysis"));
+    assert!(ctx.contains("AST traversal"));
+}
+
 // ── Issue #58: Performance Gate Tests ───────────────────────────
 
 #[test]

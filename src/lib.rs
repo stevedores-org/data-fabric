@@ -28,6 +28,53 @@ fn request_path(req: &Request) -> Result<String> {
     Ok(req.url()?.path().to_string())
 }
 
+/// Augment a claimed task with agent's memory context from MOM.
+///
+/// Enables agents to reason with past experiences by injecting relevant memories
+/// into the task description. If MOM is unavailable or contains no relevant memories,
+/// returns None (graceful degradation).
+fn augment_task_with_memory(
+    agent_id: &str,
+    tenant_id: &str,
+    task: &models::AgentTask,
+) -> Option<String> {
+    // Extract task description from params or task_type
+    let task_description = if let Some(params) = &task.params {
+        if let Some(desc) = params.get("description").and_then(|v| v.as_str()) {
+            desc.to_string()
+        } else if let Some(prompt) = params.get("prompt").and_then(|v| v.as_str()) {
+            prompt.to_string()
+        } else {
+            task.task_type.clone()
+        }
+    } else {
+        task.task_type.clone()
+    };
+
+    // Create a memory recall request scoped to this agent/tenant
+    let _recall_req = integrations::mom::recall_request_for_task(
+        agent_id,
+        tenant_id,
+        &task_description,
+        None,  // workspace_id: task doesn't have it
+        Some(5), // limit to top 5 memories
+    );
+
+    // TODO: Query MOM via MomClient::recall() when Cloudflare Worker fetch is available
+    // For now, return None (no-op, graceful degradation)
+    //
+    // When implemented:
+    // let client = integrations::mom::MomClient::new(mom_endpoint);
+    // if let Ok(memories) = client.recall(&recall_req).await {
+    //     let formatted = integrations::mom::format_memory_augmentation(&memories);
+    //     if !formatted.is_empty() {
+    //         return Some(formatted);
+    //     }
+    // }
+
+    None
+}
+
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
@@ -514,7 +561,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let d1 = ctx.env.d1("DB")?;
             match db::claim_next_task(&d1, &tenant_ctx.tenant_id, &agent_id, &caps).await? {
-                Some(task) => Response::from_json(&task),
+                Some(mut task) => {
+                    // Augment task with agent's memory context from MOM (if available)
+                    // This allows agents to reason with past experience
+                    let memory_context = augment_task_with_memory(&agent_id, &tenant_ctx.tenant_id, &task);
+                    task.memory_context = memory_context;
+                    Response::from_json(&task)
+                },
                 None => Ok(Response::empty()?.with_status(204)),
             }
         })
