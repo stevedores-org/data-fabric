@@ -33,10 +33,11 @@ fn request_path(req: &Request) -> Result<String> {
 /// Enables agents to reason with past experiences by injecting relevant memories
 /// into the task description. If MOM is unavailable or contains no relevant memories,
 /// returns None (graceful degradation).
-fn augment_task_with_memory(
+async fn augment_task_with_memory(
     agent_id: &str,
     tenant_id: &str,
     task: &models::AgentTask,
+    mom_endpoint: &str,
 ) -> Option<String> {
     // Extract task description from params or task_type
     let task_description = if let Some(params) = &task.params {
@@ -52,7 +53,7 @@ fn augment_task_with_memory(
     };
 
     // Create a memory recall request scoped to this agent/tenant
-    let _recall_req = integrations::mom::recall_request_for_task(
+    let recall_req = integrations::mom::recall_request_for_task(
         agent_id,
         tenant_id,
         &task_description,
@@ -60,17 +61,14 @@ fn augment_task_with_memory(
         Some(5), // limit to top 5 memories
     );
 
-    // TODO: Query MOM via MomClient::recall() when Cloudflare Worker fetch is available
-    // For now, return None (no-op, graceful degradation)
-    //
-    // When implemented:
-    // let client = integrations::mom::MomClient::new(mom_endpoint);
-    // if let Ok(memories) = client.recall(&recall_req).await {
-    //     let formatted = integrations::mom::format_memory_augmentation(&memories);
-    //     if !formatted.is_empty() {
-    //         return Some(formatted);
-    //     }
-    // }
+    // Query MOM for relevant memories
+    let client = integrations::mom::MomClient::new(mom_endpoint.to_string());
+    if let Ok(memories) = client.recall(&recall_req).await {
+        let formatted = integrations::mom::format_memory_augmentation(&memories);
+        if !formatted.is_empty() {
+            return Some(formatted);
+        }
+    }
 
     None
 }
@@ -564,8 +562,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(mut task) => {
                     // Augment task with agent's memory context from MOM (if available)
                     // This allows agents to reason with past experience
-                    let memory_context = augment_task_with_memory(&agent_id, &tenant_ctx.tenant_id, &task);
-                    task.memory_context = memory_context;
+                    let mom_endpoint = ctx.env.var("MOM_ENDPOINT").ok().map(|v| v.to_string());
+                    if let Some(endpoint) = mom_endpoint {
+                        let memory_context = augment_task_with_memory(&agent_id, &tenant_ctx.tenant_id, &task, &endpoint).await;
+                        task.memory_context = memory_context;
+                    }
                     Response::from_json(&task)
                 },
                 None => Ok(Response::empty()?.with_status(204)),
