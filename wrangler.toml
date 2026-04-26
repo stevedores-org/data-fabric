@@ -56,3 +56,17 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+
+# ── Environments: MOM Integration (Phase 4 & 5) ──────────────────
+
+# Development: Local MOM (or lornu.com for testing)
+[env.development]
+vars = { APP_ENV = "development", MOM_ENDPOINT = "https://mom-service.lornu.com" }
+
+# Staging: Pre-production testing with stevedores.org
+[env.staging]
+vars = { APP_ENV = "staging", MOM_ENDPOINT = "https://mom-service.stevedores.org" }
+
+# Production: Primary lornu.com with stevedores.org fallback
+[env.production]
+vars = { APP_ENV = "production", MOM_ENDPOINT = "https://mom-service.lornu.com" }
