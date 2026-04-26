@@ -61,12 +61,69 @@ max_batch_timeout = 5
 
 # Development: Local MOM (or lornu.com for testing)
 [env.development]
-vars = { APP_ENV = "development", MOM_ENDPOINT = "https://mom-service.lornu.com" }
+vars = { APP_ENV = "development", SERVICE_NAME = "data-fabric", MOM_ENDPOINT = "https://mom-service.lornu.com" }
+[[env.development.d1_databases]]
+binding = "DB"
+database_name = "data-fabric"
+database_id = "6afcdc53-3d1c-4e99-941c-76b5d1a6fda2"
+migrations_dir = "migrations"
+[[env.development.r2_buckets]]
+binding = "ARTIFACTS"
+bucket_name = "data-fabric-artifacts"
+[[env.development.kv_namespaces]]
+binding = "POLICY_KV"
+id = "33e3087e865c4230b8673ac86dc2dc7d"
+preview_id = "45b7cf03cd984f0aaa5a6da2f7a30721"
+[[env.development.queues.producers]]
+binding = "EVENTS"
+queue = "data-fabric-events"
+[[env.development.queues.consumers]]
+queue = "data-fabric-events"
+max_batch_size = 50
+max_batch_timeout = 5
 
 # Staging: Pre-production testing with stevedores.org
 [env.staging]
-vars = { APP_ENV = "staging", MOM_ENDPOINT = "https://mom-service.stevedores.org" }
+vars = { APP_ENV = "staging", SERVICE_NAME = "data-fabric", MOM_ENDPOINT = "https://mom-service.stevedores.org" }
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "data-fabric"
+database_id = "6afcdc53-3d1c-4e99-941c-76b5d1a6fda2"
+migrations_dir = "migrations"
+[[env.staging.r2_buckets]]
+binding = "ARTIFACTS"
+bucket_name = "data-fabric-artifacts"
+[[env.staging.kv_namespaces]]
+binding = "POLICY_KV"
+id = "33e3087e865c4230b8673ac86dc2dc7d"
+preview_id = "45b7cf03cd984f0aaa5a6da2f7a30721"
+[[env.staging.queues.producers]]
+binding = "EVENTS"
+queue = "data-fabric-events"
+[[env.staging.queues.consumers]]
+queue = "data-fabric-events"
+max_batch_size = 50
+max_batch_timeout = 5
 
 # Production: Primary lornu.com with stevedores.org fallback
 [env.production]
-vars = { APP_ENV = "production", MOM_ENDPOINT = "https://mom-service.lornu.com" }
+vars = { APP_ENV = "production", SERVICE_NAME = "data-fabric", MOM_ENDPOINT = "https://mom-service.lornu.com" }
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "data-fabric"
+database_id = "6afcdc53-3d1c-4e99-941c-76b5d1a6fda2"
+migrations_dir = "migrations"
+[[env.production.r2_buckets]]
+binding = "ARTIFACTS"
+bucket_name = "data-fabric-artifacts"
+[[env.production.kv_namespaces]]
+binding = "POLICY_KV"
+id = "33e3087e865c4230b8673ac86dc2dc7d"
+preview_id = "45b7cf03cd984f0aaa5a6da2f7a30721"
+[[env.production.queues.producers]]
+binding = "EVENTS"
+queue = "data-fabric-events"
+[[env.production.queues.consumers]]
+queue = "data-fabric-events"
+max_batch_size = 50
+max_batch_timeout = 5
