@@ -7,6 +7,9 @@ mod models;
 mod policy;
 mod storage;
 mod tenant;
+#[allow(dead_code)]
+mod tenant_security;
+mod verification;
 
 #[derive(Serialize)]
 struct HealthResponse<'a> {
@@ -23,6 +26,51 @@ fn is_public_path(path: &str) -> bool {
 
 fn request_path(req: &Request) -> Result<String> {
     Ok(req.url()?.path().to_string())
+}
+
+/// Augment a claimed task with agent's memory context from MOM.
+///
+/// Enables agents to reason with past experiences by injecting relevant memories
+/// into the task description. If MOM is unavailable or contains no relevant memories,
+/// returns None (graceful degradation).
+async fn augment_task_with_memory(
+    agent_id: &str,
+    tenant_id: &str,
+    task: &models::AgentTask,
+    mom_endpoint: &str,
+) -> Option<String> {
+    // Extract task description from params or task_type
+    let task_description = if let Some(params) = &task.params {
+        if let Some(desc) = params.get("description").and_then(|v| v.as_str()) {
+            desc.to_string()
+        } else if let Some(prompt) = params.get("prompt").and_then(|v| v.as_str()) {
+            prompt.to_string()
+        } else {
+            task.task_type.clone()
+        }
+    } else {
+        task.task_type.clone()
+    };
+
+    // Create a memory recall request scoped to this agent/tenant
+    let recall_req = integrations::mom::recall_request_for_task(
+        agent_id,
+        tenant_id,
+        &task_description,
+        None,  // workspace_id: task doesn't have it
+        Some(5), // limit to top 5 memories
+    );
+
+    // Query MOM for relevant memories
+    let client = integrations::mom::MomClient::new(mom_endpoint.to_string());
+    if let Ok(memories) = client.recall(&recall_req).await {
+        let formatted = integrations::mom::format_memory_augmentation(&memories);
+        if !formatted.is_empty() {
+            return Some(formatted);
+        }
+    }
+
+    None
 }
 
 #[event(fetch)]
@@ -422,6 +470,26 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let responses: Vec<_> = decisions.into_iter().map(|d| d.into_response()).collect();
             Response::from_json(&serde_json::json!({ "decisions": responses }))
         })
+        // ── WS7 Verification Evidence ─────────────────────────
+        .get_async("/v1/verification/evidence", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let run_id = params.get("run_id").map(|s| s.as_str());
+            let limit = params
+                .get("limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50u32)
+                .min(200);
+            let d1 = ctx.env.d1("DB")?;
+            let evidence =
+                db::list_verification_evidence(&d1, &tenant_ctx.tenant_id, run_id, limit).await?;
+            let responses: Vec<_> = evidence.into_iter().map(|e| e.into_response()).collect();
+            Response::from_json(&serde_json::json!({ "evidence": responses }))
+        })
         // ── Policy Definitions & Retention (WS4) ────────────────
         .put_async(
             "/v1/policies/definitions/:version",
@@ -491,7 +559,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let d1 = ctx.env.d1("DB")?;
             match db::claim_next_task(&d1, &tenant_ctx.tenant_id, &agent_id, &caps).await? {
-                Some(task) => Response::from_json(&task),
+                Some(mut task) => {
+                    // Augment task with agent's memory context from MOM (if available)
+                    // This allows agents to reason with past experience
+                    let mom_endpoint = ctx.env.var("MOM_ENDPOINT").ok().map(|v| v.to_string());
+                    if let Some(endpoint) = mom_endpoint {
+                        let memory_context = augment_task_with_memory(&agent_id, &tenant_ctx.tenant_id, &task, &endpoint).await;
+                        task.memory_context = memory_context;
+                    }
+                    Response::from_json(&task)
+                },
                 None => Ok(Response::empty()?.with_status(204)),
             }
         })
@@ -819,10 +896,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 &serde_json::json!({ "run_id": run_id, "edges": edges }),
             )
         })
-        // ── Replay Contract Stub (WS3: #58) ─────────────────────
+        // ── Replay Plan (WS3: #58) ────────────────────────────────
         .post_async("/v1/replay/plan", |mut req, ctx| async move {
             let started = js_sys::Date::now();
             let body: models::ReplayPlanRequest = req.json().await?;
+            if body.run_id.trim().is_empty() {
+                return Response::error("run_id is required", 400);
+            }
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let steps = db::build_replay_plan(
@@ -833,15 +913,106 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 body.to_event_id.as_deref(),
             )
             .await?;
-            // TODO: replace hardcoded "stub" status once replay execution is implemented
+            let status = if steps.is_empty() { "empty" } else { "planned" };
             timed_json_response(
                 started,
                 &models::ReplayPlanResponse {
                     run_id: body.run_id,
                     steps,
-                    status: "stub".into(),
+                    status: status.into(),
                 },
             )
+        })
+        .post_async("/v1/replay", |mut req, ctx| async move {
+            let started = js_sys::Date::now();
+            let body: models::ReplayExecuteRequest = req.json().await?;
+            if body.run_id.trim().is_empty() {
+                return Response::error("run_id is required", 400);
+            }
+
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let d1 = ctx.env.d1("DB")?;
+
+            let steps = db::build_replay_plan(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &body.run_id,
+                body.from_event_id.as_deref(),
+                body.to_event_id.as_deref(),
+            )
+            .await?;
+
+            let baseline_steps = match body.baseline_run_id.as_deref() {
+                Some(baseline_run_id) if !baseline_run_id.trim().is_empty() => {
+                    db::build_replay_plan(
+                        &d1,
+                        &tenant_ctx.tenant_id,
+                        baseline_run_id,
+                        body.from_event_id.as_deref(),
+                        body.to_event_id.as_deref(),
+                    )
+                    .await?
+                }
+                _ => Vec::new(),
+            };
+
+            let has_baseline = !baseline_steps.is_empty();
+            let (drift_count, drift_ratio_percent) = if has_baseline {
+                verification::compute_replay_drift_percent(&steps, &baseline_steps)
+            } else {
+                (0, 0.0)
+            };
+            let within_variance =
+                !has_baseline || drift_ratio_percent <= f64::from(body.variance_tolerance_percent);
+
+            let tests_passed = body.tests_passed.unwrap_or(true);
+            let policy_approved = body.policy_approved.unwrap_or(true);
+            let provenance_complete = body
+                .provenance_complete
+                .unwrap_or(!steps.is_empty() && within_variance);
+            let verification = verification::evaluate_verification_gates(
+                tests_passed,
+                policy_approved,
+                provenance_complete,
+            );
+
+            let failure_classification = if has_baseline {
+                Some(verification::classify_failure_from_drift_ratio(
+                    drift_ratio_percent,
+                ))
+            } else {
+                None
+            };
+
+            let status = if verification.eligible_for_promotion && within_variance {
+                "verified"
+            } else {
+                "needs_review"
+            };
+
+            let evidence_id = generate_id()?;
+            let replay_response = models::ReplayExecuteResponse {
+                evidence_id: evidence_id.clone(),
+                run_id: body.run_id,
+                baseline_run_id: body.baseline_run_id,
+                status: status.into(),
+                step_count: steps.len(),
+                drift_count,
+                drift_ratio_percent,
+                within_variance,
+                failure_classification,
+                verification,
+            };
+
+            db::create_verification_evidence(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &evidence_id,
+                &replay_response,
+            )
+            .await?;
+
+            timed_json_response(started, &replay_response)
         })
         // ── WS6: Integration Registry ────────────────────────
         .post_async("/v1/integrations", |mut req, ctx| async move {
