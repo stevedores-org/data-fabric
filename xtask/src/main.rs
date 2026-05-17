@@ -79,6 +79,7 @@ fn ensure_rustup(rustup: &Path) -> Result<()> {
 
     let mut child = Command::new(sh)
         .args(["-s", "--", "-y", "--profile", "minimal"])
+        .env("RUSTUP_INIT_SKIP_PATH_CHECK", "yes")
         .stdin(std::process::Stdio::piped())
         .spawn()
         .map_err(|err| format!("start rustup installer: {err}"))?;
