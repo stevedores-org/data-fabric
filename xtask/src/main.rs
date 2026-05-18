@@ -6,7 +6,7 @@ use std::{
 };
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
-const WORKER_BUILD_VERSION: &str = "0.7.4";
+const WORKER_BUILD_VERSION: &str = "0.8.3";
 
 type Result<T> = std::result::Result<T, String>;
 
