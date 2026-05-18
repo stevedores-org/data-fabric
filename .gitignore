@@ -1,5 +1,6 @@
 /target
 /build
+/.worker-tools
 /worker/generated
 /.wrangler
 node_modules
