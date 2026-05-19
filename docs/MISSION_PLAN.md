@@ -50,6 +50,9 @@
 - decision backlog tracked in `docs/adr/BACKLOG.md`
 - initial accepted ADRs cover event ordering, policy placement, and memory index backend
 
+## Phase WS10: Pilot and Rollout
+- Phase 1 oxidizedgraph workload defined in `docs/ws10/PHASE1_WORKLOAD.md`
+
 ## Immediate Next Tasks
 1. ~~Add D1 schema migration for silver entities.~~ (done: `migrations/0001_silver_entities.sql`, D1 binding in wrangler)
 2. ~~Add R2 artifact write/read path.~~ (done: PUT/GET `/v1/artifacts/:key` use R2 binding)

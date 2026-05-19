@@ -26,5 +26,6 @@ cargo test
 - `docs/TDD-BUN-BUNX-EXECUTION-PLAN.md`
 - `docs/adr/README.md`
 - `docs/ws1/README.md`
+- `docs/ws10/README.md`
 - `docs/WS5_RETRIEVAL_MEMORY.md`
 - `docs/WS4_POLICY_GOVERNANCE.md`
