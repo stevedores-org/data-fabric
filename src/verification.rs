@@ -183,12 +183,32 @@ mod tests {
     #[test]
     fn compute_replay_drift_percent_full_mismatch() {
         let replay = vec![
-            models::ReplayStep { sequence: 1, event_type: "a".into(), node_id: None, actor: None },
-            models::ReplayStep { sequence: 2, event_type: "b".into(), node_id: None, actor: None },
+            models::ReplayStep {
+                sequence: 1,
+                event_type: "a".into(),
+                node_id: None,
+                actor: None,
+            },
+            models::ReplayStep {
+                sequence: 2,
+                event_type: "b".into(),
+                node_id: None,
+                actor: None,
+            },
         ];
         let baseline = vec![
-            models::ReplayStep { sequence: 1, event_type: "x".into(), node_id: None, actor: None },
-            models::ReplayStep { sequence: 2, event_type: "y".into(), node_id: None, actor: None },
+            models::ReplayStep {
+                sequence: 1,
+                event_type: "x".into(),
+                node_id: None,
+                actor: None,
+            },
+            models::ReplayStep {
+                sequence: 2,
+                event_type: "y".into(),
+                node_id: None,
+                actor: None,
+            },
         ];
         let (drift_count, drift_ratio) = compute_replay_drift_percent(&replay, &baseline);
         assert_eq!(drift_count, 2);

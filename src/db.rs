@@ -600,29 +600,66 @@ pub async fn create_run(
     Ok(())
 }
 
+/// List runs for `tenant_id` ordered by `(created_at DESC, id DESC)`.
+///
+/// Returns `(rows, next_cursor)`. `next_cursor` is `Some` when there are more
+/// rows beyond this page — we fetch `limit + 1` and trim the overflow row to
+/// detect that without a second query.
+///
+/// The cursor predicate uses an OR of two terms (`created_at < ?` OR
+/// `created_at = ? AND id < ?`) rather than a row-value comparison because
+/// SQLite/D1 cannot index `(a, b) < (?, ?)` as a single sargable expression.
 pub async fn list_runs(
     db: &D1Database,
     tenant_id: &str,
     repo: Option<&str>,
     limit: u32,
-) -> Result<Vec<RunResponse>> {
-    let (query, bindings): (String, Vec<JsValue>) = match repo {
-        Some(r) => (
-            "SELECT * FROM runs WHERE tenant_id = ?1 AND repo = ?2 ORDER BY created_at DESC LIMIT ?3".into(),
-            vec![
-                JsValue::from_str(tenant_id),
-                JsValue::from_str(r),
-                JsValue::from(limit),
-            ],
-        ),
-        None => (
-            "SELECT * FROM runs WHERE tenant_id = ?1 ORDER BY created_at DESC LIMIT ?2".into(),
-            vec![JsValue::from_str(tenant_id), JsValue::from(limit)],
-        ),
-    };
+    cursor: Option<&crate::pagination::RunsCursor>,
+) -> Result<(Vec<RunResponse>, Option<crate::pagination::RunsCursor>)> {
+    let fetch_limit = limit.saturating_add(1);
+
+    // Build the predicate and bindings in lockstep so positional parameters
+    // stay in sync. Using `?` (positional, anonymous) instead of `?1/?2/...`
+    // because the parameter count depends on which optional filters are set.
+    let mut clauses: Vec<String> = vec!["tenant_id = ?".into()];
+    let mut bindings: Vec<JsValue> = vec![JsValue::from_str(tenant_id)];
+
+    if let Some(r) = repo {
+        clauses.push("repo = ?".into());
+        bindings.push(JsValue::from_str(r));
+    }
+    if let Some(c) = cursor {
+        clauses.push("(created_at < ? OR (created_at = ? AND id < ?))".into());
+        bindings.push(JsValue::from_str(&c.created_at));
+        bindings.push(JsValue::from_str(&c.created_at));
+        bindings.push(JsValue::from_str(&c.id));
+    }
+    bindings.push(JsValue::from(fetch_limit));
+
+    let query = format!(
+        "SELECT * FROM runs WHERE {} ORDER BY created_at DESC, id DESC LIMIT ?",
+        clauses.join(" AND ")
+    );
+
     let result: D1Result = db.prepare(&query).bind(&bindings)?.all().await?;
-    let rows: Vec<RunRow> = result.results()?;
-    Ok(rows.into_iter().map(|r| r.into_run_response()).collect())
+    let mut rows: Vec<RunRow> = result.results()?;
+
+    let next_cursor = if rows.len() as u32 > limit {
+        // Overflow row signals there's at least one more page. Drop it; the
+        // cursor is built from the *last returned* row, not the overflow.
+        rows.truncate(limit as usize);
+        rows.last().map(|r| crate::pagination::RunsCursor {
+            created_at: r.created_at.clone(),
+            id: r.id.clone(),
+        })
+    } else {
+        None
+    };
+
+    Ok((
+        rows.into_iter().map(|r| r.into_run_response()).collect(),
+        next_cursor,
+    ))
 }
 
 pub async fn get_run(db: &D1Database, tenant_id: &str, id: &str) -> Result<Option<RunResponse>> {

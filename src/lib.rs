@@ -2,8 +2,10 @@ use serde::Serialize;
 use worker::*;
 
 mod db;
+mod errors;
 mod integrations;
 mod models;
+mod pagination;
 mod policy;
 mod storage;
 mod tenant;
@@ -57,7 +59,7 @@ async fn augment_task_with_memory(
         agent_id,
         tenant_id,
         &task_description,
-        None,  // workspace_id: task doesn't have it
+        None,    // workspace_id: task doesn't have it
         Some(5), // limit to top 5 memories
     );
 
@@ -136,14 +138,35 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             let repo = params.get("repo").map(|s| s.as_str());
-            let limit = params
-                .get("limit")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(50u32)
-                .min(200);
+            let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
+            let cursor =
+                match pagination::RunsCursor::decode(params.get("cursor").map(|s| s.as_str())) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return errors::error_response(
+                            "INVALID_CURSOR",
+                            "cursor is malformed; echo back the next_cursor from a prior response",
+                            400,
+                        );
+                    }
+                };
             let d1 = ctx.env.d1("DB")?;
-            let runs = db::list_runs(&d1, &tenant_ctx.tenant_id, repo, limit).await?;
-            Response::from_json(&serde_json::json!({ "runs": runs }))
+            let (runs, next_cursor) =
+                db::list_runs(&d1, &tenant_ctx.tenant_id, repo, limit, cursor.as_ref()).await?;
+            let next_cursor_str = match next_cursor.as_ref().map(|c| c.encode()).transpose() {
+                Ok(s) => s,
+                Err(_) => {
+                    return errors::error_response(
+                        "CURSOR_ENCODE_FAILED",
+                        "internal: failed to encode next cursor",
+                        500,
+                    );
+                }
+            };
+            Response::from_json(&serde_json::json!({
+                "runs": runs,
+                "next_cursor": next_cursor_str,
+            }))
         })
         .get_async("/v1/runs/:id", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
@@ -151,7 +174,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let d1 = ctx.env.d1("DB")?;
             match db::get_run(&d1, &tenant_ctx.tenant_id, &id).await? {
                 Some(run) => Response::from_json(&run),
-                None => Response::error("run not found", 404),
+                None => errors::error_response("RUN_NOT_FOUND", "run not found", 404),
             }
         })
         // ── WS2 Tasks (run-scoped, D1-backed) ───────────────
@@ -564,11 +587,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     // This allows agents to reason with past experience
                     let mom_endpoint = ctx.env.var("MOM_ENDPOINT").ok().map(|v| v.to_string());
                     if let Some(endpoint) = mom_endpoint {
-                        let memory_context = augment_task_with_memory(&agent_id, &tenant_ctx.tenant_id, &task, &endpoint).await;
+                        let memory_context = augment_task_with_memory(
+                            &agent_id,
+                            &tenant_ctx.tenant_id,
+                            &task,
+                            &endpoint,
+                        )
+                        .await;
                         task.memory_context = memory_context;
                     }
                     Response::from_json(&task)
-                },
+                }
                 None => Ok(Response::empty()?.with_status(204)),
             }
         })
