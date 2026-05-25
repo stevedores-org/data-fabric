@@ -79,8 +79,11 @@ async fn augment_task_with_memory(
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
+    let start_ms = js_sys::Date::now();
 
     let path = request_path(&req)?;
+    let method = req.method();
+    let mut tenant_id_for_metric: Option<String> = None;
     if !is_public_path(&path) {
         let tenant_ctx = match tenant::tenant_from_request(&req) {
             Ok(ctx) => ctx,
@@ -89,11 +92,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         if tenant::authorize(&tenant_ctx, req.method(), &path).is_err() {
             return Response::error("forbidden by tenant role policy", 403);
         }
+        tenant_id_for_metric = Some(tenant_ctx.tenant_id.clone());
     }
+
+    // Grab the Analytics Engine sink before `env` is consumed by the router.
+    // Missing in local dev / tests — that must not fail the request.
+    let latency_sink = env.analytics_engine("PILOT_LATENCY").ok();
 
     let router = Router::new();
 
-    router
+    let response = router
         // ── Health ──────────────────────────────────────────────
         .get("/", |_, _| Response::ok("data-fabric-worker online"))
         .get("/health", |_, _| {
@@ -1390,7 +1398,54 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             )
         })
         .run(req, env)
-        .await
+        .await;
+
+    if !is_public_path(&path) {
+        if let Some(sink) = latency_sink.as_ref() {
+            let status = response
+                .as_ref()
+                .ok()
+                .map(|r| r.status_code())
+                .unwrap_or(500);
+            emit_pilot_latency(
+                sink,
+                &path,
+                &method,
+                tenant_id_for_metric.as_deref().unwrap_or("unknown"),
+                js_sys::Date::now() - start_ms,
+                status,
+            );
+        }
+    }
+
+    response
+}
+
+/// Best-effort emit of one request-latency sample to the `PILOT_LATENCY`
+/// Analytics Engine dataset. Failures are deliberately swallowed: a missing
+/// dataset or transient sink error must not turn a successful request into
+/// a 500.
+///
+/// Path is currently emitted as-is. High-cardinality routes (`/v1/runs/:id`)
+/// inflate the dataset row count — templating the path is a follow-up.
+fn emit_pilot_latency(
+    sink: &AnalyticsEngineDataset,
+    path: &str,
+    method: &Method,
+    tenant_id: &str,
+    elapsed_ms: f64,
+    status_code: u16,
+) {
+    let method_str = method.to_string();
+    let dp = AnalyticsEngineDataPointBuilder::new()
+        .indexes([tenant_id])
+        .add_blob(path)
+        .add_blob(method_str.as_str())
+        .add_blob(tenant_id)
+        .add_double(elapsed_ms)
+        .add_double(status_code as f64)
+        .build();
+    let _ = sink.write_data_point(&dp);
 }
 
 /// Queue consumer: enriches events — causality edges, gold summaries, task deps.
