@@ -4,6 +4,7 @@ use worker::*;
 mod db;
 mod errors;
 mod integrations;
+mod metrics;
 mod models;
 mod pagination;
 mod policy;
@@ -176,6 +177,33 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(run) => Response::from_json(&run),
                 None => errors::error_response("RUN_NOT_FOUND", "run not found", 404),
             }
+        })
+        // ── WS10 pilot baseline metrics (issue #105) ────────
+        .get_async("/v1/metrics/pilot", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let window_raw = params.get("window").map(|s| s.as_str()).unwrap_or("1d");
+            let (window, window_seconds) = match metrics::parse_window(window_raw) {
+                Ok(w) => w,
+                Err(e) => {
+                    return errors::error_response("INVALID_WINDOW", &e.to_string(), 400);
+                }
+            };
+            let task_type = params.get("task_type").map(|s| s.as_str());
+            let d1 = ctx.env.d1("DB")?;
+            let body = metrics::pilot(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &window,
+                window_seconds,
+                task_type,
+            )
+            .await?;
+            Response::from_json(&body)
         })
         // ── WS2 Tasks (run-scoped, D1-backed) ───────────────
         .post_async("/v1/runs/:run_id/tasks", |mut req, ctx| async move {

@@ -57,6 +57,13 @@ queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
 
+# ── Analytics Engine: API latency sink (WS10 pilot KPI #6) ──────
+# Dataset is created on first writeDataPoint call; no pre-provisioning.
+# Querying p50/p95/p99: scripts/pilot-latency.sh
+[[analytics_engine_datasets]]
+binding = "PILOT_LATENCY"
+dataset = "data_fabric_pilot_latency"
+
 # ── Environments: MOM Integration (Phase 4 & 5) ──────────────────
 
 # Development: Local MOM (or lornu.com for testing)
@@ -81,6 +88,9 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+[[env.development.analytics_engine_datasets]]
+binding = "PILOT_LATENCY"
+dataset = "data_fabric_pilot_latency_dev"
 
 # Staging: Pre-production testing with stevedores.org
 [env.staging]
@@ -104,6 +114,9 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+[[env.staging.analytics_engine_datasets]]
+binding = "PILOT_LATENCY"
+dataset = "data_fabric_pilot_latency_staging"
 
 # Production: Primary lornu.com with stevedores.org fallback
 [env.production]
@@ -127,3 +140,6 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+[[env.production.analytics_engine_datasets]]
+binding = "PILOT_LATENCY"
+dataset = "data_fabric_pilot_latency"
