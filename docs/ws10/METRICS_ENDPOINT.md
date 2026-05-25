@@ -51,9 +51,19 @@ Query parameters:
 |---|---|---|---|
 | `task_completion_rate` | `mcp_tasks` | `COUNT(status='completed') / COUNT(*)` over window. Honors `task_type`. | Null when no tasks in window. |
 | `mttr_p50_seconds` / `mttr_p95_seconds` | `events_bronze` | For each failure event (`run_failed` / `task_failed` / `error`), delta in seconds to the next recovery event (`run_completed` / `task_completed` / `recovered`) for the same `run_id`. p50/p95 are linear-interpolation percentiles of the resulting deltas. | Null when no failure→recovery transitions in window. Cross-run boundaries are not crossed. |
-| `context_reuse_rate` | (deferred) | — | **Always null.** See [#105 risk section](https://github.com/stevedores-org/data-fabric/issues/105) — needs a concrete hit/miss definition first. |
+| `context_reuse_rate` | `events_bronze` (stopgap) | `COUNT(payload.hit = true) / COUNT(*)` over rows where `event_type = 'checkpoint_read'`. Truthiness check is `json_extract(payload, '$.hit') = 1` (SQLite JSON1 returns `1` for a JSON `true`). | **Stopgap definition** — see "Stopgap notes" below. Null when no checkpoint_read events in window. |
 | `human_intervention_rate` | `policy_decisions` | `COUNT(decision='escalate') / COUNT(*)` over window. | Null when no decisions in window. |
 | `event_throughput_per_sec` | `events_bronze` | `COUNT(*) / window_seconds`. | Null when no events in window. |
+
+### Stopgap notes — `context_reuse_rate`
+
+The #105 risk section flagged this KPI as the fuzziest of the six: no single table directly counts cache hits vs misses. This PR defines it deliberately so the KPI returns a real number now and pilot-week reviewers can sanity-check it:
+
+- **Numerator:** rows in `events_bronze` with `event_type = 'checkpoint_read'` and a payload where `payload.hit` evaluates to JSON `true`.
+- **Denominator:** rows in `events_bronze` with `event_type = 'checkpoint_read'`.
+- **Producer contract:** code that reads a checkpoint must emit a `checkpoint_read` event with `{"hit": true|false, ...}` in the payload. (No producer guarantees this yet — payloads written without a `hit` field count as misses, which is the conservative default.)
+
+If reviewers prefer a different definition (e.g., reads-against-writes from `run_summaries`), point me at it and I'll swap the query. Either way, this is a Phase-1 KPI that we expect to refine before Phase 2 gates.
 
 ### Null semantics
 
@@ -93,11 +103,47 @@ Exit codes: `0` success, `2` missing prereqs, `3` API error, `4` dataset empty.
 
 > **Caveat:** the Worker is not yet emitting to this dataset. Until it does, `scripts/pilot-latency.sh` exits with code 4 ("no rows in dataset"). Emitting `latency_ms` per request is the next WS10 follow-up.
 
+## Smoke test
+
+`scripts/pilot-smoke.sh` calls the endpoint with `curl`, asserts HTTP 200, and verifies the response has the five required top-level keys (`window`, `window_seconds`, `sample_counts`, `kpis`, `meta`) plus all six KPIs in `kpis`. Use it as a reviewer / post-deploy sanity check.
+
+```bash
+# Local dev
+scripts/pilot-smoke.sh --tenant-id acme
+
+# Staging
+scripts/pilot-smoke.sh --base-url https://data-fabric.stevedores.org --tenant-id acme --window 7d
+
+# With task_type filter
+scripts/pilot-smoke.sh --tenant-id acme --task-type oxidizedgraph.test
+```
+
+Exit codes: `0` shape valid, `2` missing prereqs, `3` request failed / non-200, `4` 200 but shape invalid.
+
+## API latency: how it gets into Analytics Engine
+
+The Worker emits one data point per non-public request to the `PILOT_LATENCY` Analytics Engine binding (see `emit_pilot_latency` in `src/lib.rs`). Schema:
+
+| Field | Value |
+|---|---|
+| `index1` | `tenant_id` (sampling key) |
+| `blob1` | request path (raw — high-cardinality routes like `/v1/runs/:id` inflate the dataset; templating is a follow-up) |
+| `blob2` | HTTP method |
+| `blob3` | `tenant_id` (dimension) |
+| `double1` | elapsed milliseconds |
+| `double2` | response status code |
+
+Emission is best-effort: a missing binding or transient sink failure must not turn a successful request into a 500.
+
+`scripts/pilot-latency.sh` reads `double1` from this dataset to compute p50/p95/p99.
+
 ## Implementation map
 
 | File | Role |
 |---|---|
-| `src/metrics.rs` | KPI computation; pure-Rust helpers (`parse_window`, `percentile_sorted`, `extract_mttr_deltas_seconds`) are unit-tested in-source. |
+| `src/metrics.rs` | KPI computation. Split into `query_inputs` (D1 IO → `PilotInputs`) + `assemble` (pure → `PilotMetrics`). Pure helpers (`parse_window`, `percentile_sorted`, `extract_mttr_deltas_seconds`) plus the assembly branches are unit-tested in-source. |
 | `src/lib.rs` (route `/v1/metrics/pilot`) | Parses query params, resolves tenant context, delegates to `metrics::pilot`. |
+| `src/lib.rs` (`emit_pilot_latency`) | Per-request `writeDataPoint` to the `PILOT_LATENCY` binding. Best-effort. |
+| `scripts/pilot-smoke.sh` | Reviewer / deploy sanity check against the live endpoint. |
 | `scripts/pilot-latency.sh` | Workers Analytics Engine query for p50/p95/p99 latency. |
 | `wrangler.toml` (`[[analytics_engine_datasets]]`) | `PILOT_LATENCY` binding per env. |

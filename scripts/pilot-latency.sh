@@ -98,8 +98,10 @@ fi
 SAMPLE_COUNT=$(echo "$RESPONSE" | jq -r '.data[0].sample_count // 0')
 if [[ "$SAMPLE_COUNT" == "0" ]]; then
   echo "no rows in dataset '${DATASET}' over window ${WINDOW}"
-  echo "(if the Worker isn't emitting to this dataset yet, the p50/p95/p99"
-  echo " KPI is null until that lands — track in WS10 follow-ups)"
+  echo "(Worker emits one row per non-public request via emit_pilot_latency"
+  echo " in src/lib.rs — if this is unexpectedly empty, confirm the"
+  echo " PILOT_LATENCY binding is wired in wrangler.toml for this env and"
+  echo " that the deployed build is recent.)"
   exit 4
 fi
 
