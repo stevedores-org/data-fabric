@@ -95,9 +95,15 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         tenant_id_for_metric = Some(tenant_ctx.tenant_id.clone());
     }
 
-    // Grab the Analytics Engine sink before `env` is consumed by the router.
-    // Missing in local dev / tests — that must not fail the request.
+    // Grab the Analytics Engine sink (and APP_ENV for cross-env filtering)
+    // before `env` is consumed by the router. Missing binding in local dev /
+    // tests is non-fatal — emission below is best-effort.
     let latency_sink = env.analytics_engine("PILOT_LATENCY").ok();
+    let app_env = env
+        .var("APP_ENV")
+        .ok()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
 
     let router = Router::new();
 
@@ -1412,6 +1418,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 &path,
                 &method,
                 tenant_id_for_metric.as_deref().unwrap_or("unknown"),
+                &app_env,
                 js_sys::Date::now() - start_ms,
                 status,
             );
@@ -1428,11 +1435,20 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 ///
 /// Path is currently emitted as-is. High-cardinality routes (`/v1/runs/:id`)
 /// inflate the dataset row count — templating the path is a follow-up.
+///
+/// Sample schema (kept in sync with `docs/ws10/METRICS_ENDPOINT.md`):
+/// * `index1` — `tenant_id` (sampling key)
+/// * `blob1`  — request path
+/// * `blob2`  — HTTP method
+/// * `blob3`  — `APP_ENV` (dev / staging / production)
+/// * `double1`— elapsed milliseconds
+/// * `double2`— response status code
 fn emit_pilot_latency(
     sink: &AnalyticsEngineDataset,
     path: &str,
     method: &Method,
     tenant_id: &str,
+    app_env: &str,
     elapsed_ms: f64,
     status_code: u16,
 ) {
@@ -1441,7 +1457,7 @@ fn emit_pilot_latency(
         .indexes([tenant_id])
         .add_blob(path)
         .add_blob(method_str.as_str())
-        .add_blob(tenant_id)
+        .add_blob(app_env)
         .add_double(elapsed_ms)
         .add_double(status_code as f64)
         .build();
