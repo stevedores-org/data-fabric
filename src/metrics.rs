@@ -75,13 +75,6 @@ pub struct CountTotal {
 }
 
 impl CountTotal {
-    pub const fn zero() -> Self {
-        Self {
-            numerator: 0,
-            denominator: 0,
-        }
-    }
-
     /// `numerator / denominator` when `denominator > 0`, else `None`.
     pub fn rate(self) -> Option<f64> {
         if self.denominator > 0 {
@@ -108,12 +101,14 @@ pub struct PilotInputs {
 
 /// Parse `?window=` to canonical `(echoed_string, seconds)`. Accepts `Nh`,
 /// `Nd`, `Nw` for hours, days, weeks. `24h` and `1d` resolve to the same
-/// `seconds` deliberately.
+/// `seconds` deliberately. UTF-8 safe — `?window=1🌒` returns Err rather
+/// than panicking on a byte-boundary slice.
 pub fn parse_window(raw: &str) -> Result<(String, i64)> {
-    if raw.is_empty() {
-        return Err(Error::RustError("window must not be empty".into()));
-    }
-    let (num_part, unit) = raw.split_at(raw.len() - 1);
+    let unit_char = raw
+        .chars()
+        .last()
+        .ok_or_else(|| Error::RustError("window must not be empty".into()))?;
+    let num_part = &raw[..raw.len() - unit_char.len_utf8()];
     let n: i64 = num_part
         .parse()
         .map_err(|_| Error::RustError(format!("window: bad number in {raw:?}")))?;
@@ -122,10 +117,10 @@ pub fn parse_window(raw: &str) -> Result<(String, i64)> {
             "window: must be positive, got {n}"
         )));
     }
-    let secs_per_unit: i64 = match unit {
-        "h" => 3600,
-        "d" => 86_400,
-        "w" => 604_800,
+    let secs_per_unit: i64 = match unit_char {
+        'h' => 3600,
+        'd' => 86_400,
+        'w' => 604_800,
         other => {
             return Err(Error::RustError(format!(
                 "window: unknown unit {other:?} (expected h, d, or w)"
@@ -323,21 +318,61 @@ fn cutoff_iso(window_seconds: i64) -> String {
         .unwrap()
 }
 
+/// Cap on rows fetched for the MTTR computation. Each row is small (~80
+/// bytes) so this is well under D1's response-size cap, but a runaway
+/// tenant could otherwise OOM the Worker. When the cap is hit the reported
+/// p50/p95 reflect only the lexicographically-first
+/// `MTTR_EVENT_FETCH_LIMIT` rows after sorting by `(run_id, created_at)` —
+/// approximate at high volumes. See `docs/ws10/METRICS_ENDPOINT.md`.
+const MTTR_EVENT_FETCH_LIMIT: i64 = 50_000;
+
 /// Run the five D1 queries that feed `assemble`. Returns the intermediate
 /// shape so tests can exercise the assembly logic without a D1 binding.
+///
+/// The five queries don't depend on each other, so they're polled
+/// concurrently via `try_join!`. Workers are single-threaded but D1 I/O
+/// interleaves, turning ~5 × RTT into ~1 × RTT.
 pub async fn query_inputs(
     db: &D1Database,
     tenant_id: &str,
     cutoff_iso: &str,
     task_type: Option<&str>,
 ) -> Result<PilotInputs> {
+    let (task_completion, events_total, human_intervention, context_reuse, mttr_events) = futures_util::try_join!(
+        fetch_task_completion(db, tenant_id, cutoff_iso, task_type),
+        fetch_events_total(db, tenant_id, cutoff_iso),
+        fetch_human_intervention(db, tenant_id, cutoff_iso),
+        fetch_context_reuse(db, tenant_id, cutoff_iso),
+        fetch_mttr_events(db, tenant_id, cutoff_iso),
+    )?;
+
+    let mttr_deltas_seconds =
+        extract_mttr_deltas_seconds(mttr_events.into_iter().filter_map(|e| {
+            let run = e.run_id?;
+            let ts = iso_to_epoch_seconds(&e.created_at)?;
+            Some((run, e.event_type, ts))
+        }));
+
+    Ok(PilotInputs {
+        task_completion,
+        events_total,
+        human_intervention,
+        context_reuse,
+        mttr_deltas_seconds,
+    })
+}
+
+async fn fetch_task_completion(
+    db: &D1Database,
+    tenant_id: &str,
+    cutoff_iso: &str,
+    task_type: Option<&str>,
+) -> Result<CountTotal> {
     let task_type_bind = match task_type {
         Some(t) => JsValue::from_str(t),
         None => JsValue::NULL,
     };
-
-    // ── Task completion (filtered by task_type when given) ─────────────
-    let tasks_row: Vec<RateRow> = db
+    let rows: Vec<RateRow> = db
         .prepare(
             "SELECT
                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS numerator,
@@ -355,13 +390,11 @@ pub async fn query_inputs(
         .all()
         .await?
         .results()?;
-    let task_completion = tasks_row
-        .first()
-        .map(CountTotal::from)
-        .unwrap_or(CountTotal::zero());
+    Ok(rows.first().map(CountTotal::from).unwrap_or_default())
+}
 
-    // ── Events count (denominator for throughput) ──────────────────────
-    let events_row: Vec<CountRow> = db
+async fn fetch_events_total(db: &D1Database, tenant_id: &str, cutoff_iso: &str) -> Result<i64> {
+    let rows: Vec<CountRow> = db
         .prepare(
             "SELECT COUNT(*) AS total
              FROM events_bronze
@@ -371,10 +404,15 @@ pub async fn query_inputs(
         .all()
         .await?
         .results()?;
-    let events_total = events_row.first().map(|r| r.total).unwrap_or(0);
+    Ok(rows.first().map(|r| r.total).unwrap_or(0))
+}
 
-    // ── Human intervention (escalations / decisions) ───────────────────
-    let decisions_row: Vec<RateRow> = db
+async fn fetch_human_intervention(
+    db: &D1Database,
+    tenant_id: &str,
+    cutoff_iso: &str,
+) -> Result<CountTotal> {
+    let rows: Vec<RateRow> = db
         .prepare(
             "SELECT
                SUM(CASE WHEN decision = 'escalate' THEN 1 ELSE 0 END) AS numerator,
@@ -386,21 +424,26 @@ pub async fn query_inputs(
         .all()
         .await?
         .results()?;
-    let human_intervention = decisions_row
-        .first()
-        .map(CountTotal::from)
-        .unwrap_or(CountTotal::zero());
+    Ok(rows.first().map(CountTotal::from).unwrap_or_default())
+}
 
-    // ── Context reuse (checkpoint_read events: hits / total) ───────────
-    //
-    // Stopgap definition (documented in docs/ws10/METRICS_ENDPOINT.md):
-    // among `events_bronze` rows with `event_type = 'checkpoint_read'`,
-    // count those whose `payload.hit` JSON field is truthy (= 1 per
-    // SQLite JSON1's `json_extract` of a JSON `true`).
-    let context_row: Vec<RateRow> = db
+/// Context-reuse stopgap (docs/ws10/METRICS_ENDPOINT.md):
+/// among `events_bronze` rows with `event_type = 'checkpoint_read'`, count
+/// those whose `payload.hit` is truthy. `json_extract` returns integer `1`
+/// for a JSON boolean `true`, but producers in the wild also emit the
+/// string `"true"` (various casings) — accept all common variants.
+async fn fetch_context_reuse(
+    db: &D1Database,
+    tenant_id: &str,
+    cutoff_iso: &str,
+) -> Result<CountTotal> {
+    let rows: Vec<RateRow> = db
         .prepare(
             "SELECT
-               SUM(CASE WHEN json_extract(payload, '$.hit') = 1 THEN 1 ELSE 0 END) AS numerator,
+               SUM(CASE
+                 WHEN json_extract(payload, '$.hit') IN (1, 'true', 'True', 'TRUE')
+                   THEN 1 ELSE 0
+               END) AS numerator,
                COUNT(*) AS total
              FROM events_bronze
              WHERE tenant_id = ?1
@@ -411,13 +454,15 @@ pub async fn query_inputs(
         .all()
         .await?
         .results()?;
-    let context_reuse = context_row
-        .first()
-        .map(CountTotal::from)
-        .unwrap_or(CountTotal::zero());
+    Ok(rows.first().map(CountTotal::from).unwrap_or_default())
+}
 
-    // ── MTTR: ordered failure+recovery events, paired in Rust ──────────
-    let mttr_events: Vec<EventRow> = db
+async fn fetch_mttr_events(
+    db: &D1Database,
+    tenant_id: &str,
+    cutoff_iso: &str,
+) -> Result<Vec<EventRow>> {
+    let rows: Vec<EventRow> = db
         .prepare(
             "SELECT run_id, event_type, created_at
              FROM events_bronze
@@ -426,26 +471,18 @@ pub async fn query_inputs(
                AND run_id IS NOT NULL
                AND event_type IN
                  ('run_failed','task_failed','error','run_completed','task_completed','recovered')
-             ORDER BY run_id ASC, created_at ASC",
+             ORDER BY run_id ASC, created_at ASC
+             LIMIT ?3",
         )
-        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(cutoff_iso)])?
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(cutoff_iso),
+            JsValue::from_f64(MTTR_EVENT_FETCH_LIMIT as f64),
+        ])?
         .all()
         .await?
         .results()?;
-    let mttr_deltas_seconds =
-        extract_mttr_deltas_seconds(mttr_events.into_iter().filter_map(|e| {
-            let run = e.run_id?;
-            let ts = iso_to_epoch_seconds(&e.created_at)?;
-            Some((run, e.event_type, ts))
-        }));
-
-    Ok(PilotInputs {
-        task_completion,
-        events_total,
-        human_intervention,
-        context_reuse,
-        mttr_deltas_seconds,
-    })
+    Ok(rows)
 }
 
 /// Compute the pilot KPI block for one tenant over the given window.
@@ -495,6 +532,14 @@ mod tests {
         assert!(parse_window("-1d").is_err());
         assert!(parse_window("5m").is_err()); // minutes not supported
         assert!(parse_window("abc").is_err());
+    }
+
+    #[test]
+    fn window_multibyte_unit_returns_err_not_panic() {
+        // Previously: `raw.split_at(raw.len() - 1)` panicked on a non-ASCII
+        // last byte. Now: chars().last() handles the boundary correctly.
+        assert!(parse_window("1🌒").is_err());
+        assert!(parse_window("🌒").is_err());
     }
 
     // ── percentile ─────────────────────────────────────────────────────
@@ -585,7 +630,7 @@ mod tests {
 
     #[test]
     fn count_total_rate_handles_zero_and_normal() {
-        assert_eq!(CountTotal::zero().rate(), None);
+        assert_eq!(CountTotal::default().rate(), None);
         assert_eq!(
             CountTotal {
                 numerator: 0,
@@ -663,7 +708,7 @@ mod tests {
     #[test]
     fn assemble_marks_task_completion_null_when_no_tasks() {
         let mut inputs = inputs_for_assemble_happy();
-        inputs.task_completion = CountTotal::zero();
+        inputs.task_completion = CountTotal::default();
         let m = assemble("1d", 86_400, "t", inputs, "now".into());
         assert_eq!(m.kpis.task_completion_rate, None);
         assert_eq!(
@@ -676,7 +721,7 @@ mod tests {
     #[test]
     fn assemble_marks_human_intervention_null_when_no_decisions() {
         let mut inputs = inputs_for_assemble_happy();
-        inputs.human_intervention = CountTotal::zero();
+        inputs.human_intervention = CountTotal::default();
         let m = assemble("1d", 86_400, "t", inputs, "now".into());
         assert_eq!(m.kpis.human_intervention_rate, None);
         assert_eq!(
@@ -688,7 +733,7 @@ mod tests {
     #[test]
     fn assemble_marks_context_reuse_null_when_no_checkpoint_reads() {
         let mut inputs = inputs_for_assemble_happy();
-        inputs.context_reuse = CountTotal::zero();
+        inputs.context_reuse = CountTotal::default();
         let m = assemble("1d", 86_400, "t", inputs, "now".into());
         assert_eq!(m.kpis.context_reuse_rate, None);
         assert_eq!(
@@ -784,34 +829,5 @@ mod tests {
         let m = assemble("1d", 86_400, "t", inputs, "now".into());
         let json = serde_json::to_value(&m).unwrap();
         assert!(json.get("null_reasons").is_some());
-    }
-
-    // ── context_reuse_rate SQL shape (string-level guard) ─────────────
-    //
-    // We can't run the SQL against a real D1 in unit tests, but we can pin
-    // the query string's load-bearing pieces so an accidental edit (e.g.,
-    // dropping the tenant_id filter or the JSON1 clause) trips a test.
-
-    #[test]
-    fn query_inputs_function_exists_with_expected_signature() {
-        // Compile-time existence check — the signature is part of the public
-        // API for the metrics module.
-        fn _assert<F>(_f: F)
-        where
-            F: for<'a> Fn(
-                &'a D1Database,
-                &'a str,
-                &'a str,
-                Option<&'a str>,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<PilotInputs>> + 'a>,
-            >,
-        {
-        }
-        // We're not invoking; just asserting the symbol exists with these
-        // ownership/lifetime constraints. The `Pin<Box<dyn Future>>` shape
-        // is what `async fn` desugars to, so if `query_inputs` ever loses
-        // its async marker or D1Database param this test breaks.
-        let _ = query_inputs;
     }
 }
