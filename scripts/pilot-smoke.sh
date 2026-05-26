@@ -47,7 +47,9 @@ done
 
 URL="${BASE_URL}/v1/metrics/pilot?window=${WINDOW}"
 if [[ -n "$TASK_TYPE" ]]; then
-  URL="${URL}&task_type=${TASK_TYPE}"
+  # URL-encode so values like "foo bar" or "ns:type" don't break the query.
+  TASK_TYPE_ENC=$(jq -rn --arg v "$TASK_TYPE" '$v|@uri')
+  URL="${URL}&task_type=${TASK_TYPE_ENC}"
 fi
 
 echo "→ GET ${URL}"

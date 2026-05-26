@@ -50,10 +50,10 @@ Query parameters:
 | KPI | Source | Computation | Notes |
 |---|---|---|---|
 | `task_completion_rate` | `mcp_tasks` | `COUNT(status='completed') / COUNT(*)` over window. Honors `task_type`. | Null when no tasks in window. |
-| `mttr_p50_seconds` / `mttr_p95_seconds` | `events_bronze` | For each failure event (`run_failed` / `task_failed` / `error`), delta in seconds to the next recovery event (`run_completed` / `task_completed` / `recovered`) for the same `run_id`. p50/p95 are linear-interpolation percentiles of the resulting deltas. | Null when no failure→recovery transitions in window. Cross-run boundaries are not crossed. |
-| `context_reuse_rate` | `events_bronze` (stopgap) | `COUNT(payload.hit = true) / COUNT(*)` over rows where `event_type = 'checkpoint_read'`. Truthiness check is `json_extract(payload, '$.hit') = 1` (SQLite JSON1 returns `1` for a JSON `true`). | **Stopgap definition** — see "Stopgap notes" below. Null when no checkpoint_read events in window. |
+| `mttr_p50_seconds` / `mttr_p95_seconds` | `events_bronze` | For each failure event (`run_failed` / `task_failed` / `error`), delta in seconds to the next recovery event (`run_completed` / `task_completed` / `recovered`) for the same `run_id`. p50/p95 are linear-interpolation percentiles of the resulting deltas. Up to 50,000 most-recent rows are sampled. | Null when no failure→recovery transitions in window. Cross-run boundaries are not crossed. Above 50,000 events, p50/p95 are approximate. |
+| `context_reuse_rate` | `events_bronze` (stopgap) | `COUNT(payload.hit ∈ {true, "true"}) / COUNT(*)` over rows where `event_type = 'checkpoint_read'`. Predicate is `json_extract(payload, '$.hit') IN (1, 'true', 'True', 'TRUE')`. | **Stopgap definition** — see "Stopgap notes" below. Null when no checkpoint_read events in window. |
 | `human_intervention_rate` | `policy_decisions` | `COUNT(decision='escalate') / COUNT(*)` over window. | Null when no decisions in window. |
-| `event_throughput_per_sec` | `events_bronze` | `COUNT(*) / window_seconds`. | Null when no events in window. |
+| `event_throughput_per_sec` | `events_bronze` | `COUNT(*) / window_seconds`. | Null when no events in window. **Caveat:** averaged over the *requested* window, not the active-data window — if the tenant's first ingest was N seconds ago and `window_seconds > N`, throughput under-reports by `~N / window_seconds`. |
 
 ### Stopgap notes — `context_reuse_rate`
 
@@ -122,14 +122,14 @@ Exit codes: `0` shape valid, `2` missing prereqs, `3` request failed / non-200, 
 
 ## API latency: how it gets into Analytics Engine
 
-The Worker emits one data point per non-public request to the `PILOT_LATENCY` Analytics Engine binding (see `emit_pilot_latency` in `src/lib.rs`). Schema:
+The Worker emits one data point per non-public request **that passes tenant authz** to the `PILOT_LATENCY` Analytics Engine binding (see `emit_pilot_latency` in `src/lib.rs`). Pre-router 401 / 403 responses are not sampled — they short-circuit before the emit path. Schema:
 
 | Field | Value |
 |---|---|
 | `index1` | `tenant_id` (sampling key) |
 | `blob1` | request path (raw — high-cardinality routes like `/v1/runs/:id` inflate the dataset; templating is a follow-up) |
 | `blob2` | HTTP method |
-| `blob3` | `tenant_id` (dimension) |
+| `blob3` | `APP_ENV` (`dev` / `staging` / `production` — for cross-env filtering in shared dashboards) |
 | `double1` | elapsed milliseconds |
 | `double2` | response status code |
 
