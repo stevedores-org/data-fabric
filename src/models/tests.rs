@@ -1032,7 +1032,8 @@ fn run_summary_actors_and_event_types_deduplication() {
     let actors = json["actors"].as_array().unwrap();
     assert_eq!(actors.len(), 2);
     // Verify no duplicates in serialized form
-    let unique: std::collections::HashSet<&str> = actors.iter().map(|a| a.as_str().unwrap()).collect();
+    let unique: std::collections::HashSet<&str> =
+        actors.iter().map(|a| a.as_str().unwrap()).collect();
     assert_eq!(unique.len(), actors.len());
 }
 
@@ -1082,10 +1083,46 @@ fn task_dependency_edge_with_full_causality_chain() {
 fn provenance_edge_full_causality_chain_round_trip() {
     // Full chain: run → plan → task → tool_call → artifact
     let chain = vec![
-        ProvenanceEdge { depth: 0, rel_type: "causality".into(), from_kind: "run".into(), from_id: "r1".into(), to_kind: "plan".into(), to_id: "p1".into(), relation: Some("planned".into()), created_at: Some("2026-01-01T00:00:00Z".into()) },
-        ProvenanceEdge { depth: 1, rel_type: "causality".into(), from_kind: "plan".into(), from_id: "p1".into(), to_kind: "task".into(), to_id: "t1".into(), relation: Some("scheduled".into()), created_at: Some("2026-01-01T00:00:01Z".into()) },
-        ProvenanceEdge { depth: 2, rel_type: "causality".into(), from_kind: "task".into(), from_id: "t1".into(), to_kind: "tool_call".into(), to_id: "tc1".into(), relation: Some("invoked".into()), created_at: Some("2026-01-01T00:00:02Z".into()) },
-        ProvenanceEdge { depth: 3, rel_type: "causality".into(), from_kind: "tool_call".into(), from_id: "tc1".into(), to_kind: "artifact".into(), to_id: "a1".into(), relation: Some("produced".into()), created_at: Some("2026-01-01T00:00:03Z".into()) },
+        ProvenanceEdge {
+            depth: 0,
+            rel_type: "causality".into(),
+            from_kind: "run".into(),
+            from_id: "r1".into(),
+            to_kind: "plan".into(),
+            to_id: "p1".into(),
+            relation: Some("planned".into()),
+            created_at: Some("2026-01-01T00:00:00Z".into()),
+        },
+        ProvenanceEdge {
+            depth: 1,
+            rel_type: "causality".into(),
+            from_kind: "plan".into(),
+            from_id: "p1".into(),
+            to_kind: "task".into(),
+            to_id: "t1".into(),
+            relation: Some("scheduled".into()),
+            created_at: Some("2026-01-01T00:00:01Z".into()),
+        },
+        ProvenanceEdge {
+            depth: 2,
+            rel_type: "causality".into(),
+            from_kind: "task".into(),
+            from_id: "t1".into(),
+            to_kind: "tool_call".into(),
+            to_id: "tc1".into(),
+            relation: Some("invoked".into()),
+            created_at: Some("2026-01-01T00:00:02Z".into()),
+        },
+        ProvenanceEdge {
+            depth: 3,
+            rel_type: "causality".into(),
+            from_kind: "tool_call".into(),
+            from_id: "tc1".into(),
+            to_kind: "artifact".into(),
+            to_id: "a1".into(),
+            relation: Some("produced".into()),
+            created_at: Some("2026-01-01T00:00:03Z".into()),
+        },
     ];
     let json = serde_json::to_string(&chain).unwrap();
     let parsed: Vec<ProvenanceEdge> = serde_json::from_str(&json).unwrap();
@@ -1107,9 +1144,16 @@ fn provenance_response_with_hops_parameter() {
         entity_id: "r1".into(),
         direction: "forward".into(),
         hops: 5,
-        edges: vec![
-            ProvenanceEdge { depth: 0, rel_type: "causality".into(), from_kind: "run".into(), from_id: "r1".into(), to_kind: "plan".into(), to_id: "p1".into(), relation: Some("planned".into()), created_at: None },
-        ],
+        edges: vec![ProvenanceEdge {
+            depth: 0,
+            rel_type: "causality".into(),
+            from_kind: "run".into(),
+            from_id: "r1".into(),
+            to_kind: "plan".into(),
+            to_id: "p1".into(),
+            relation: Some("planned".into()),
+            created_at: None,
+        }],
     };
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["hops"], 5);
@@ -1125,8 +1169,26 @@ fn provenance_response_backward_direction() {
         direction: "backward".into(),
         hops: 3,
         edges: vec![
-            ProvenanceEdge { depth: 0, rel_type: "causality".into(), from_kind: "tool_call".into(), from_id: "tc1".into(), to_kind: "artifact".into(), to_id: "a1".into(), relation: Some("produced".into()), created_at: None },
-            ProvenanceEdge { depth: 1, rel_type: "causality".into(), from_kind: "task".into(), from_id: "t1".into(), to_kind: "tool_call".into(), to_id: "tc1".into(), relation: Some("invoked".into()), created_at: None },
+            ProvenanceEdge {
+                depth: 0,
+                rel_type: "causality".into(),
+                from_kind: "tool_call".into(),
+                from_id: "tc1".into(),
+                to_kind: "artifact".into(),
+                to_id: "a1".into(),
+                relation: Some("produced".into()),
+                created_at: None,
+            },
+            ProvenanceEdge {
+                depth: 1,
+                rel_type: "causality".into(),
+                from_kind: "task".into(),
+                from_id: "t1".into(),
+                to_kind: "tool_call".into(),
+                to_id: "tc1".into(),
+                relation: Some("invoked".into()),
+                created_at: None,
+            },
         ],
     };
     let json = serde_json::to_string(&resp).unwrap();
@@ -1142,8 +1204,18 @@ fn replay_plan_response_planned_status() {
     let resp = ReplayPlanResponse {
         run_id: "r1".into(),
         steps: vec![
-            ReplayStep { sequence: 1, event_type: "run.start".into(), node_id: None, actor: Some("ci".into()) },
-            ReplayStep { sequence: 2, event_type: "task.start".into(), node_id: Some("n1".into()), actor: Some("agent".into()) },
+            ReplayStep {
+                sequence: 1,
+                event_type: "run.start".into(),
+                node_id: None,
+                actor: Some("ci".into()),
+            },
+            ReplayStep {
+                sequence: 2,
+                event_type: "task.start".into(),
+                node_id: Some("n1".into()),
+                actor: Some("agent".into()),
+            },
         ],
         status: "planned".into(),
     };
@@ -1213,7 +1285,10 @@ fn replay_execute_response_needs_review_status() {
     assert!(!json["within_variance"].as_bool().unwrap());
     assert_eq!(json["failure_classification"], "logical");
     assert_eq!(json["verification"]["confidence_score"], 75);
-    assert_eq!(json["verification"]["failed_gates"][0], "provenance_complete");
+    assert_eq!(
+        json["verification"]["failed_gates"][0],
+        "provenance_complete"
+    );
 }
 
 // ── Phase 4: Memory-Augmented Tasks (WS6) ────────────────────────
@@ -1267,7 +1342,9 @@ fn agent_task_with_memory_context_some() {
         lease_expires_at: None,
         created_at: "2026-01-01T00:00:00Z".into(),
         completed_at: None,
-        memory_context: Some("## Memory: Past Experience\n- Fixed similar build issue with cargo cache".into()),
+        memory_context: Some(
+            "## Memory: Past Experience\n- Fixed similar build issue with cargo cache".into(),
+        ),
     };
     let json = serde_json::to_string(&task).unwrap();
     let parsed: AgentTask = serde_json::from_str(&json).unwrap();
@@ -1299,7 +1376,9 @@ fn agent_task_memory_context_round_trip() {
         lease_expires_at: None,
         created_at: "2026-01-01T00:00:00Z".into(),
         completed_at: None,
-        memory_context: Some("## Memory Context\nPrevious analysis on similar codebase. Use AST traversal.".into()),
+        memory_context: Some(
+            "## Memory Context\nPrevious analysis on similar codebase. Use AST traversal.".into(),
+        ),
     };
     let json = serde_json::to_string(&task).unwrap();
     let parsed: AgentTask = serde_json::from_str(&json).unwrap();

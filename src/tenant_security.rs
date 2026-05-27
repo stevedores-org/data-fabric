@@ -197,20 +197,14 @@ pub struct TokenClaims {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthzError {
     /// The action is not permitted for this role.
-    PermissionDenied {
-        role: Role,
-        required: Permission,
-    },
+    PermissionDenied { role: Role, required: Permission },
     /// Attempted cross-tenant resource access.
     CrossTenantAccess {
         requesting_tenant: String,
         resource_tenant: String,
     },
     /// Rate limit exceeded.
-    RateLimitExceeded {
-        tenant_id: String,
-        limit: u64,
-    },
+    RateLimitExceeded { tenant_id: String, limit: u64 },
 }
 
 impl fmt::Display for AuthzError {
@@ -255,10 +249,8 @@ pub fn evaluate_authz(
     // 2. Permission check — prefer token-scoped overrides, else policy.
     let effective = match &claims.scoped_permissions {
         Some(scoped) => scoped.clone(),
-        None => AuthzPolicy::default().permissions_for_role_resource(
-            &claims.role,
-            &resource.resource_type,
-        ),
+        None => AuthzPolicy::default()
+            .permissions_for_role_resource(&claims.role, &resource.resource_type),
     };
 
     if effective.contains(&action) {
@@ -480,9 +472,7 @@ pub fn classify_field(field_name: &str) -> SecretClassification {
 /// Returns `Ok(())` if all fields classified as Restricted or Confidential
 /// have placeholder/encrypted values (i.e., start with `"enc:"` or `"***"`).
 /// Otherwise returns `Err` with the offending field names.
-pub fn validate_no_plaintext_secrets(
-    record: &serde_json::Value,
-) -> Result<(), Vec<String>> {
+pub fn validate_no_plaintext_secrets(record: &serde_json::Value) -> Result<(), Vec<String>> {
     let mut violations = Vec::new();
 
     if let Some(obj) = record.as_object() {
@@ -543,8 +533,7 @@ pub fn redact_sensitive_fields(record: &serde_json::Value) -> serde_json::Value 
 // ── 5. Cross-Tenant Federation ─────────────────────────────────────
 
 /// Configuration for cross-tenant data sharing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FederationConfig {
     /// Whether this tenant has opted into federation.
     pub opt_in: bool,
@@ -553,7 +542,6 @@ pub struct FederationConfig {
     /// Types of data that may be shared.
     pub sharing_scope: HashSet<String>,
 }
-
 
 /// Check whether federation is allowed between two tenants for a given
 /// data type.

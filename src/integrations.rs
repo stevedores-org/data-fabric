@@ -580,7 +580,8 @@ pub mod mom {
             return String::new();
         }
 
-        let mut augmented = String::from("\n\n## Agent Memory Context (Relevant Past Experience)\n\n");
+        let mut augmented =
+            String::from("\n\n## Agent Memory Context (Relevant Past Experience)\n\n");
 
         for (i, mem) in memories.iter().enumerate() {
             augmented.push_str(&format!(
@@ -592,8 +593,10 @@ pub mod mom {
             ));
 
             if let Some(meta) = &mem.metadata {
-                augmented.push_str(&format!("   Details: {}\n", serde_json::to_string(meta)
-                    .unwrap_or_else(|_| "...".to_string())));
+                augmented.push_str(&format!(
+                    "   Details: {}\n",
+                    serde_json::to_string(meta).unwrap_or_else(|_| "...".to_string())
+                ));
             }
         }
 
@@ -644,7 +647,8 @@ pub mod mom {
 
             // Set Content-Type header
             let headers = worker::Headers::new();
-            headers.append("Content-Type", "application/json")
+            headers
+                .append("Content-Type", "application/json")
                 .map_err(|e| format!("Failed to set header: {:?}", e))?;
             opts.with_headers(headers);
 
@@ -660,7 +664,7 @@ pub mod mom {
                 Ok(mut response) => {
                     // Check response status code
                     let status = response.status_code();
-                    if status < 200 || status >= 300 {
+                    if !(200..300).contains(&status) {
                         // MOM returned error status - graceful degradation
                         return Ok(vec![]);
                     }
@@ -980,7 +984,8 @@ mod tests {
                 score: 0.87,
                 id: "mem-2".to_string(),
                 kind: "fact".to_string(),
-                content: "DashMap provides atomic entry mutation for lock-free patterns".to_string(),
+                content: "DashMap provides atomic entry mutation for lock-free patterns"
+                    .to_string(),
                 metadata: Some(serde_json::json!({"crate": "dashmap", "version": "5.x"})),
                 created_at_ms: 1609459200000,
                 importance: Some(0.7),
