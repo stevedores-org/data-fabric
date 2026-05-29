@@ -58,11 +58,17 @@ max_batch_size = 50
 max_batch_timeout = 5
 
 # ── Analytics Engine: API latency sink (WS10 pilot KPI #6) ──────
-# Dataset is created on first writeDataPoint call; no pre-provisioning.
-# Querying p50/p95/p99: scripts/pilot-latency.sh
-[[analytics_engine_datasets]]
-binding = "PILOT_LATENCY"
-dataset = "data_fabric_pilot_latency"
+# DEFERRED to a follow-up PR. Enabling AE at the account level alone is
+# not sufficient for CF Workers Builds to deploy with the binding —
+# diagnosis needs dashboard log access. The worker code in src/lib.rs
+# already calls env.analytics_engine("PILOT_LATENCY").ok() and treats
+# the missing binding as non-fatal, so KPI #6 (latency p50/p95/p99)
+# silently becomes a no-op until this binding is re-added. The other
+# five KPIs continue to flow via /v1/metrics/pilot (D1-backed). See
+# follow-up issue once filed.
+# [[analytics_engine_datasets]]
+# binding = "PILOT_LATENCY"
+# dataset = "data_fabric_pilot_latency"
 
 # ── Environments: MOM Integration (Phase 4 & 5) ──────────────────
 
@@ -88,9 +94,10 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
-[[env.development.analytics_engine_datasets]]
-binding = "PILOT_LATENCY"
-dataset = "data_fabric_pilot_latency_dev"
+# AE binding deferred — see top-level note above.
+# [[env.development.analytics_engine_datasets]]
+# binding = "PILOT_LATENCY"
+# dataset = "data_fabric_pilot_latency_dev"
 
 # Staging: Pre-production testing with stevedores.org
 [env.staging]
@@ -114,9 +121,10 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
-[[env.staging.analytics_engine_datasets]]
-binding = "PILOT_LATENCY"
-dataset = "data_fabric_pilot_latency_staging"
+# AE binding deferred — see top-level note above.
+# [[env.staging.analytics_engine_datasets]]
+# binding = "PILOT_LATENCY"
+# dataset = "data_fabric_pilot_latency_staging"
 
 # Production: Primary lornu.com with stevedores.org fallback
 [env.production]
@@ -140,6 +148,7 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
-[[env.production.analytics_engine_datasets]]
-binding = "PILOT_LATENCY"
-dataset = "data_fabric_pilot_latency"
+# AE binding deferred — see top-level note above.
+# [[env.production.analytics_engine_datasets]]
+# binding = "PILOT_LATENCY"
+# dataset = "data_fabric_pilot_latency"
