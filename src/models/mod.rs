@@ -8,6 +8,9 @@
 #[allow(dead_code)]
 mod entities;
 pub mod orchestration;
+mod telemetry;
+
+pub use telemetry::*;
 #[allow(dead_code)]
 mod relationships;
 mod requests;
