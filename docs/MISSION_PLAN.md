@@ -52,6 +52,7 @@
 
 ## Phase WS10: Pilot and Rollout
 - Phase 1 oxidizedgraph workload defined in `docs/ws10/PHASE1_WORKLOAD.md`
+- Baseline KPI endpoint (`GET /v1/metrics/pilot`) and `scripts/pilot-latency.sh` documented in `docs/ws10/METRICS_ENDPOINT.md`
 
 ## Immediate Next Tasks
 1. ~~Add D1 schema migration for silver entities.~~ (done: `migrations/0001_silver_entities.sql`, D1 binding in wrangler)
