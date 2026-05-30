@@ -26,12 +26,13 @@ SERVICE_NAME = "data-fabric"
 [durable_objects]
 bindings = [
   { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
-  { name = "THREAD_MANAGER", class_name = "ThreadManager" }
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" },
+  { name = "PLAY_MANAGER", class_name = "PlayManager" }
 ]
 
 [[migrations]]
 tag = "v1"
-new_classes = ["TaskLeaseManager", "ThreadManager"]
+new_classes = ["TaskLeaseManager", "ThreadManager", "PlayManager"]
 
 [ai]
 binding = "AI"
@@ -100,7 +101,8 @@ migrations_dir = "migrations"
 [env.development.durable_objects]
 bindings = [
   { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
-  { name = "THREAD_MANAGER", class_name = "ThreadManager" }
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" },
+  { name = "PLAY_MANAGER", class_name = "PlayManager" }
 ]
 [env.development.ai]
 binding = "AI"
@@ -137,7 +139,8 @@ migrations_dir = "migrations"
 [env.staging.durable_objects]
 bindings = [
   { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
-  { name = "THREAD_MANAGER", class_name = "ThreadManager" }
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" },
+  { name = "PLAY_MANAGER", class_name = "PlayManager" }
 ]
 [env.staging.ai]
 binding = "AI"
@@ -174,7 +177,8 @@ migrations_dir = "migrations"
 [env.production.durable_objects]
 bindings = [
   { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
-  { name = "THREAD_MANAGER", class_name = "ThreadManager" }
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" },
+  { name = "PLAY_MANAGER", class_name = "PlayManager" }
 ]
 [env.production.ai]
 binding = "AI"
