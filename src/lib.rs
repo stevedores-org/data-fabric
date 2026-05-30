@@ -10,12 +10,14 @@ mod pagination;
 mod policy;
 mod storage;
 mod task_do;
+mod thread_do;
 mod tenant;
 #[allow(dead_code)]
 mod tenant_security;
 mod verification;
 
 pub use task_do::TaskLeaseManager;
+pub use thread_do::ThreadManager;
 
 #[derive(Serialize)]
 struct HealthResponse<'a> {
@@ -819,6 +821,20 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let size = storage::put_blob(&bucket, &r2_key, state_bytes).await? as i64;
             db::create_checkpoint(&d1, &tenant_ctx.tenant_id, &id, &body, &r2_key, size).await?;
 
+            // 3. Update ThreadManager Durable Object (fast state)
+            let namespace = ctx.env.durable_object("THREAD_MANAGER")?;
+            let stub = namespace.id_from_name(&body.thread_id)?.get_stub()?;
+
+            let do_req = Request::new_with_init(
+                "https://do/checkpoint",
+                &RequestInit {
+                    method: Method::Post,
+                    body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
+                    ..Default::default()
+                },
+            )?;
+            stub.fetch_with_request(do_req).await?;
+
             Response::from_json(&models::CheckpointCreated {
                 id,
                 thread_id: body.thread_id,
@@ -830,9 +846,35 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             |req, ctx| async move {
                 let tenant_ctx = tenant::tenant_from_request(&req)?;
                 let thread_id = ctx.param("thread_id").unwrap().to_string();
+
+                // 1. Try fast path via ThreadManager Durable Object
+                let namespace = ctx.env.durable_object("THREAD_MANAGER")?;
+                let stub = namespace.id_from_name(&thread_id)?.get_stub()?;
+                
+                let do_req = Request::new("https://do/latest", Method::Get)?;
+                let mut do_resp = stub.fetch_with_request(do_req).await?;
+
+                if do_resp.status_code() == 200 {
+                    let data: serde_json::Value = do_resp.json().await?;
+                    return Response::from_json(&data);
+                }
+
+                // 2. Fallback to D1/R2 slow path
                 let d1 = ctx.env.d1("DB")?;
                 match db::get_latest_checkpoint(&d1, &tenant_ctx.tenant_id, &thread_id).await? {
-                    Some(row) => Response::from_json(&row.into_checkpoint()),
+                    Some(row) => {
+                        let bucket = ctx.env.bucket("ARTIFACTS")?;
+                        match storage::get_blob(&bucket, &row.state_r2_key).await? {
+                            Some(blob) => {
+                                let state: serde_json::Value = serde_json::from_slice(&blob)?;
+                                Response::from_json(&serde_json::json!({
+                                    "checkpoint": row.into_checkpoint(),
+                                    "state": state
+                                }))
+                            }
+                            None => Response::error("checkpoint state not found in R2", 404),
+                        }
+                    }
                     None => Response::error("no checkpoint found", 404),
                 }
             },
@@ -1627,7 +1669,7 @@ pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Conte
     Ok(())
 }
 
-fn generate_id() -> Result<String> {
+pub(crate) fn generate_id() -> Result<String> {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf)
         .map_err(|err| Error::RustError(format!("failed to generate id: {err}")))?;
