@@ -56,83 +56,48 @@ pub async fn create_task(
     Ok(())
 }
 
-pub async fn claim_next_task(
+pub async fn get_mcp_task_by_id(
     db: &D1Database,
     tenant_id: &str,
-    agent_id: &str,
-    capabilities: &[&str],
+    id: &str,
 ) -> Result<Option<models::AgentTask>> {
-    let now = now_iso();
-    let lease = lease_time(300);
-
-    // Build capability filter using parameterized placeholders (no string interpolation)
-    let result: Option<TaskIdRow> = if capabilities.is_empty() {
-        db.prepare(
-            "SELECT id FROM mcp_tasks WHERE tenant_id = ?1 AND status = 'pending' ORDER BY priority DESC, created_at ASC LIMIT 1",
-        )
-        .bind(&[JsValue::from_str(tenant_id)])?
-        .first(None)
-        .await?
-    } else {
-        let placeholders: Vec<String> = (2..=capabilities.len() + 1)
-            .map(|i| format!("?{}", i))
-            .collect();
-        let query = format!(
-            "SELECT id FROM mcp_tasks WHERE tenant_id = ?1 AND status = 'pending' AND task_type IN ({}) ORDER BY priority DESC, created_at ASC LIMIT 1",
-            placeholders.join(", ")
-        );
-        let mut bindings: Vec<JsValue> = vec![JsValue::from_str(tenant_id)];
-        bindings.extend(capabilities.iter().map(|c| JsValue::from_str(c)));
-        db.prepare(&query).bind(&bindings)?.first(None).await?
-    };
-    let task_id = match result {
-        Some(row) => row.id,
-        None => return Ok(None),
-    };
-
-    // Claim it atomically: only succeeds if still pending
-    let res: D1Result = db.prepare(
-        "UPDATE mcp_tasks SET status = 'running', agent_id = ?1, lease_expires_at = ?2 WHERE tenant_id = ?3 AND id = ?4 AND status = 'pending'",
-    )
-    .bind(&[
-        JsValue::from_str(agent_id),
-        JsValue::from_str(&lease),
-        JsValue::from_str(tenant_id),
-        JsValue::from_str(&task_id),
-    ])?
-    .run()
-    .await?;
-
-    let changed = res
-        .meta()?
-        .map(|m| m.changes.unwrap_or(0) > 0)
-        .unwrap_or(false);
-    if !changed {
-        return Ok(None);
-    }
-
-    // Update agent heartbeat
-    db.prepare("UPDATE agents SET last_heartbeat = ?1 WHERE tenant_id = ?2 AND id = ?3")
-        .bind(&[
-            JsValue::from_str(&now),
-            JsValue::from_str(tenant_id),
-            JsValue::from_str(agent_id),
-        ])?
-        .run()
-        .await?;
-
-    // Fetch full task
     let task: Option<TaskRow> = db
-        .prepare("SELECT * FROM mcp_tasks WHERE tenant_id = ?1 AND id = ?2 AND agent_id = ?3")
-        .bind(&[
-            JsValue::from_str(tenant_id),
-            JsValue::from_str(&task_id),
-            JsValue::from_str(agent_id),
-        ])?
+        .prepare("SELECT * FROM mcp_tasks WHERE tenant_id = ?1 AND id = ?2")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
         .first(None)
         .await?;
 
     Ok(task.map(|r| r.into_agent_task()))
+}
+
+pub async fn sync_task_status(
+    db: &D1Database,
+    tenant_id: &str,
+    task: &models::AgentTask,
+) -> Result<()> {
+    let result_json = task.result.as_ref().map(|v| serde_json::to_string(v).unwrap());
+
+    db.prepare(
+        "UPDATE mcp_tasks SET status = ?1, agent_id = ?2, result = ?3, retry_count = ?4, lease_expires_at = ?5, completed_at = ?6
+         WHERE tenant_id = ?7 AND id = ?8",
+    )
+    .bind(&[
+        JsValue::from_str(&task.status),
+        opt_str(&task.agent_id),
+        match &result_json {
+            Some(s) => JsValue::from_str(s),
+            None => JsValue::NULL,
+        },
+        JsValue::from(task.retry_count),
+        opt_str(&task.lease_expires_at),
+        opt_str(&task.completed_at),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&task.id),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
 }
 
 pub async fn heartbeat_task(
@@ -160,78 +125,6 @@ pub async fn heartbeat_task(
         .map(|m| m.changes.unwrap_or(0) > 0)
         .unwrap_or(false);
     Ok(changed)
-}
-
-pub async fn complete_task(
-    db: &D1Database,
-    tenant_id: &str,
-    task_id: &str,
-    result_val: Option<&serde_json::Value>,
-) -> Result<bool> {
-    let now = now_iso();
-    let result_json = result_val.map(|v| serde_json::to_string(v).unwrap());
-    let res: D1Result = db
-        .prepare(
-            "UPDATE mcp_tasks SET status = 'completed', result = ?1, completed_at = ?2 WHERE tenant_id = ?3 AND id = ?4 AND status = 'running'",
-        )
-        .bind(&[
-            match &result_json {
-                Some(s) => JsValue::from_str(s),
-                None => JsValue::NULL,
-            },
-            JsValue::from_str(&now),
-            JsValue::from_str(tenant_id),
-            JsValue::from_str(task_id),
-        ])?
-        .run()
-        .await?;
-
-    let changed = res
-        .meta()?
-        .map(|m| m.changes.unwrap_or(0) > 0)
-        .unwrap_or(false);
-    Ok(changed)
-}
-
-pub async fn fail_task(
-    db: &D1Database,
-    tenant_id: &str,
-    task_id: &str,
-    error: &str,
-) -> Result<String> {
-    let now = now_iso();
-
-    // Check retry eligibility
-    let task: Option<RetryRow> = db
-        .prepare(
-            "SELECT retry_count, max_retries FROM mcp_tasks WHERE tenant_id = ?1 AND id = ?2 AND status = 'running'",
-        )
-        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(task_id)])?
-        .first(None)
-        .await?;
-
-    let (new_status, new_retry) = match task {
-        Some(row) if row.retry_count < row.max_retries => ("pending", row.retry_count + 1),
-        _ => ("failed", 0),
-    };
-
-    let result_json = serde_json::json!({ "error": error }).to_string();
-
-    db.prepare(
-        "UPDATE mcp_tasks SET status = ?1, retry_count = CASE WHEN ?1 = 'pending' THEN ?2 ELSE retry_count END, result = ?3, agent_id = CASE WHEN ?1 = 'pending' THEN NULL ELSE agent_id END, lease_expires_at = NULL, completed_at = CASE WHEN ?1 = 'failed' THEN ?4 ELSE NULL END WHERE tenant_id = ?5 AND id = ?6",
-    )
-    .bind(&[
-        JsValue::from_str(new_status),
-        JsValue::from(new_retry),
-        JsValue::from_str(&result_json),
-        JsValue::from_str(&now),
-        JsValue::from_str(tenant_id),
-        JsValue::from_str(task_id),
-    ])?
-    .run()
-    .await?;
-
-    Ok(new_status.to_string())
 }
 
 // ── Agents ──────────────────────────────────────────────────────
@@ -1911,6 +1804,44 @@ pub async fn list_verification_evidence(
     bindings.push(JsValue::from(limit));
     let result: D1Result = db.prepare(&query).bind(&bindings)?.all().await?;
     result.results()
+}
+
+pub async fn record_telemetry(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::TelemetrySnapshot,
+) -> Result<()> {
+    let now = now_iso();
+    let payload_json = body.payload.as_ref().map(|v| serde_json::to_string(v).unwrap());
+
+    db.prepare(
+        "INSERT INTO telemetry_snapshots (
+            id, tenant_id, agent_name, agent_type, status,
+            duration_seconds, total_attempts, success_rate, namespace,
+            payload, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&body.agent_name),
+        JsValue::from_str(&body.agent_type),
+        JsValue::from_str(&body.status),
+        JsValue::from(body.duration_seconds),
+        JsValue::from(body.total_attempts),
+        JsValue::from(body.success_rate),
+        JsValue::from_str(&body.namespace),
+        match &payload_json {
+            Some(s) => JsValue::from_str(s),
+            None => JsValue::NULL,
+        },
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
 }
 
 pub async fn provision_tenant(

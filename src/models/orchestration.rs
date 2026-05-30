@@ -15,7 +15,7 @@ pub struct CreateAgentTask {
     pub max_retries: Option<i32>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentTask {
     pub id: String,
     pub job_id: String,

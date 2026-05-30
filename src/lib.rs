@@ -9,10 +9,13 @@ mod models;
 mod pagination;
 mod policy;
 mod storage;
+mod task_do;
 mod tenant;
 #[allow(dead_code)]
 mod tenant_security;
 mod verification;
+
+pub use task_do::TaskLeaseManager;
 
 #[derive(Serialize)]
 struct HealthResponse<'a> {
@@ -597,7 +600,30 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
+
+            // Create in D1 for persistence
             db::create_task(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
+
+            // Fetch the task as an AgentTask for the DO
+            let task = match db::get_mcp_task_by_id(&d1, &tenant_ctx.tenant_id, &id).await? {
+                Some(t) => t,
+                None => return Response::error("failed to fetch created task", 500),
+            };
+
+            // Enqueue in Durable Object for active management
+            let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
+            let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
+
+            let do_req = Request::new_with_init(
+                "https://do/enqueue",
+                &RequestInit {
+                    method: Method::Post,
+                    body: Some(serde_wasm_bindgen::to_value(&task).map_err(|e| Error::RustError(e.to_string()))?),
+                    ..Default::default()
+                },
+            )?;
+            stub.fetch_with_request(do_req).await?;
+
             Response::from_json(&models::TaskCreated {
                 id,
                 status: "pending".into(),
@@ -615,33 +641,38 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(id) => id.clone(),
                 None => return Response::error("agent_id required", 400),
             };
-            let caps_str = params.get("cap").cloned().unwrap_or_default();
-            let caps: Vec<&str> = if caps_str.is_empty() {
-                vec![]
-            } else {
-                caps_str.split(',').collect()
-            };
+            let caps = params.get("cap").cloned().unwrap_or_default();
 
-            let d1 = ctx.env.d1("DB")?;
-            match db::claim_next_task(&d1, &tenant_ctx.tenant_id, &agent_id, &caps).await? {
-                Some(mut task) => {
-                    // Augment task with agent's memory context from MOM (if available)
-                    // This allows agents to reason with past experience
-                    let mom_endpoint = ctx.env.var("MOM_ENDPOINT").ok().map(|v| v.to_string());
-                    if let Some(endpoint) = mom_endpoint {
-                        let memory_context = augment_task_with_memory(
-                            &agent_id,
-                            &tenant_ctx.tenant_id,
-                            &task,
-                            &endpoint,
-                        )
-                        .await;
-                        task.memory_context = memory_context;
-                    }
-                    Response::from_json(&task)
-                }
-                None => Ok(Response::empty()?.with_status(204)),
+            let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
+            let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
+            
+            let do_url = format!("https://do/claim?agent_id={}&caps={}", agent_id, caps);
+            let do_req = Request::new(&do_url, Method::Post)?;
+            let mut do_resp = stub.fetch_with_request(do_req).await?;
+
+            if do_resp.status_code() == 204 {
+                return Ok(Response::empty()?.with_status(204));
             }
+
+            let mut task: models::AgentTask = do_resp.json().await?;
+            
+            // Sync to D1 (best effort)
+            let d1 = ctx.env.d1("DB")?;
+            let _ = db::sync_task_status(&d1, &tenant_ctx.tenant_id, &task).await;
+
+            // Augment task with agent's memory context from MOM (if available)
+            let mom_endpoint = ctx.env.var("MOM_ENDPOINT").ok().map(|v| v.to_string());
+            if let Some(endpoint) = mom_endpoint {
+                let memory_context = augment_task_with_memory(
+                    &agent_id,
+                    &tenant_ctx.tenant_id,
+                    &task,
+                    &endpoint,
+                )
+                .await;
+                task.memory_context = memory_context;
+            }
+            Response::from_json(&task)
         })
         .post_async("/mcp/task/:id/heartbeat", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
@@ -659,10 +690,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("agent_id required", 400),
             };
 
-            let d1 = ctx.env.d1("DB")?;
-            let updated =
-                db::heartbeat_task(&d1, &tenant_ctx.tenant_id, &task_id, &agent_id).await?;
-            if updated {
+            let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
+            let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
+            
+            let do_url = format!("https://do/heartbeat?task_id={}&agent_id={}", task_id, agent_id);
+            let do_req = Request::new(&do_url, Method::Post)?;
+            let mut do_resp = stub.fetch_with_request(do_req).await?;
+
+            if do_resp.status_code() == 200 {
+                // Update D1 (best effort)
+                let d1 = ctx.env.d1("DB")?;
+                let _ = db::heartbeat_task(&d1, &tenant_ctx.tenant_id, &task_id, &agent_id).await;
                 Response::from_json(&serde_json::json!({ "ok": true }))
             } else {
                 Response::error("task not found or not owned by agent", 404)
@@ -675,11 +713,25 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("missing task id", 400),
             };
             let body: models::TaskCompleteRequest = req.json().await?;
-            let d1 = ctx.env.d1("DB")?;
-            let updated =
-                db::complete_task(&d1, &tenant_ctx.tenant_id, &task_id, body.result.as_ref())
-                    .await?;
-            if updated {
+            
+            let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
+            let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
+            
+            let do_req = Request::new_with_init(
+                &format!("https://do/complete/{}", task_id),
+                &RequestInit {
+                    method: Method::Post,
+                    body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
+                    ..Default::default()
+                },
+            )?;
+            let mut do_resp = stub.fetch_with_request(do_req).await?;
+
+            if do_resp.status_code() == 200 {
+                let task: models::AgentTask = do_resp.json().await?;
+                // Sync to D1
+                let d1 = ctx.env.d1("DB")?;
+                db::sync_task_status(&d1, &tenant_ctx.tenant_id, &task).await?;
                 Response::from_json(&serde_json::json!({ "status": "completed" }))
             } else {
                 Response::error("task not found or not running", 404)
@@ -692,10 +744,29 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("missing task id", 400),
             };
             let body: models::TaskFailRequest = req.json().await?;
-            let d1 = ctx.env.d1("DB")?;
-            let new_status =
-                db::fail_task(&d1, &tenant_ctx.tenant_id, &task_id, &body.error).await?;
-            Response::from_json(&serde_json::json!({ "status": new_status }))
+
+            let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
+            let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
+            
+            let do_req = Request::new_with_init(
+                &format!("https://do/fail/{}", task_id),
+                &RequestInit {
+                    method: Method::Post,
+                    body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
+                    ..Default::default()
+                },
+            )?;
+            let mut do_resp = stub.fetch_with_request(do_req).await?;
+            
+            if do_resp.status_code() == 200 {
+                let task: models::AgentTask = do_resp.json().await?;
+                // Sync to D1
+                let d1 = ctx.env.d1("DB")?;
+                db::sync_task_status(&d1, &tenant_ctx.tenant_id, &task).await?;
+                Response::from_json(&serde_json::json!({ "status": task.status }))
+            } else {
+                Response::error("task not found or not running", 404)
+            }
         })
         // ── Agents (M1) ───────────────────────────────────────
         .post_async("/v1/agents", |mut req, ctx| async move {
@@ -715,6 +786,19 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let d1 = ctx.env.d1("DB")?;
             let agents = db::list_agents(&d1, &tenant_ctx.tenant_id).await?;
             Response::from_json(&serde_json::json!({ "agents": agents }))
+        })
+        .post_async("/v1/telemetry", |mut req, ctx| async move {
+            let body: models::TelemetrySnapshot = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            
+            db::record_telemetry(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
+            
+            Response::from_json(&models::TelemetryAck {
+                id,
+                accepted: true,
+            })
         })
         // ── Checkpoints (M2) ──────────────────────────────────
         .post_async("/v1/checkpoints", |mut req, ctx| async move {
