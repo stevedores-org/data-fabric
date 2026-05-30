@@ -11,6 +11,7 @@ mod policy;
 mod storage;
 mod task_do;
 mod thread_do;
+mod vector_index;
 mod tenant;
 #[allow(dead_code)]
 mod tenant_security;
@@ -299,7 +300,23 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let body: models::UpsertMemoryItemRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
+
+            // 1. Persistent storage in D1
             let expires_at = db::upsert_memory_item(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
+
+            // 2. Semantic indexing in Vectorize
+            if let Ok(index) = vector_index::SemanticIndex::new(&ctx.env) {
+                if let Ok(vector) = index.embed(&body.summary).await {
+                    let metadata = serde_json::json!({
+                        "repo": body.repo,
+                        "kind": format!("{:?}", body.kind),
+                        "run_id": body.run_id,
+                        "tenant_id": tenant_ctx.tenant_id
+                    });
+                    let _ = index.insert(&id, vector, metadata).await;
+                }
+            }
+
             Response::from_json(&models::MemoryItemCreated {
                 id,
                 status: "indexed".into(),
@@ -310,7 +327,34 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::RetrieveMemoryRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-            let response = db::retrieve_memory(&d1, &tenant_ctx.tenant_id, &body).await?;
+            
+            let start = js_sys::Date::now();
+
+            // 1. Semantic Search via Vectorize (if query provided)
+            let mut semantic_ids = Vec::new();
+            if !body.query.is_empty() {
+                if let Ok(index) = vector_index::SemanticIndex::new(&ctx.env) {
+                    if let Ok(vector) = index.embed(&body.query).await {
+                        if let Ok(results) = index.query(vector, body.top_k).await {
+                            if let Some(matches) = results["matches"].as_array() {
+                                for m in matches {
+                                    if let Some(id) = m["id"].as_str() {
+                                        semantic_ids.push(id.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Relational Search + Filter via D1
+            // Hybrid approach: use semantic IDs if available, or just use D1 filters
+            let response = db::retrieve_memory_hybrid(&d1, &tenant_ctx.tenant_id, &body, &semantic_ids).await?;
+
+            let _latency_ms = (js_sys::Date::now() - start) as i64;
+            // Update latency in response if needed, though D1 usually tracks its own
+            
             Response::from_json(&response)
         })
         .post_async("/v1/memory/context-pack", |mut req, ctx| async move {

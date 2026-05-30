@@ -33,6 +33,13 @@ bindings = [
 tag = "v1"
 new_classes = ["TaskLeaseManager", "ThreadManager"]
 
+[ai]
+binding = "AI"
+
+[[vectorize]]
+binding = "SEMANTIC_INDEX"
+index_name = "data-fabric-semantic-index"
+
 # ── D1: structured metadata, lineage, domain entities ───────────
 # Create DB: wrangler d1 create data-fabric
 # Apply migrations: wrangler d1 migrations apply data-fabric --remote
@@ -95,6 +102,11 @@ bindings = [
   { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
   { name = "THREAD_MANAGER", class_name = "ThreadManager" }
 ]
+[env.development.ai]
+binding = "AI"
+[[env.development.vectorize]]
+binding = "SEMANTIC_INDEX"
+index_name = "data-fabric-semantic-index-dev"
 [[env.development.r2_buckets]]
 binding = "ARTIFACTS"
 bucket_name = "data-fabric-artifacts"
@@ -127,6 +139,11 @@ bindings = [
   { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
   { name = "THREAD_MANAGER", class_name = "ThreadManager" }
 ]
+[env.staging.ai]
+binding = "AI"
+[[env.staging.vectorize]]
+binding = "SEMANTIC_INDEX"
+index_name = "data-fabric-semantic-index-staging"
 [[env.staging.r2_buckets]]
 binding = "ARTIFACTS"
 bucket_name = "data-fabric-artifacts"
@@ -159,6 +176,11 @@ bindings = [
   { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
   { name = "THREAD_MANAGER", class_name = "ThreadManager" }
 ]
+[env.production.ai]
+binding = "AI"
+[[env.production.vectorize]]
+binding = "SEMANTIC_INDEX"
+index_name = "data-fabric-semantic-index-prod"
 [[env.production.r2_buckets]]
 binding = "ARTIFACTS"
 bucket_name = "data-fabric-artifacts"
