@@ -11,6 +11,7 @@ mod policy;
 mod storage;
 mod task_do;
 mod thread_do;
+mod play_do;
 mod vector_index;
 mod tenant;
 #[allow(dead_code)]
@@ -19,6 +20,7 @@ mod verification;
 
 pub use task_do::TaskLeaseManager;
 pub use thread_do::ThreadManager;
+pub use play_do::PlayManager;
 
 #[derive(Serialize)]
 struct HealthResponse<'a> {
@@ -410,6 +412,41 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let d1 = ctx.env.d1("DB")?;
             let summary = db::memory_eval_summary(&d1, &tenant_ctx.tenant_id).await?;
             Response::from_json(&summary)
+        })
+        // ── Plays (Orchestration) ──────────────────────────────
+        .post_async("/v1/plays/:name/launch", |mut req, ctx| async move {
+            let _tenant_ctx = tenant::tenant_from_request(&req)?;
+            let play_name = ctx.param("name").unwrap().to_string();
+            let body: models::PlayLaunchRequest = req.json().await.unwrap_or(models::PlayLaunchRequest {
+                play_name: play_name.clone(),
+                job_id: None,
+                metadata: None,
+            });
+
+            // 1. Fetch play definition from D1
+            let d1 = ctx.env.d1("DB")?;
+            let def = match db::get_play_definition(&d1, &play_name).await? {
+                Some(d) => d,
+                None => return Response::error(format!("play '{}' not found", play_name), 404),
+            };
+
+            // 2. Launch via PlayManager Durable Object
+            let run_id = body.job_id.unwrap_or_else(|| generate_id().unwrap());
+            let namespace = ctx.env.durable_object("PLAY_MANAGER")?;
+            let stub = namespace.id_from_name(&run_id)?.get_stub()?;
+            
+            let mut do_req = Request::new_with_init(
+                "https://do/launch",
+                &RequestInit {
+                    method: Method::Post,
+                    body: Some(serde_wasm_bindgen::to_value(&def).map_err(|e| Error::RustError(e.to_string()))?),
+                    ..Default::default()
+                }
+            )?;
+            let mut do_resp = stub.fetch_with_request(do_req).await?;
+            
+            let result: serde_json::Value = do_resp.json().await?;
+            Response::from_json(&result)
         })
         // ── Artifacts (R2-backed) ─────────────────────────────
         .put_async("/v1/artifacts/:key", |mut req, ctx| async move {
