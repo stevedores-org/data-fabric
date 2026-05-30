@@ -25,12 +25,13 @@ SERVICE_NAME = "data-fabric"
 
 [durable_objects]
 bindings = [
-  { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" }
+  { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" }
 ]
 
 [[migrations]]
 tag = "v1"
-new_classes = ["TaskLeaseManager"]
+new_classes = ["TaskLeaseManager", "ThreadManager"]
 
 # ── D1: structured metadata, lineage, domain entities ───────────
 # Create DB: wrangler d1 create data-fabric
@@ -78,7 +79,8 @@ database_id = "6afcdc53-3d1c-4e99-941c-76b5d1a6fda2"
 migrations_dir = "migrations"
 [env.development.durable_objects]
 bindings = [
-  { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" }
+  { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" }
 ]
 [[env.development.r2_buckets]]
 binding = "ARTIFACTS"
@@ -105,7 +107,8 @@ database_id = "6afcdc53-3d1c-4e99-941c-76b5d1a6fda2"
 migrations_dir = "migrations"
 [env.staging.durable_objects]
 bindings = [
-  { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" }
+  { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" }
 ]
 [[env.staging.r2_buckets]]
 binding = "ARTIFACTS"
@@ -132,7 +135,8 @@ database_id = "6afcdc53-3d1c-4e99-941c-76b5d1a6fda2"
 migrations_dir = "migrations"
 [env.production.durable_objects]
 bindings = [
-  { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" }
+  { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" }
 ]
 [[env.production.r2_buckets]]
 binding = "ARTIFACTS"
