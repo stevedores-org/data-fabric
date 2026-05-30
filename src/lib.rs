@@ -423,26 +423,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 metadata: None,
             });
 
-            // 1. Fetch play definition (mock for now, should be in D1)
-            let def = models::PlayDefinition {
-                name: play_name.clone(),
-                goal: format!("Execute play {}", play_name),
-                tasks: vec![
-                    models::PlayTaskDefinition {
-                        id: "task-1".into(),
-                        task_type: "research".into(),
-                        priority: 10,
-                        params: None,
-                        depends_on: vec![],
-                    },
-                    models::PlayTaskDefinition {
-                        id: "task-2".into(),
-                        task_type: "implement".into(),
-                        priority: 5,
-                        params: None,
-                        depends_on: vec!["task-1".into()],
-                    }
-                ],
+            // 1. Fetch play definition from D1
+            let d1 = ctx.env.d1("DB")?;
+            let def = match db::get_play_definition(&d1, &play_name).await? {
+                Some(d) => d,
+                None => return Response::error(format!("play '{}' not found", play_name), 404),
             };
 
             // 2. Launch via PlayManager Durable Object
