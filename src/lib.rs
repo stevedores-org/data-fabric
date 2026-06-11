@@ -41,6 +41,115 @@ fn request_path(req: &Request) -> Result<String> {
     Ok(req.url()?.path().to_string())
 }
 
+/// Build a URL targeting the internal `https://do/...` namespace used by
+/// Durable Object stubs, with each query parameter percent-encoded.
+///
+/// The previous implementation interpolated user-controlled values
+/// (`agent_id`, `task_id`, `cap`) into the URL with `format!`. A caller
+/// supplying e.g. `agent_id = "agent-1&caps=evil"` would inject a second
+/// `caps` parameter on its way through the DO boundary. Using
+/// `url::Url::query_pairs_mut` ensures each value is percent-encoded.
+fn build_do_url(path: &str, params: &[(&str, &str)]) -> Result<String> {
+    let mut url = url::Url::parse("https://do")
+        .map_err(|e| Error::RustError(format!("internal: bad DO base url: {}", e)))?;
+    // `path` is a developer-controlled literal (e.g. "/claim"), so we can set
+    // it directly. We only encode the dynamic params.
+    url.set_path(path);
+    {
+        let mut qp = url.query_pairs_mut();
+        for (k, v) in params {
+            qp.append_pair(k, v);
+        }
+    }
+    Ok(url.into())
+}
+
+#[cfg(test)]
+mod do_url_tests {
+    use super::build_do_url;
+
+    /// Regression test for the URL-injection findings in crr2:
+    /// values passed via `params` must be percent-encoded so a caller can't
+    /// smuggle additional query parameters across the DO boundary.
+    #[test]
+    fn build_do_url_encodes_injected_query_separators() {
+        let url = build_do_url(
+            "/claim",
+            &[
+                ("agent_id", "agent-1&caps=evil"),
+                ("caps", "rust"),
+            ],
+        )
+        .expect("url must build");
+
+        let parsed = url::Url::parse(&url).expect("url must parse");
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.host_str(), Some("do"));
+        assert_eq!(parsed.path(), "/claim");
+
+        // Exactly one `caps` parameter — the legitimate one. If the injected
+        // `&caps=evil` had been interpolated raw, we'd see two.
+        let caps_count = parsed
+            .query_pairs()
+            .filter(|(k, _)| k == "caps")
+            .count();
+        assert_eq!(caps_count, 1, "expected one caps param, url was: {}", url);
+
+        // The agent_id round-trips with `&` and `=` preserved as data, not
+        // interpreted as separators.
+        let agent_id_value = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "agent_id")
+            .map(|(_, v)| v.into_owned())
+            .expect("agent_id must be present");
+        assert_eq!(agent_id_value, "agent-1&caps=evil");
+
+        // Sanity: the legitimate caps value is preserved.
+        let caps_value = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "caps")
+            .map(|(_, v)| v.into_owned())
+            .expect("caps must be present");
+        assert_eq!(caps_value, "rust");
+    }
+
+    #[test]
+    fn build_do_url_encodes_path_aware_chars_in_query() {
+        let url = build_do_url(
+            "/heartbeat",
+            &[
+                ("task_id", "abc/extra?injected=1"),
+                ("agent_id", "agent#1"),
+            ],
+        )
+        .expect("url must build");
+
+        let parsed = url::Url::parse(&url).expect("url must parse");
+        assert_eq!(parsed.path(), "/heartbeat");
+
+        // No injected `injected=1` from task_id.
+        assert!(
+            parsed.query_pairs().all(|(k, _)| k != "injected"),
+            "task_id must not smuggle additional params: {}",
+            url
+        );
+
+        let task_id = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "task_id")
+            .map(|(_, v)| v.into_owned())
+            .expect("task_id must be present");
+        assert_eq!(task_id, "abc/extra?injected=1");
+
+        let agent_id = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "agent_id")
+            .map(|(_, v)| v.into_owned())
+            .expect("agent_id must be present");
+        assert_eq!(agent_id, "agent#1");
+    }
+}
+
 /// Augment a claimed task with agent's memory context from MOM.
 ///
 /// Enables agents to reason with past experiences by injecting relevant memories
@@ -764,7 +873,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
             let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
 
-            let do_url = format!("https://do/claim?agent_id={}&caps={}", agent_id, caps);
+            let do_url = build_do_url("/claim", &[("agent_id", &agent_id), ("caps", &caps)])?;
             let do_req = Request::new(&do_url, Method::Post)?;
             let mut do_resp = stub.fetch_with_request(do_req).await?;
 
@@ -843,7 +952,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
             let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
             
-            let do_url = format!("https://do/heartbeat?task_id={}&agent_id={}", task_id, agent_id);
+            let do_url = build_do_url(
+                "/heartbeat",
+                &[("task_id", &task_id), ("agent_id", &agent_id)],
+            )?;
             let do_req = Request::new(&do_url, Method::Post)?;
             let do_resp = stub.fetch_with_request(do_req).await?;
 

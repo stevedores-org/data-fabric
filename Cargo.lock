@@ -262,6 +262,7 @@ dependencies = [
 name = "data-fabric-client"
 version = "0.1.1"
 dependencies = [
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",
@@ -281,6 +282,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "url",
  "wasm-bindgen",
  "worker",
  "worker-macros",
