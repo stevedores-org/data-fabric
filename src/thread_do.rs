@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use worker::*;
 
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug)]
 struct ThreadState {
     latest_checkpoint: Option<Checkpoint>,
@@ -12,6 +13,7 @@ struct ThreadState {
 #[durable_object]
 pub struct ThreadManager {
     state: State,
+    #[allow(dead_code)]
     env: Env,
 }
 
