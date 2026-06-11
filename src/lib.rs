@@ -737,6 +737,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 return Ok(Response::empty()?.with_status(204));
             }
 
+
             let mut task: models::AgentTask = do_resp.json().await?;
             
             // Sync to D1 (best effort)
