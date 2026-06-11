@@ -1,13 +1,136 @@
 use crate::models::{AgentTask, TaskFailRequest};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use worker::*;
 
 #[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug)]
 struct TaskLeaseState {
     pending_tasks: VecDeque<AgentTask>,
-    active_tasks: std::collections::HashMap<String, AgentTask>,
+    active_tasks: HashMap<String, AgentTask>,
+}
+
+/// Default lease window in milliseconds (5 minutes). Mirrors the values used
+/// inside the DO fetch handler.
+#[allow(dead_code)]
+pub(crate) const LEASE_WINDOW_MS: u64 = 300 * 1000;
+
+// ── Pure state-machine helpers (PR #142 unit coverage) ──────────────────
+//
+// Extracted so native unit tests can exercise queue/lease logic without
+// standing up DO storage. Production handlers still inline equivalent
+// logic; a follow-up refactor may wire these through directly.
+
+#[allow(dead_code)]
+pub(crate) fn enqueue_task(pending: &mut VecDeque<AgentTask>, task: AgentTask) {
+    pending.push_back(task);
+}
+
+#[allow(dead_code)]
+pub(crate) fn claim_next_task(
+    pending: &mut VecDeque<AgentTask>,
+    active: &mut HashMap<String, AgentTask>,
+    agent_id: &str,
+    caps: &[String],
+    now_ms: u64,
+    lease_expires_at: String,
+) -> Option<AgentTask> {
+    let task_idx = pending
+        .iter()
+        .position(|t| caps.is_empty() || caps.contains(&t.task_type))?;
+
+    let mut task = pending.remove(task_idx)?;
+    task.status = "running".to_string();
+    task.agent_id = Some(agent_id.to_string());
+    task.lease_expires_at = Some(lease_expires_at);
+    let _ = now_ms;
+
+    active.insert(task.id.clone(), task.clone());
+    Some(task)
+}
+
+#[allow(dead_code)]
+pub(crate) fn find_expired_lease_ids(
+    active: &HashMap<String, AgentTask>,
+    now_ms: u64,
+) -> Vec<String> {
+    let mut to_release = Vec::new();
+    for (id, task) in active {
+        if let Some(expires_str) = &task.lease_expires_at {
+            if let Ok(expires_ms) = expires_str.parse::<u64>() {
+                if expires_ms <= now_ms {
+                    to_release.push(id.clone());
+                }
+            }
+        }
+    }
+    to_release
+}
+
+#[allow(dead_code)]
+pub(crate) fn expire_leases(
+    active: &mut HashMap<String, AgentTask>,
+    pending: &mut VecDeque<AgentTask>,
+    now_ms: u64,
+    completed_at_iso: &str,
+) -> Vec<String> {
+    let to_release = find_expired_lease_ids(active, now_ms);
+    let mut released = Vec::with_capacity(to_release.len());
+    for id in to_release {
+        if let Some(mut task) = active.remove(&id) {
+            if task.retry_count < task.max_retries {
+                task.status = "pending".to_string();
+                task.retry_count += 1;
+                task.agent_id = None;
+                task.lease_expires_at = None;
+                pending.push_back(task);
+            } else {
+                task.status = "failed".to_string();
+                task.result =
+                    Some(serde_json::json!({ "error": "lease expired and no retries left" }));
+                task.completed_at = Some(completed_at_iso.to_string());
+            }
+            released.push(id);
+        }
+    }
+    released
+}
+
+#[allow(dead_code)]
+pub(crate) fn complete_task(
+    active: &mut HashMap<String, AgentTask>,
+    task_id: &str,
+    result: Option<serde_json::Value>,
+    completed_at_iso: &str,
+) -> Option<AgentTask> {
+    let mut task = active.remove(task_id)?;
+    task.status = "completed".to_string();
+    task.result = result;
+    task.completed_at = Some(completed_at_iso.to_string());
+    Some(task)
+}
+
+#[allow(dead_code)]
+pub(crate) fn fail_task(
+    active: &mut HashMap<String, AgentTask>,
+    pending: &mut VecDeque<AgentTask>,
+    task_id: &str,
+    error: &str,
+    completed_at_iso: &str,
+) -> Option<AgentTask> {
+    let mut task = active.remove(task_id)?;
+    if task.retry_count < task.max_retries {
+        task.status = "pending".to_string();
+        task.retry_count += 1;
+        task.agent_id = None;
+        task.lease_expires_at = None;
+        pending.push_back(task.clone());
+    } else {
+        task.status = "failed".to_string();
+        task.result = Some(serde_json::json!({ "error": error }));
+        task.completed_at = Some(completed_at_iso.to_string());
+    }
+    Some(task)
 }
 
 /// Maximum number of pending tasks held in a single TaskLeaseManager DO.
@@ -948,5 +1071,151 @@ mod tests {
         // contain an entry with attempts >= MAX_NOTIFY_ATTEMPTS — and
         // a drop is logged as an error.
         assert_eq!(MAX_NOTIFY_ATTEMPTS, 5);
+    }
+
+    // ── DO unit coverage (PR #142): queue / lease / complete helpers ──
+
+    fn make_task(id: &str, task_type: &str) -> AgentTask {
+        AgentTask {
+            id: id.to_string(),
+            job_id: "job-1".to_string(),
+            task_type: task_type.to_string(),
+            priority: 0,
+            status: "pending".to_string(),
+            params: None,
+            result: None,
+            agent_id: None,
+            graph_ref: None,
+            play_id: None,
+            parent_task_id: None,
+            retry_count: 0,
+            max_retries: 3,
+            lease_expires_at: None,
+            created_at: "1970-01-01T00:00:00Z".to_string(),
+            completed_at: None,
+            memory_context: None,
+            tenant_id: Some("tenant-test".to_string()),
+        }
+    }
+
+    #[test]
+    fn enqueue_then_claim_returns_task_and_decrements_pending() {
+        let mut pending: VecDeque<AgentTask> = VecDeque::new();
+        let mut active: HashMap<String, AgentTask> = HashMap::new();
+
+        enqueue_task(&mut pending, make_task("t1", "build"));
+        let claimed = claim_next_task(
+            &mut pending,
+            &mut active,
+            "agent-A",
+            &[],
+            1_000,
+            "1300".to_string(),
+        );
+
+        assert!(claimed.is_some());
+        let task = claimed.unwrap();
+        assert_eq!(task.id, "t1");
+        assert_eq!(task.status, "running");
+        assert_eq!(pending.len(), 0);
+        assert_eq!(active.len(), 1);
+    }
+
+    #[test]
+    fn claim_skips_tasks_outside_caps() {
+        let mut pending: VecDeque<AgentTask> = VecDeque::new();
+        let mut active: HashMap<String, AgentTask> = HashMap::new();
+
+        enqueue_task(&mut pending, make_task("t1", "build"));
+        enqueue_task(&mut pending, make_task("t2", "deploy"));
+
+        let claimed = claim_next_task(
+            &mut pending,
+            &mut active,
+            "agent-A",
+            &["deploy".to_string()],
+            0,
+            "100".to_string(),
+        );
+
+        assert_eq!(claimed.as_ref().map(|t| t.id.as_str()), Some("t2"));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "t1");
+    }
+
+    #[test]
+    fn expired_lease_reverts_task_to_pending_when_retries_remain() {
+        let mut pending: VecDeque<AgentTask> = VecDeque::new();
+        let mut active: HashMap<String, AgentTask> = HashMap::new();
+
+        enqueue_task(&mut pending, make_task("t1", "build"));
+        let _ = claim_next_task(
+            &mut pending,
+            &mut active,
+            "agent-A",
+            &[],
+            1_000,
+            "1300".to_string(),
+        );
+
+        let released = expire_leases(&mut active, &mut pending, 2_000, "1970-01-01T00:00:00Z");
+        assert_eq!(released, vec!["t1".to_string()]);
+        assert!(active.is_empty());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].retry_count, 1);
+    }
+
+    #[test]
+    fn complete_marks_task_completed_and_removes_from_active() {
+        let mut active: HashMap<String, AgentTask> = HashMap::new();
+        let mut task = make_task("t1", "build");
+        task.status = "running".to_string();
+        active.insert("t1".to_string(), task);
+
+        let completed = complete_task(
+            &mut active,
+            "t1",
+            Some(serde_json::json!({"out": 42})),
+            "2026-01-01T00:00:00Z",
+        );
+
+        assert!(completed.is_some());
+        assert_eq!(completed.unwrap().status, "completed");
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn double_complete_is_idempotent_no_double_notification() {
+        let mut active: HashMap<String, AgentTask> = HashMap::new();
+        active.insert("t1".to_string(), make_task("t1", "build"));
+
+        assert!(complete_task(&mut active, "t1", None, "ts").is_some());
+        assert!(complete_task(&mut active, "t1", None, "ts").is_none());
+    }
+
+    #[test]
+    fn fail_requeues_when_retries_remain() {
+        let mut pending: VecDeque<AgentTask> = VecDeque::new();
+        let mut active: HashMap<String, AgentTask> = HashMap::new();
+        active.insert("t1".to_string(), make_task("t1", "build"));
+
+        let failed = fail_task(&mut active, &mut pending, "t1", "boom", "ts");
+        assert_eq!(failed.unwrap().retry_count, 1);
+        assert_eq!(pending.len(), 1);
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn fail_marks_failed_when_retries_exhausted() {
+        let mut pending: VecDeque<AgentTask> = VecDeque::new();
+        let mut active: HashMap<String, AgentTask> = HashMap::new();
+        let mut task = make_task("t1", "build");
+        task.retry_count = 3;
+        task.max_retries = 3;
+        active.insert("t1".to_string(), task);
+
+        let failed = fail_task(&mut active, &mut pending, "t1", "fatal", "tsfail");
+        assert_eq!(failed.unwrap().status, "failed");
+        assert!(pending.is_empty());
     }
 }

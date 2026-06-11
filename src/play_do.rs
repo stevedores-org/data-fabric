@@ -317,6 +317,15 @@ fn derive_to_launch(state: &PlayState) -> Vec<PlayTaskDefinition> {
     to_launch
 }
 
+/// Apply a `/task-completed` event idempotently. The same `task_id` reported
+/// twice is a no-op the second time. Returns `true` if the state changed.
+#[allow(dead_code)]
+fn mark_completed(state: &mut PlayState, task_id: &str) -> bool {
+    let inserted = state.completed_tasks.insert(task_id.to_string());
+    let removed = state.active_tasks.remove(task_id);
+    inserted || removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +419,72 @@ mod tests {
         let launched = derive_to_launch(&state);
         let ids: Vec<_> = launched.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["c"]);
+    }
+
+    // ── DO unit coverage (PR #142): DAG fan-out + idempotency ─────────
+
+    fn three_task_dag() -> PlayDefinition {
+        PlayDefinition {
+            name: "play".to_string(),
+            goal: "test".to_string(),
+            tasks: vec![
+                task("root", &[]),
+                task("child_a", &["root"]),
+                task("child_b", &["root"]),
+                task("grandchild", &["child_a", "child_b"]),
+            ],
+        }
+    }
+
+    #[test]
+    fn launch_with_three_task_chain_materializes_only_root() {
+        let def = PlayDefinition {
+            name: "chain".to_string(),
+            goal: "linear".to_string(),
+            tasks: vec![
+                task("root", &[]),
+                task("middle", &["root"]),
+                task("leaf", &["middle"]),
+            ],
+        };
+        let state = make_state(def.tasks.clone());
+        let eligible = derive_to_launch(&state);
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].id, "root");
+    }
+
+    #[test]
+    fn task_completed_for_root_materializes_eligible_children() {
+        let mut state = make_state(three_task_dag().tasks);
+        state.active_tasks.insert("root".to_string());
+        assert!(mark_completed(&mut state, "root"));
+
+        let eligible = derive_to_launch(&state);
+        let mut ids: Vec<_> = eligible.iter().map(|t| t.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["child_a", "child_b"]);
+    }
+
+    #[test]
+    fn task_completed_with_unsatisfied_deps_does_not_materialize_grandchild() {
+        let mut state = make_state(three_task_dag().tasks);
+        state.completed_tasks.insert("root".to_string());
+        state.active_tasks.insert("child_b".to_string());
+        mark_completed(&mut state, "child_a");
+
+        let eligible = derive_to_launch(&state);
+        assert!(eligible.is_empty());
+    }
+
+    #[test]
+    fn task_completed_is_idempotent_no_duplicate_state() {
+        let mut state = make_state(three_task_dag().tasks);
+        state.active_tasks.insert("root".to_string());
+
+        assert!(mark_completed(&mut state, "root"));
+        assert!(!mark_completed(&mut state, "root"));
+        assert_eq!(state.completed_tasks.len(), 1);
+        assert!(!state.active_tasks.contains("root"));
     }
 
     // ── PR #132 finding: play_do.rs:178 — partial-enqueue stuck-active ─

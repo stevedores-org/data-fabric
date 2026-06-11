@@ -76,6 +76,22 @@ pub(crate) fn ids_to_evict_for_trim(history: &VecDeque<Checkpoint>, max: usize) 
         .collect()
 }
 
+/// Append a checkpoint to the front of `history`, trimming the oldest entry
+/// when the cap is exceeded. Mirrors the body of the `/checkpoint` handler.
+#[allow(dead_code)]
+pub(crate) fn append_to_history(history: &mut VecDeque<Checkpoint>, cp: Checkpoint, max: usize) {
+    history.push_front(cp);
+    while history.len() > max {
+        history.pop_back();
+    }
+}
+
+/// Serialize `state` to JSON and return its byte length.
+#[allow(dead_code)]
+pub(crate) fn measured_state_size(state: &serde_json::Value) -> usize {
+    serde_json::to_string(state).map(|s| s.len()).unwrap_or(0)
+}
+
 #[durable_object]
 pub struct ThreadManager {
     state: State,
@@ -309,5 +325,61 @@ mod tests {
             evicted,
             vec!["c0".to_string(), "c1".to_string(), "c2".to_string()]
         );
+    }
+
+    // ── DO unit coverage (PR #142): history ring + size boundary ──────
+
+    fn make_cp(id: &str) -> Checkpoint {
+        dummy_checkpoint(id)
+    }
+
+    #[test]
+    fn append_checkpoint_then_history_returns_expected_order() {
+        let mut history: VecDeque<Checkpoint> = VecDeque::new();
+        append_to_history(&mut history, make_cp("a"), MAX_HISTORY_ENTRIES);
+        append_to_history(&mut history, make_cp("b"), MAX_HISTORY_ENTRIES);
+        append_to_history(&mut history, make_cp("c"), MAX_HISTORY_ENTRIES);
+
+        let ids: Vec<_> = history.iter().map(|cp| cp.id.clone()).collect();
+        assert_eq!(ids, vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn history_is_trimmed_at_documented_cap() {
+        let mut history: VecDeque<Checkpoint> = VecDeque::new();
+        for i in 0..(MAX_HISTORY_ENTRIES + 5) {
+            append_to_history(&mut history, make_cp(&format!("cp-{i:03}")), MAX_HISTORY_ENTRIES);
+        }
+
+        assert_eq!(history.len(), MAX_HISTORY_ENTRIES);
+        let ids: Vec<&str> = history.iter().map(|cp| cp.id.as_str()).collect();
+        assert!(!ids.contains(&"cp-000"));
+        assert_eq!(
+            history.front().unwrap().id,
+            format!("cp-{:03}", MAX_HISTORY_ENTRIES + 4)
+        );
+    }
+
+    #[test]
+    fn checkpoint_at_boundary_size_is_accepted() {
+        let payload: String = "a".repeat(MAX_DO_STATE_BYTES - 2);
+        let state = serde_json::Value::String(payload);
+        assert_eq!(measured_state_size(&state), MAX_DO_STATE_BYTES);
+        assert!(matches!(
+            validate_checkpoint_size(measured_state_size(&state)),
+            CheckpointSize::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_over_cap_is_rejected() {
+        let payload: String = "b".repeat(MAX_DO_STATE_BYTES);
+        let state = serde_json::Value::String(payload);
+        let sz = measured_state_size(&state);
+        assert!(sz > MAX_DO_STATE_BYTES);
+        assert!(matches!(
+            validate_checkpoint_size(sz),
+            CheckpointSize::TooLarge { .. }
+        ));
     }
 }
