@@ -18,7 +18,7 @@ struct TaskLeaseState {
 /// retry mechanics.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct PendingNotify {
-    /// PlayManager DO target name (currently the task's `job_id`).
+    /// PlayManager DO target name (`{tenant_id}:play:{run_id}`).
     pub(crate) target_name: String,
     /// The play-side task id (suffix of the AgentTask id) to mark complete.
     pub(crate) play_task_id: String,
@@ -242,28 +242,49 @@ impl DurableObject for TaskLeaseManager {
                         Some(js_sys::Date::new_0().to_iso_string().as_string().unwrap());
 
                     let job_id = task.job_id.clone();
+                    let task_tenant = task.tenant_id.clone();
 
                     storage.put("active", active).await?;
 
-                    // If task belongs to a play, notify PlayManager
-                    // Extract ID from job_id or play_id
+                    // If task belongs to a play, notify PlayManager. The
+                    // PlayManager DO is tenant-namespaced (see lib.rs
+                    // `/v1/plays/:name/launch`) so we must reconstruct the
+                    // name as `{tenant_id}:play:{run_id}`. If the task is
+                    // missing tenant_id (legacy persisted state from before
+                    // WS8), we skip the notification rather than routing to
+                    // a potentially cross-tenant DO instance.
                     let play_task_id = task_id
                         .split('-')
                         .next_back()
                         .unwrap_or(&task_id)
                         .to_string();
 
-                    // PR #132 crr finding (task_do.rs:134): the previous
-                    // notification was `let _ = play_stub.fetch_with_request().await;`
-                    // which silently dropped delivery failures and orphaned
-                    // any downstream tasks if PlayManager was unreachable.
-                    // We now (1) attempt the notify, (2) on failure persist
-                    // a PendingNotify entry to DO storage, (3) ensure an
-                    // alarm is scheduled to drive the retry loop, and (4)
-                    // surface the failure with a warn log visible in
-                    // `wrangler tail`.
-                    self.try_notify_play_manager(&job_id, &play_task_id, 1)
-                        .await;
+                    if let Some(tenant_id) = task_tenant.as_deref() {
+                        if !tenant_id.is_empty() {
+                            let do_name = format!("{}:play:{}", tenant_id, job_id);
+                            // PR #132 crr finding (task_do.rs:134): the previous
+                            // notification was `let _ = play_stub.fetch_with_request().await;`
+                            // which silently dropped delivery failures and orphaned
+                            // any downstream tasks if PlayManager was unreachable.
+                            // We now (1) attempt the notify, (2) on failure persist
+                            // a PendingNotify entry to DO storage, (3) ensure an
+                            // alarm is scheduled to drive the retry loop, and (4)
+                            // surface the failure with a warn log visible in
+                            // `wrangler tail`.
+                            self.try_notify_play_manager(&do_name, &play_task_id, 1)
+                                .await;
+                        } else {
+                            worker::console_log!(
+                                "skipping PlayManager notify for task {}: empty tenant_id",
+                                task_id
+                            );
+                        }
+                    } else {
+                        worker::console_log!(
+                            "skipping PlayManager notify for task {}: tenant_id missing (pre-WS8 task)",
+                            task_id
+                        );
+                    }
 
                     Response::from_json(&task)
                 } else {
