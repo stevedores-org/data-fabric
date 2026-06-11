@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use worker::*;
 
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug)]
 struct TaskLeaseState {
     pending_tasks: VecDeque<AgentTask>,
@@ -12,6 +13,7 @@ struct TaskLeaseState {
 #[durable_object]
 pub struct TaskLeaseManager {
     state: State,
+    #[allow(dead_code)]
     env: Env,
 }
 
