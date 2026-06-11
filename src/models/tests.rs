@@ -1459,3 +1459,124 @@ fn trace_response_bounded_by_limit() {
     assert!(json["truncated"].as_bool().unwrap());
     assert_eq!(json["events"].as_array().unwrap().len(), 100);
 }
+
+// ── Reasoning trace (#111) ──────────────────────────────────────
+
+#[test]
+fn ingest_reasoning_trace_round_trip() {
+    let t = IngestReasoningTrace {
+        schema_version: TRACE_SCHEMA_VERSION,
+        agent_id: "agent-a".into(),
+        job_id: "job-1".into(),
+        parent_span_id: Some("span-root".into()),
+        step_number: 3,
+        step_type: StepType::ToolCall,
+        inputs: Some(serde_json::json!({"tool": "search", "q": "rust"})),
+        outputs: Some(serde_json::json!({"hits": 7})),
+        tokens: TokenCost {
+            input: 120,
+            output: 45,
+            cached: 10,
+        },
+        started_at: "2026-06-10T00:00:00Z".into(),
+        completed_at: Some("2026-06-10T00:00:01Z".into()),
+        idempotency_key: "job-1:3".into(),
+    };
+    let json = serde_json::to_string(&t).unwrap();
+    let parsed: IngestReasoningTrace = serde_json::from_str(&json).unwrap();
+    assert_eq!(t, parsed);
+}
+
+#[test]
+fn ingest_reasoning_trace_defaults_schema_version() {
+    // Older clients may omit schema_version; sink fills the current one.
+    let minimal = serde_json::json!({
+        "agent_id": "a",
+        "job_id": "j",
+        "step_number": 0,
+        "step_type": "thought",
+        "started_at": "2026-06-10T00:00:00Z",
+        "idempotency_key": "j:0",
+    });
+    let parsed: IngestReasoningTrace = serde_json::from_value(minimal).unwrap();
+    assert_eq!(parsed.schema_version, TRACE_SCHEMA_VERSION);
+    assert_eq!(parsed.tokens, TokenCost::default());
+    assert!(parsed.inputs.is_none() && parsed.outputs.is_none());
+}
+
+#[test]
+fn step_type_snake_case_serialisation() {
+    for (st, expected) in [
+        (StepType::ToolCall, "tool_call"),
+        (StepType::Thought, "thought"),
+        (StepType::Commit, "commit"),
+        (StepType::Observation, "observation"),
+        (StepType::Error, "error"),
+        (StepType::Other, "other"),
+    ] {
+        let json = serde_json::to_string(&st).unwrap();
+        assert_eq!(json, format!("\"{}\"", expected));
+        assert_eq!(st.as_str(), expected);
+    }
+}
+
+#[test]
+fn classify_payload_inline_when_small() {
+    let small = serde_json::json!({"q": "hi"});
+    match classify_payload(&small, "tenants/t1/", "trace-1", "inputs") {
+        PayloadDisposition::Inline(v) => assert_eq!(v, small),
+        PayloadDisposition::Archive { .. } => panic!("small payload should stay inline"),
+    }
+}
+
+#[test]
+fn classify_payload_archives_when_over_limit() {
+    let big = serde_json::json!({"blob": "x".repeat(INLINE_LIMIT_BYTES + 1)});
+    match classify_payload(&big, "tenants/t1/", "trace-9", "outputs") {
+        PayloadDisposition::Archive { key, bytes } => {
+            assert_eq!(key, "tenants/t1/reasoning_traces/trace-9/outputs.json");
+            assert!(bytes.len() > INLINE_LIMIT_BYTES);
+        }
+        PayloadDisposition::Inline(_) => panic!("payload over limit must archive"),
+    }
+}
+
+#[test]
+fn redact_pii_replaces_flagged_keys() {
+    let mut v = serde_json::json!({
+        "user_email": "alice@example.com",
+        "request_id": "req-1",
+        "__pii__": ["user_email"],
+    });
+    redact_pii(&mut v);
+    assert_eq!(v["user_email"], "<redacted>");
+    assert_eq!(v["request_id"], "req-1");
+}
+
+#[test]
+fn redact_pii_recurses_into_nested_objects() {
+    let mut v = serde_json::json!({
+        "outer": "keep",
+        "child": {
+            "name": "Alice",
+            "id": 42,
+            "__pii__": ["name"],
+        },
+    });
+    redact_pii(&mut v);
+    assert_eq!(v["outer"], "keep");
+    assert_eq!(v["child"]["name"], "<redacted>");
+    assert_eq!(v["child"]["id"], 42);
+}
+
+#[test]
+fn trace_ack_serializes_deduplicated_flag() {
+    let ack = TraceAck {
+        id: "abc".into(),
+        accepted: true,
+        deduplicated: true,
+    };
+    let json = serde_json::to_value(&ack).unwrap();
+    assert_eq!(json["deduplicated"], true);
+    assert_eq!(json["accepted"], true);
+}

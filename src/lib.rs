@@ -875,13 +875,78 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-            
+
             db::record_telemetry(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
-            
+
             Response::from_json(&models::TelemetryAck {
                 id,
                 accepted: true,
             })
+        })
+        // ── Reasoning traces (Epic 3 / #111) ─────────────────
+        .post_async("/v1/reasoning-traces", |mut req, ctx| async move {
+            let mut body: models::IngestReasoningTrace = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let d1 = ctx.env.d1("DB")?;
+            let bucket = ctx.env.bucket("ARTIFACTS")?;
+            let id = generate_id()?;
+            let r2_prefix = tenant_ctx.r2_prefix();
+
+            // Defensive PII redaction. The client SHOULD have redacted, but the
+            // sink must never persist fields the client flagged as tainted.
+            if let Some(v) = body.inputs.as_mut() {
+                models::redact_pii(v);
+            }
+            if let Some(v) = body.outputs.as_mut() {
+                models::redact_pii(v);
+            }
+
+            let (inputs_inline, inputs_r2_key) =
+                stash_payload(&bucket, &r2_prefix, &id, "inputs", body.inputs.as_ref()).await?;
+            let (outputs_inline, outputs_r2_key) =
+                stash_payload(&bucket, &r2_prefix, &id, "outputs", body.outputs.as_ref()).await?;
+
+            let inserted = db::insert_reasoning_trace(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &id,
+                &body,
+                db::ReasoningPayloadRefs {
+                    inputs_inline: inputs_inline.as_deref(),
+                    inputs_r2_key: inputs_r2_key.as_deref(),
+                    outputs_inline: outputs_inline.as_deref(),
+                    outputs_r2_key: outputs_r2_key.as_deref(),
+                },
+            )
+            .await?;
+
+            Response::from_json(&models::TraceAck {
+                id,
+                accepted: true,
+                deduplicated: !inserted,
+            })
+        })
+        .get_async("/v1/reasoning-traces", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let job_id = match params.get("job_id") {
+                Some(id) => id.clone(),
+                None => return Response::error("missing job_id query param", 400),
+            };
+            let limit = params
+                .get("limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100u32)
+                .min(1000);
+            let d1 = ctx.env.d1("DB")?;
+            let traces =
+                db::list_reasoning_traces_for_job(&d1, &tenant_ctx.tenant_id, &job_id, limit)
+                    .await?;
+            Response::from_json(&serde_json::json!({ "traces": traces }))
         })
         // ── Checkpoints (M2) ──────────────────────────────────
         .post_async("/v1/checkpoints", |mut req, ctx| async move {
@@ -1755,6 +1820,32 @@ pub(crate) fn generate_id() -> Result<String> {
     getrandom::getrandom(&mut buf)
         .map_err(|err| Error::RustError(format!("failed to generate id: {err}")))?;
     Ok(hex::encode(buf))
+}
+
+/// Decide whether a reasoning-trace payload stays inline or gets offloaded
+/// to R2 (the GZRS analogue on Cloudflare). Returns `(inline_json, r2_key)`
+/// where at most one is `Some`.
+async fn stash_payload(
+    bucket: &Bucket,
+    r2_prefix: &str,
+    trace_id: &str,
+    field: &str,
+    payload: Option<&serde_json::Value>,
+) -> Result<(Option<String>, Option<String>)> {
+    let Some(value) = payload else {
+        return Ok((None, None));
+    };
+    match models::classify_payload(value, r2_prefix, trace_id, field) {
+        models::PayloadDisposition::Inline(v) => {
+            let s = serde_json::to_string(&v)
+                .map_err(|e| Error::RustError(format!("serialize inline payload: {e}")))?;
+            Ok((Some(s), None))
+        }
+        models::PayloadDisposition::Archive { key, bytes } => {
+            storage::put_blob(bucket, &key, bytes).await?;
+            Ok((None, Some(key)))
+        }
+    }
 }
 
 /// Build a JSON response with a `Server-Timing` header recording the elapsed time since `started`.
