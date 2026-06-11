@@ -1314,12 +1314,16 @@ fn agent_task_with_memory_context_none() {
         created_at: "2026-01-01T00:00:00Z".into(),
         completed_at: None,
         memory_context: None,
+        tenant_id: None,
     };
     let json = serde_json::to_string(&task).unwrap();
     let parsed: AgentTask = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.memory_context, None);
     // Verify memory_context is not in JSON when None
     assert!(!json.contains("memory_context"));
+    // tenant_id is also None for this legacy-shape test; verify it round-trips
+    assert_eq!(parsed.tenant_id, None);
+    assert!(!json.contains("tenant_id"));
 }
 
 #[test]
@@ -1345,6 +1349,7 @@ fn agent_task_with_memory_context_some() {
         memory_context: Some(
             "## Memory: Past Experience\n- Fixed similar build issue with cargo cache".into(),
         ),
+        tenant_id: None,
     };
     let json = serde_json::to_string(&task).unwrap();
     let parsed: AgentTask = serde_json::from_str(&json).unwrap();
@@ -1379,6 +1384,7 @@ fn agent_task_memory_context_round_trip() {
         memory_context: Some(
             "## Memory Context\nPrevious analysis on similar codebase. Use AST traversal.".into(),
         ),
+        tenant_id: None,
     };
     let json = serde_json::to_string(&task).unwrap();
     let parsed: AgentTask = serde_json::from_str(&json).unwrap();

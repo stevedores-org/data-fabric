@@ -3,10 +3,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use worker::*;
 
+/// Envelope sent by `POST /v1/plays/:name/launch` (in `lib.rs`) so the
+/// PlayManager DO is told which tenant owns this launch instead of
+/// fabricating it from `self.state.id()`.
+#[derive(Serialize, Deserialize, Debug)]
+struct LaunchEnvelope {
+    tenant_id: String,
+    definition: PlayDefinition,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct PlayState {
     definition: PlayDefinition,
     run_id: String,
+    /// Owning tenant. Persisted in DO storage so subsequent task-completion
+    /// callbacks and task materializations route to the correct
+    /// TaskLeaseManager instance and stamp the correct tenant on each
+    /// emitted AgentTask. Pre-WS8 this was incorrectly derived from
+    /// `self.state.id()` (the DO's instance UUID).
+    tenant_id: String,
     completed_tasks: HashSet<String>,
     active_tasks: HashSet<String>,
     /// Monotonic version counter. Bumped on every persist that mutates
@@ -35,13 +50,22 @@ impl DurableObject for PlayManager {
 
         match (method, path.as_str()) {
             (Method::Post, "/launch") => {
-                let def: PlayDefinition = req.json().await?;
+                let envelope: LaunchEnvelope = req.json().await?;
+                let LaunchEnvelope {
+                    tenant_id,
+                    definition: def,
+                } = envelope;
+
+                if tenant_id.is_empty() {
+                    return Response::error("tenant_id required in launch envelope", 400);
+                }
 
                 let run_id = crate::generate_id().unwrap_or_else(|_| "err".to_string());
 
                 let state = PlayState {
                     definition: def.clone(),
                     run_id: run_id.clone(),
+                    tenant_id: tenant_id.clone(),
                     completed_tasks: HashSet::new(),
                     active_tasks: HashSet::new(),
                     state_version: 0,
@@ -127,9 +151,14 @@ impl PlayManager {
             return Ok(());
         }
 
-        let tenant_id = self.state.id().to_string(); // Simplified, should pass tenant_id
+        // Route to the per-tenant TaskLeaseManager. The TLM DO is named by
+        // tenant_id everywhere else in the worker (see lib.rs handlers for
+        // /mcp/task/*) so we use the same naming here. Previously this used
+        // `self.state.id().to_string()` (the PlayManager's instance UUID),
+        // which created a stray TLM per play run and broke cross-DO
+        // coordination across the tenant's other task surfaces.
         let task_ns = self.env.durable_object("TASK_LEASE_MANAGER")?;
-        let task_stub = task_ns.id_from_name(&tenant_id)?.get_stub()?;
+        let task_stub = task_ns.id_from_name(&state.tenant_id)?.get_stub()?;
 
         // PR #132 crr finding (play_do.rs:178): the previous implementation
         // marked ALL `to_launch` tasks as active and persisted that state
@@ -176,6 +205,7 @@ impl PlayManager {
                 created_at: js_sys::Date::new_0().to_iso_string().as_string().unwrap(),
                 completed_at: None,
                 memory_context: None,
+                tenant_id: Some(state.tenant_id.clone()),
             };
 
             let do_req = Request::new_with_init(
@@ -310,6 +340,7 @@ mod tests {
                 tasks,
             },
             run_id: "run-1".to_string(),
+            tenant_id: "tenant-test".to_string(),
             completed_tasks: HashSet::new(),
             active_tasks: HashSet::new(),
             state_version: 0,
