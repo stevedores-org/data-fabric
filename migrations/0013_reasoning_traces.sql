@@ -43,7 +43,20 @@ CREATE TABLE IF NOT EXISTS reasoning_traces (
 
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
 
-    UNIQUE (tenant_id, idempotency_key)
+    UNIQUE (tenant_id, idempotency_key),
+
+    -- Either inline OR archived, never both. Allowed to be neither when the
+    -- step legitimately has no payload (e.g. a Thought with only token cost).
+    CHECK (inputs_inline IS NULL OR inputs_r2_key IS NULL),
+    CHECK (outputs_inline IS NULL OR outputs_r2_key IS NULL),
+
+    -- Keep the step_type column honest at the storage layer so a client
+    -- typo can't silently coerce to "other" on readback.
+    CHECK (step_type IN ('tool_call', 'thought', 'commit', 'observation', 'error', 'other')),
+
+    -- Non-empty idempotency_key — empty string would collide on the unique
+    -- constraint after one row and turn the dedupe path into a foot-gun.
+    CHECK (length(idempotency_key) > 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_reasoning_traces_job

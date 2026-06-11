@@ -2056,6 +2056,32 @@ pub async fn record_telemetry(
 
 // ── Reasoning traces (#111) ────────────────────────────────────
 
+/// Look up an existing reasoning_traces row id by its idempotency key. The
+/// handler calls this BEFORE writing payloads to R2 so a retry is detected
+/// without orphaning storage.
+pub async fn find_reasoning_trace_by_idempotency_key(
+    db: &D1Database,
+    tenant_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    struct IdRow {
+        id: String,
+    }
+    let row: Option<IdRow> = db
+        .prepare(
+            "SELECT id FROM reasoning_traces
+             WHERE tenant_id = ?1 AND idempotency_key = ?2 LIMIT 1",
+        )
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(idempotency_key),
+        ])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.id))
+}
+
 /// Resolved storage locations for the inputs/outputs of a reasoning step.
 /// Either the inline JSON or the R2 key is set for each side — never both.
 pub struct ReasoningPayloadRefs<'a> {
@@ -2119,28 +2145,62 @@ pub async fn insert_reasoning_trace(
     Ok(inserted)
 }
 
+/// Page of reasoning traces for a single job. `after_step` is the cursor:
+/// callers paginate by feeding the last returned `step_number` back in.
+/// `has_more` is true when the DB held at least one more row beyond the
+/// returned page (computed by fetching `limit + 1` and trimming).
+pub struct ReasoningTracePage {
+    pub traces: Vec<models::ReasoningTrace>,
+    pub has_more: bool,
+}
+
 pub async fn list_reasoning_traces_for_job(
     db: &D1Database,
     tenant_id: &str,
     job_id: &str,
+    after_step: Option<i64>,
     limit: u32,
-) -> Result<Vec<models::ReasoningTrace>> {
+) -> Result<ReasoningTracePage> {
+    // Fetch one extra row to detect whether more pages exist without a
+    // separate COUNT round-trip.
+    let fetch = (limit as i64) + 1;
     let result: D1Result = db
         .prepare(
             "SELECT * FROM reasoning_traces
-             WHERE tenant_id = ?1 AND job_id = ?2
+             WHERE tenant_id = ?1 AND job_id = ?2 AND step_number > ?3
              ORDER BY step_number ASC
-             LIMIT ?3",
+             LIMIT ?4",
         )
         .bind(&[
             JsValue::from_str(tenant_id),
             JsValue::from_str(job_id),
-            JsValue::from(limit),
+            JsValue::from(after_step.unwrap_or(-1) as f64),
+            JsValue::from(fetch as f64),
         ])?
         .all()
         .await?;
-    let rows: Vec<ReasoningTraceRow> = result.results()?;
-    Ok(rows.into_iter().map(|r| r.into_trace()).collect())
+    let mut rows: Vec<ReasoningTraceRow> = result.results()?;
+    let has_more = rows.len() > limit as usize;
+    if has_more {
+        rows.truncate(limit as usize);
+    }
+    Ok(ReasoningTracePage {
+        traces: rows.into_iter().map(|r| r.into_trace()).collect(),
+        has_more,
+    })
+}
+
+pub async fn get_reasoning_trace(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<models::ReasoningTrace>> {
+    let row: Option<ReasoningTraceRow> = db
+        .prepare("SELECT * FROM reasoning_traces WHERE tenant_id = ?1 AND id = ?2")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.into_trace()))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2166,14 +2226,7 @@ struct ReasoningTraceRow {
 
 impl ReasoningTraceRow {
     fn into_trace(self) -> models::ReasoningTrace {
-        let step_type = match self.step_type.as_str() {
-            "tool_call" => models::StepType::ToolCall,
-            "thought" => models::StepType::Thought,
-            "commit" => models::StepType::Commit,
-            "observation" => models::StepType::Observation,
-            "error" => models::StepType::Error,
-            _ => models::StepType::Other,
-        };
+        let step_type = models::StepType::from_storage_str(&self.step_type);
         models::ReasoningTrace {
             id: self.id,
             schema_version: self.schema_version as u32,

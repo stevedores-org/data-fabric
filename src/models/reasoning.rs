@@ -36,6 +36,21 @@ impl StepType {
             Self::Other => "other",
         }
     }
+
+    /// Parse the storage-layer string back into the enum. Unknown values
+    /// fall back to [`StepType::Other`] — the migration's CHECK constraint
+    /// should prevent unknown values reaching this path, but a future schema
+    /// version might add variants this code hasn't seen yet.
+    pub fn from_storage_str(s: &str) -> Self {
+        match s {
+            "tool_call" => Self::ToolCall,
+            "thought" => Self::Thought,
+            "commit" => Self::Commit,
+            "observation" => Self::Observation,
+            "error" => Self::Error,
+            _ => Self::Other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,7 +159,9 @@ pub fn classify_payload(
     trace_id: &str,
     field: &str,
 ) -> PayloadDisposition {
-    let serialized = serde_json::to_vec(payload).unwrap_or_default();
+    // Serializing a serde_json::Value cannot fail — unwrap surfaces any
+    // future regression instead of silently writing an empty payload.
+    let serialized = serde_json::to_vec(payload).expect("serde_json::Value always serializes");
     if serialized.len() <= INLINE_LIMIT_BYTES {
         PayloadDisposition::Inline(payload.clone())
     } else {
@@ -179,6 +196,9 @@ pub fn redact_pii(payload: &mut serde_json::Value) {
                     map.insert(key.clone(), serde_json::Value::String("<redacted>".into()));
                 }
             }
+            // Strip the marker itself so the stored row doesn't leak which
+            // fields the client flagged as sensitive.
+            map.remove("__pii__");
             for (_, v) in map.iter_mut() {
                 redact_pii(v);
             }

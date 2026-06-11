@@ -886,8 +886,30 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── Reasoning traces (Epic 3 / #111) ─────────────────
         .post_async("/v1/reasoning-traces", |mut req, ctx| async move {
             let mut body: models::IngestReasoningTrace = req.json().await?;
+            if body.idempotency_key.trim().is_empty() {
+                return Response::error("idempotency_key must be non-empty", 400);
+            }
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
+
+            // Short-circuit on retry: a row already exists for this idempotency
+            // key. Returning early here means we never touch R2 on retries,
+            // which would otherwise orphan a duplicate blob under a fresh
+            // trace_id (D1 dedupes by key, R2 keys are id-derived).
+            if let Some(existing_id) = db::find_reasoning_trace_by_idempotency_key(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &body.idempotency_key,
+            )
+            .await?
+            {
+                return Response::from_json(&models::TraceAck {
+                    id: existing_id,
+                    accepted: true,
+                    deduplicated: true,
+                });
+            }
+
             let bucket = ctx.env.bucket("ARTIFACTS")?;
             let id = generate_id()?;
             let r2_prefix = tenant_ctx.r2_prefix();
@@ -941,13 +963,76 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .get("limit")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(100u32)
-                .min(1000);
+                .clamp(1, 500);
+            let after_step = params.get("after_step").and_then(|s| s.parse::<i64>().ok());
             let d1 = ctx.env.d1("DB")?;
-            let traces =
-                db::list_reasoning_traces_for_job(&d1, &tenant_ctx.tenant_id, &job_id, limit)
-                    .await?;
-            Response::from_json(&serde_json::json!({ "traces": traces }))
+            let page = db::list_reasoning_traces_for_job(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &job_id,
+                after_step,
+                limit,
+            )
+            .await?;
+            let next_after_step = if page.has_more {
+                page.traces.last().map(|t| t.step_number as i64)
+            } else {
+                None
+            };
+            Response::from_json(&serde_json::json!({
+                "traces": page.traces,
+                "has_more": page.has_more,
+                "next_after_step": next_after_step,
+            }))
         })
+        // Payload resolver — inline JSON returns the value verbatim; an
+        // archived payload streams the R2 object back. Either way callers
+        // dereference a single canonical URL, fulfilling the AC's "pointer
+        // URL" requirement without leaking R2 keys to the public internet.
+        .get_async(
+            "/v1/reasoning-traces/:id/payload/:field",
+            |req, ctx| async move {
+                let tenant_ctx = tenant::tenant_from_request(&req)?;
+                let trace_id = match ctx.param("id") {
+                    Some(v) => v.to_string(),
+                    None => return Response::error("missing trace id", 400),
+                };
+                let field = match ctx.param("field") {
+                    Some(v) => v.to_string(),
+                    None => return Response::error("missing field", 400),
+                };
+                if field != "inputs" && field != "outputs" {
+                    return Response::error("field must be 'inputs' or 'outputs'", 400);
+                }
+                let d1 = ctx.env.d1("DB")?;
+                let trace = match db::get_reasoning_trace(&d1, &tenant_ctx.tenant_id, &trace_id)
+                    .await?
+                {
+                    Some(t) => t,
+                    None => return Response::error("reasoning trace not found", 404),
+                };
+                let (inline, r2_key) = if field == "inputs" {
+                    (trace.inputs_inline, trace.inputs_r2_key)
+                } else {
+                    (trace.outputs_inline, trace.outputs_r2_key)
+                };
+                if let Some(v) = inline {
+                    return Response::from_json(&v);
+                }
+                if let Some(key) = r2_key {
+                    let bucket = ctx.env.bucket("ARTIFACTS")?;
+                    let bytes = match storage::get_blob(&bucket, &key).await? {
+                        Some(b) => b,
+                        None => return Response::error("payload archived but missing in R2", 502),
+                    };
+                    let mut resp = Response::from_bytes(bytes)?;
+                    resp.headers_mut().set("Content-Type", "application/json")?;
+                    return Ok(resp);
+                }
+                // Step had no payload (e.g. token-only Thought).
+                Response::from_json(&serde_json::Value::Null)
+            },
+        )
         // ── Checkpoints (M2) ──────────────────────────────────
         .post_async("/v1/checkpoints", |mut req, ctx| async move {
             let body: models::CreateCheckpoint = req.json().await?;

@@ -1551,6 +1551,8 @@ fn redact_pii_replaces_flagged_keys() {
     redact_pii(&mut v);
     assert_eq!(v["user_email"], "<redacted>");
     assert_eq!(v["request_id"], "req-1");
+    // Marker must be stripped — keeping it leaks which fields were sensitive.
+    assert!(v.get("__pii__").is_none());
 }
 
 #[test]
@@ -1567,6 +1569,7 @@ fn redact_pii_recurses_into_nested_objects() {
     assert_eq!(v["outer"], "keep");
     assert_eq!(v["child"]["name"], "<redacted>");
     assert_eq!(v["child"]["id"], 42);
+    assert!(v["child"].get("__pii__").is_none());
 }
 
 #[test]
@@ -1579,4 +1582,27 @@ fn trace_ack_serializes_deduplicated_flag() {
     let json = serde_json::to_value(&ack).unwrap();
     assert_eq!(json["deduplicated"], true);
     assert_eq!(json["accepted"], true);
+}
+
+#[test]
+fn step_type_from_storage_str_round_trips_every_variant() {
+    for st in [
+        StepType::ToolCall,
+        StepType::Thought,
+        StepType::Commit,
+        StepType::Observation,
+        StepType::Error,
+        StepType::Other,
+    ] {
+        assert_eq!(StepType::from_storage_str(st.as_str()), st);
+    }
+}
+
+#[test]
+fn step_type_from_storage_str_falls_back_on_unknown() {
+    // Future schema versions might add variants this binary hasn't seen.
+    // The DB CHECK constraint blocks the typo path; this guards the
+    // forward-compat path.
+    assert_eq!(StepType::from_storage_str("future_variant"), StepType::Other);
+    assert_eq!(StepType::from_storage_str(""), StepType::Other);
 }
