@@ -25,7 +25,6 @@ pub struct PlayLaunchRequest {
 
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
-#[allow(dead_code)]
 pub struct PlayLaunchResponse {
     pub run_id: String,
     pub status: String,
