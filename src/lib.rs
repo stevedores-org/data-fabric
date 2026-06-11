@@ -653,7 +653,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             
             let do_url = format!("https://do/heartbeat?task_id={}&agent_id={}", task_id, agent_id);
             let do_req = Request::new(&do_url, Method::Post)?;
-            let mut do_resp = stub.fetch_with_request(do_req).await?;
+            let do_resp = stub.fetch_with_request(do_req).await?;
 
             if do_resp.status_code() == 200 {
                 // Update D1 (best effort)
