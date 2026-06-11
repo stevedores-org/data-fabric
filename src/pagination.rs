@@ -9,6 +9,11 @@
 //! For `/v1/runs` the sort key is `(created_at DESC, id DESC)`, so the cursor
 //! carries both fields. Including `id` breaks ties when two runs share the
 //! same `created_at`.
+//!
+//! `/v1/policies/rules` and `/v1/agents` follow the same shape: the cursor
+//! carries the row's primary sort field plus `id` as a tiebreaker. All cursor
+//! types use single-letter serde keys (`c`, `i`, `n`, `p`) to keep the
+//! hex-encoded payload short — clients still get a single opaque blob.
 
 use serde::{Deserialize, Serialize};
 use worker::Result;
@@ -35,6 +40,76 @@ impl RunsCursor {
     /// Decode a hex-encoded cursor. Returns `Ok(None)` if the input is empty,
     /// `Err` if the input is present but malformed (callers should map this
     /// to `INVALID_CURSOR` 400).
+    pub fn decode(raw: Option<&str>) -> Result<Option<Self>> {
+        let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let bytes = hex::decode(raw)
+            .map_err(|e| worker::Error::RustError(format!("decode cursor hex: {e}")))?;
+        let cursor: Self = serde_json::from_slice(&bytes)
+            .map_err(|e| worker::Error::RustError(format!("decode cursor json: {e}")))?;
+        Ok(Some(cursor))
+    }
+}
+
+/// Sort-key tuple for `/v1/policies/rules` pagination.
+///
+/// Rows are ordered by `(priority DESC, created_at ASC, id ASC)`. Carrying all
+/// three fields lets the query resume deterministically even when many rules
+/// share the same `priority` and `created_at` (common when seeded in batches).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyRulesCursor {
+    /// Last row's `priority`.
+    #[serde(rename = "p")]
+    pub priority: i32,
+    /// Last row's `created_at` (ISO 8601 string from D1).
+    #[serde(rename = "c")]
+    pub created_at: String,
+    /// Last row's `id`, used as a final tiebreaker.
+    #[serde(rename = "i")]
+    pub id: String,
+}
+
+impl PolicyRulesCursor {
+    pub fn encode(&self) -> Result<String> {
+        let json = serde_json::to_vec(self)
+            .map_err(|e| worker::Error::RustError(format!("encode cursor: {e}")))?;
+        Ok(hex::encode(json))
+    }
+
+    pub fn decode(raw: Option<&str>) -> Result<Option<Self>> {
+        let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let bytes = hex::decode(raw)
+            .map_err(|e| worker::Error::RustError(format!("decode cursor hex: {e}")))?;
+        let cursor: Self = serde_json::from_slice(&bytes)
+            .map_err(|e| worker::Error::RustError(format!("decode cursor json: {e}")))?;
+        Ok(Some(cursor))
+    }
+}
+
+/// Sort-key tuple for `/v1/agents` pagination.
+///
+/// Rows are ordered by `(name ASC, id ASC)`. Carrying `id` breaks ties for
+/// agents that share a name (rare but possible across capability variants).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentsCursor {
+    /// Last row's `name`.
+    #[serde(rename = "n")]
+    pub name: String,
+    /// Last row's `id`, used as a tiebreaker.
+    #[serde(rename = "i")]
+    pub id: String,
+}
+
+impl AgentsCursor {
+    pub fn encode(&self) -> Result<String> {
+        let json = serde_json::to_vec(self)
+            .map_err(|e| worker::Error::RustError(format!("encode cursor: {e}")))?;
+        Ok(hex::encode(json))
+    }
+
     pub fn decode(raw: Option<&str>) -> Result<Option<Self>> {
         let Some(raw) = raw.filter(|s| !s.is_empty()) else {
             return Ok(None);
@@ -95,5 +170,60 @@ mod tests {
         assert_eq!(clamp_limit(Some(10)), 10);
         assert_eq!(clamp_limit(Some(0)), 1);
         assert_eq!(clamp_limit(Some(5_000)), MAX_PAGE_LIMIT);
+    }
+
+    // ── PolicyRulesCursor ──────────────────────────────────────
+
+    #[test]
+    fn policy_rules_cursor_roundtrips_through_hex() {
+        let cursor = PolicyRulesCursor {
+            priority: 100,
+            created_at: "2026-05-13T10:00:00Z".into(),
+            id: "rule-abc".into(),
+        };
+        let encoded = cursor.encode().expect("encode");
+        let decoded = PolicyRulesCursor::decode(Some(&encoded))
+            .expect("decode")
+            .expect("some");
+        assert_eq!(decoded, cursor);
+    }
+
+    #[test]
+    fn policy_rules_cursor_decode_returns_none_for_absent_or_empty() {
+        assert!(PolicyRulesCursor::decode(None).unwrap().is_none());
+        assert!(PolicyRulesCursor::decode(Some("")).unwrap().is_none());
+    }
+
+    #[test]
+    fn policy_rules_cursor_decode_errors_on_garbage() {
+        assert!(PolicyRulesCursor::decode(Some("not-hex-zzzz")).is_err());
+        assert!(PolicyRulesCursor::decode(Some("deadbeef")).is_err());
+    }
+
+    // ── AgentsCursor ───────────────────────────────────────────
+
+    #[test]
+    fn agents_cursor_roundtrips_through_hex() {
+        let cursor = AgentsCursor {
+            name: "agent-orchestrator".into(),
+            id: "ag-42".into(),
+        };
+        let encoded = cursor.encode().expect("encode");
+        let decoded = AgentsCursor::decode(Some(&encoded))
+            .expect("decode")
+            .expect("some");
+        assert_eq!(decoded, cursor);
+    }
+
+    #[test]
+    fn agents_cursor_decode_returns_none_for_absent_or_empty() {
+        assert!(AgentsCursor::decode(None).unwrap().is_none());
+        assert!(AgentsCursor::decode(Some("")).unwrap().is_none());
+    }
+
+    #[test]
+    fn agents_cursor_decode_errors_on_garbage() {
+        assert!(AgentsCursor::decode(Some("not-hex-zzzz")).is_err());
+        assert!(AgentsCursor::decode(Some("deadbeef")).is_err());
     }
 }

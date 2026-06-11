@@ -711,10 +711,42 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/v1/policies/rules", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
+            let cursor = match pagination::PolicyRulesCursor::decode(
+                params.get("cursor").map(|s| s.as_str()),
+            ) {
+                Ok(c) => c,
+                Err(_) => {
+                    return errors::error_response(
+                        "INVALID_CURSOR",
+                        "cursor is malformed; echo back the next_cursor from a prior response",
+                        400,
+                    );
+                }
+            };
             let d1 = ctx.env.d1("DB")?;
-            let rules = db::list_policy_rules(&d1, &tenant_ctx.tenant_id).await?;
+            let (rules, next_cursor) =
+                db::list_policy_rules(&d1, &tenant_ctx.tenant_id, limit, cursor.as_ref()).await?;
+            let next_cursor_str = match next_cursor.as_ref().map(|c| c.encode()).transpose() {
+                Ok(s) => s,
+                Err(_) => {
+                    return errors::error_response(
+                        "CURSOR_ENCODE_FAILED",
+                        "internal: failed to encode next cursor",
+                        500,
+                    );
+                }
+            };
             let responses: Vec<_> = rules.into_iter().map(|r| r.into_response()).collect();
-            Response::from_json(&serde_json::json!({ "rules": responses }))
+            Response::from_json(&serde_json::json!({
+                "rules": responses,
+                "next_cursor": next_cursor_str,
+            }))
         })
         .get_async("/v1/policies/rules/:id", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
@@ -882,7 +914,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     ..Default::default()
                 },
             )?;
-            stub.fetch_with_request(do_req).await?;
+            let do_resp = stub.fetch_with_request(do_req).await?;
+
+            // Propagate any non-2xx response (notably 429 QUEUE_FULL backpressure
+            // from TaskLeaseManager when pending_tasks is at MAX_PENDING_TASKS)
+            // to the client. Without this passthrough, the DO's Retry-After +
+            // QUEUE_FULL envelope is silently swallowed and the client sees a
+            // generic success / 500, defeating the backpressure feature.
+            if let Some(forwarded) = forward_do_response(do_resp).await? {
+                return Ok(forwarded);
+            }
 
             Response::from_json(&models::TaskCreated {
                 id,
@@ -1082,9 +1123,41 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/v1/agents", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
+            let cursor = match pagination::AgentsCursor::decode(
+                params.get("cursor").map(|s| s.as_str()),
+            ) {
+                Ok(c) => c,
+                Err(_) => {
+                    return errors::error_response(
+                        "INVALID_CURSOR",
+                        "cursor is malformed; echo back the next_cursor from a prior response",
+                        400,
+                    );
+                }
+            };
             let d1 = ctx.env.d1("DB")?;
-            let agents = db::list_agents(&d1, &tenant_ctx.tenant_id).await?;
-            Response::from_json(&serde_json::json!({ "agents": agents }))
+            let (agents, next_cursor) =
+                db::list_agents(&d1, &tenant_ctx.tenant_id, limit, cursor.as_ref()).await?;
+            let next_cursor_str = match next_cursor.as_ref().map(|c| c.encode()).transpose() {
+                Ok(s) => s,
+                Err(_) => {
+                    return errors::error_response(
+                        "CURSOR_ENCODE_FAILED",
+                        "internal: failed to encode next cursor",
+                        500,
+                    );
+                }
+            };
+            Response::from_json(&serde_json::json!({
+                "agents": agents,
+                "next_cursor": next_cursor_str,
+            }))
         })
         .post_async("/v1/telemetry", |mut req, ctx| async move {
             let body: models::TelemetrySnapshot = req.json().await?;
@@ -2200,6 +2273,162 @@ async fn ingest_events_bronze_silver(
     Ok(count)
 }
 
+/// Decision for how to handle a Durable Object response from the worker
+/// handler. Pure so the routing rule is unit-testable without a wasm runtime.
+#[derive(Debug, PartialEq, Eq)]
+enum DoForwardAction {
+    /// 2xx or 3xx — handler should proceed with its normal success path.
+    /// 3xx is included so a future DO update that emits a redirect isn't
+    /// surfaced as a synthetic gateway error.
+    Success,
+    /// 4xx/5xx — handler should mirror this status back to the client.
+    /// For 429 the DO's `retry-after` is preserved through
+    /// [`sanitize_retry_after`] (defaulting to
+    /// `DEFAULT_DO_RETRY_AFTER_SECS` when absent or malformed) so the
+    /// backpressure contract surfaces end-to-end. For other non-2xx/3xx
+    /// statuses the header is only forwarded when syntactically valid.
+    Forward {
+        status: u16,
+        retry_after: Option<String>,
+    },
+}
+
+/// Default Retry-After value to apply when the DO returned 429 without a
+/// `retry-after` header. Matches the TaskLeaseManager `/enqueue` 30s value
+/// so a missing header doesn't downgrade the client-visible contract.
+const DEFAULT_DO_RETRY_AFTER_SECS: u32 = 30;
+
+/// Validate a `retry-after` header value per RFC 7231 §7.1.3 and return a
+/// non-negative integer delta-seconds value. Accepts either:
+///   * a non-negative integer (delta-seconds form), or
+///   * an HTTP-date (IMF-fixdate / RFC 850 / asctime per RFC 7231 §7.1.1.1).
+///
+/// Garbage (or absent) input falls back to [`DEFAULT_DO_RETRY_AFTER_SECS`] so
+/// we never forward an invalid header to the client. The output is always
+/// expressed in seconds — for the HTTP-date form we use the default rather
+/// than parsing the timestamp (we lack a date dep and the DO contract is
+/// to emit delta-seconds), but we still accept the date form as syntactically
+/// valid so a conformant peer is not rejected.
+fn sanitize_retry_after(raw: Option<&str>) -> u32 {
+    let Some(value) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_DO_RETRY_AFTER_SECS;
+    };
+    if let Ok(secs) = value.parse::<u32>() {
+        return secs;
+    }
+    if looks_like_http_date(value) {
+        // Accept as valid per RFC 7231, but normalise to the default
+        // because we don't carry a date-parsing dep in the worker.
+        return DEFAULT_DO_RETRY_AFTER_SECS;
+    }
+    DEFAULT_DO_RETRY_AFTER_SECS
+}
+
+/// Cheap structural check for an RFC 7231 §7.1.1.1 HTTP-date. Recognises
+/// the three permitted forms by their leading weekday token plus a
+/// trailing time component (HH:MM:SS). Intentionally tolerant — the goal
+/// is to distinguish well-formed HTTP-date strings from garbage, not to
+/// fully parse the timestamp.
+fn looks_like_http_date(s: &str) -> bool {
+    const WEEKDAYS_SHORT: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const WEEKDAYS_LONG: [&str; 7] = [
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    ];
+    // Length sanity — shortest legal form (asctime: "Sun Nov  6 08:49:37 1994") is 24 chars;
+    // longest legal form (RFC 850 with "Wednesday") is around 33 chars. Allow some slack.
+    if s.len() < 20 || s.len() > 40 {
+        return false;
+    }
+    let starts_with_weekday = WEEKDAYS_SHORT
+        .iter()
+        .chain(WEEKDAYS_LONG.iter())
+        .any(|wd| s.starts_with(wd));
+    if !starts_with_weekday {
+        return false;
+    }
+    // Must contain a time-of-day "HH:MM:SS" — two colons separating digits.
+    let colon_count = s.bytes().filter(|&b| b == b':').count();
+    colon_count == 2
+}
+
+/// Classify a DO response status + retry-after header into a forward action.
+/// Pure: takes primitives so it's testable without a JS runtime.
+///
+/// The success range is `(200..400)` rather than `(200..300)` so that any
+/// 3xx redirect emitted by a (future) DO update is treated as a normal
+/// pass-through. Gateways shouldn't surface a downstream redirect as an
+/// error, and DOs in this worker don't intentionally redirect today.
+///
+/// Any `retry-after` header on a forwarded (non-2xx, non-3xx) response is
+/// sanitised through [`sanitize_retry_after`] so a malformed value from
+/// the DO can't propagate to clients.
+fn classify_do_response(status: u16, retry_after_header: Option<&str>) -> DoForwardAction {
+    if (200..400).contains(&status) {
+        DoForwardAction::Success
+    } else {
+        let retry_after = if status == 429 {
+            // 429 always carries a retry-after — synthesize the default
+            // when the DO omitted (or garbled) the header.
+            Some(sanitize_retry_after(retry_after_header).to_string())
+        } else {
+            // Other 4xx/5xx: only forward retry-after if the DO actually
+            // provided a syntactically valid value. We don't synthesize a
+            // default outside the 429 backpressure contract.
+            retry_after_header.and_then(|raw| {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else if trimmed.parse::<u32>().is_ok() || looks_like_http_date(trimmed) {
+                    Some(trimmed.to_string())
+                } else {
+                    None
+                }
+            })
+        };
+        DoForwardAction::Forward { status, retry_after }
+    }
+}
+
+/// Forward a Durable Object response back to the client when it carries a
+/// non-2xx status. Returns `Ok(None)` for 2xx so callers continue with their
+/// success path; returns `Ok(Some(resp))` with the status, retry-after, and
+/// body mirrored when the DO signaled backpressure or another error.
+///
+/// This exists because `stub.fetch_with_request(...).await?` swallows the DO
+/// response by default — including the 429 `QUEUE_FULL` envelope from
+/// TaskLeaseManager — so without explicit propagation the client sees a
+/// generic success (or, worse, a 500) and the backpressure feature is mute.
+async fn forward_do_response(mut do_resp: Response) -> Result<Option<Response>> {
+    let status = do_resp.status_code();
+    let retry_after = do_resp
+        .headers()
+        .get("retry-after")
+        .ok()
+        .flatten();
+    match classify_do_response(status, retry_after.as_deref()) {
+        DoForwardAction::Success => Ok(None),
+        DoForwardAction::Forward { status, retry_after } => {
+            let content_type = do_resp
+                .headers()
+                .get("content-type")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "application/json".to_string());
+            let body = do_resp.bytes().await.unwrap_or_default();
+
+            let headers = Headers::new();
+            headers.set("content-type", &content_type)?;
+            if let Some(value) = retry_after {
+                headers.set("retry-after", &value)?;
+            }
+            let resp = Response::from_bytes(body)?
+                .with_status(status)
+                .with_headers(headers);
+            Ok(Some(resp))
+        }
+    }
+}
+
 /// Build a 503 response for graceful degradation when the fabric is unavailable.
 /// Used by integration intake handlers to signal temporary unavailability
 /// so clients can retry rather than treating the failure as permanent.
@@ -2258,9 +2487,209 @@ fn build_trace_response_metadata(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_trace_response_metadata, parse_limit_query, parse_limit_query_with_valid_presence,
+        build_trace_response_metadata, classify_do_response, parse_limit_query,
+        parse_limit_query_with_valid_presence, sanitize_retry_after, DoForwardAction,
+        DEFAULT_DO_RETRY_AFTER_SECS,
     };
     use worker::Url;
+
+    // ── classify_do_response (DO 429 / error forwarding) ────────
+
+    #[test]
+    fn classify_do_response_passes_2xx_as_success() {
+        // 2xx codes must not be forwarded — handler proceeds with its
+        // normal success path. This is the only "Success" branch.
+        for status in [200u16, 201, 202, 204, 299] {
+            assert_eq!(
+                classify_do_response(status, None),
+                DoForwardAction::Success,
+                "status {status} should be classified as Success",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_do_response_forwards_429_with_do_retry_after() {
+        // When the DO sets retry-after explicitly, that exact value is
+        // mirrored back to the client. This is the TaskLeaseManager
+        // backpressure contract surfaced end-to-end.
+        let action = classify_do_response(429, Some("30"));
+        assert_eq!(
+            action,
+            DoForwardAction::Forward {
+                status: 429,
+                retry_after: Some("30".to_string()),
+            },
+        );
+    }
+
+    #[test]
+    fn classify_do_response_429_without_header_defaults_retry_after() {
+        // Defensive: if a future DO omits retry-after on 429, the worker
+        // still surfaces a sensible default so clients don't hot-loop.
+        let action = classify_do_response(429, None);
+        assert_eq!(
+            action,
+            DoForwardAction::Forward {
+                status: 429,
+                retry_after: Some(DEFAULT_DO_RETRY_AFTER_SECS.to_string()),
+            },
+        );
+    }
+
+    #[test]
+    fn classify_do_response_forwards_other_4xx_without_synthesizing_retry_after() {
+        // Non-429 4xx errors pass through with whatever (if any)
+        // retry-after the DO sent — we don't fabricate one.
+        assert_eq!(
+            classify_do_response(404, None),
+            DoForwardAction::Forward {
+                status: 404,
+                retry_after: None,
+            },
+        );
+        assert_eq!(
+            classify_do_response(400, Some("5")),
+            DoForwardAction::Forward {
+                status: 400,
+                retry_after: Some("5".to_string()),
+            },
+        );
+    }
+
+    #[test]
+    fn classify_do_response_forwards_5xx() {
+        // 5xx from a DO is forwarded as-is so operators see the real
+        // failure mode instead of an opaque worker 500.
+        assert_eq!(
+            classify_do_response(500, None),
+            DoForwardAction::Forward {
+                status: 500,
+                retry_after: None,
+            },
+        );
+        assert_eq!(
+            classify_do_response(503, Some("60")),
+            DoForwardAction::Forward {
+                status: 503,
+                retry_after: Some("60".to_string()),
+            },
+        );
+    }
+
+    #[test]
+    fn classify_do_response_default_retry_after_matches_task_lease_manager() {
+        // Tripwire: the default must match the TaskLeaseManager
+        // ENQUEUE_RETRY_AFTER_SECS value (30) so a missing header
+        // doesn't downgrade the contract.
+        assert_eq!(DEFAULT_DO_RETRY_AFTER_SECS, 30);
+        assert_eq!(DEFAULT_DO_RETRY_AFTER_SECS, super::task_do::ENQUEUE_RETRY_AFTER_SECS);
+    }
+
+    #[test]
+    fn classify_do_response_passes_through_3xx() {
+        // 3xx redirect codes are not errors and must not be forwarded
+        // through the error-mirroring path. DOs in this worker don't
+        // intentionally redirect today, but a future update that does
+        // shouldn't surface as a synthetic worker error.
+        for status in [300u16, 301, 302, 303, 304, 307, 308, 399] {
+            assert_eq!(
+                classify_do_response(status, None),
+                DoForwardAction::Success,
+                "status {status} should pass through as Success",
+            );
+        }
+        // Even with a retry-after header set, 3xx still passes through:
+        // the redirect semantics take precedence over backpressure.
+        assert_eq!(
+            classify_do_response(302, Some("5")),
+            DoForwardAction::Success,
+        );
+    }
+
+    #[test]
+    fn sanitize_retry_after_rejects_garbage() {
+        // Numeric delta-seconds — accepted verbatim.
+        assert_eq!(sanitize_retry_after(Some("0")), 0);
+        assert_eq!(sanitize_retry_after(Some("30")), 30);
+        assert_eq!(sanitize_retry_after(Some("3600")), 3600);
+        // Leading/trailing whitespace is normalised.
+        assert_eq!(sanitize_retry_after(Some("  42  ")), 42);
+
+        // HTTP-date forms (RFC 7231 §7.1.1.1) — accepted as syntactically
+        // valid; normalised to the default because we don't carry a date
+        // dep. The point is they are NOT treated as garbage.
+        assert_eq!(
+            sanitize_retry_after(Some("Sun, 06 Nov 1994 08:49:37 GMT")),
+            DEFAULT_DO_RETRY_AFTER_SECS,
+        );
+        assert_eq!(
+            sanitize_retry_after(Some("Sunday, 06-Nov-94 08:49:37 GMT")),
+            DEFAULT_DO_RETRY_AFTER_SECS,
+        );
+
+        // Garbage — falls back to default rather than forwarding to client.
+        for garbage in [
+            "",                              // empty
+            "   ",                           // whitespace-only
+            "soon",                          // arbitrary token
+            "-5",                            // negative (rejected by u32 parse)
+            "30.5",                          // fractional
+            "30s",                           // unit-suffixed
+            "9999999999",                    // overflows u32
+            "0x1e",                          // hex
+            "\u{0007}garbage\u{0007}",       // control chars
+            "Notaday, 06 Nov 1994 08:49:37", // bogus weekday
+            "Sun 06 Nov 1994",               // missing time component
+        ] {
+            assert_eq!(
+                sanitize_retry_after(Some(garbage)),
+                DEFAULT_DO_RETRY_AFTER_SECS,
+                "garbage value {garbage:?} should fall back to default",
+            );
+        }
+
+        // Absent header — falls back to default.
+        assert_eq!(
+            sanitize_retry_after(None),
+            DEFAULT_DO_RETRY_AFTER_SECS,
+        );
+    }
+
+    #[test]
+    fn classify_do_response_drops_garbage_retry_after_on_non_429() {
+        // Non-429 errors must not propagate a malformed retry-after value
+        // to the client. We drop the header rather than synthesizing a
+        // default (which only applies to the 429 backpressure contract).
+        assert_eq!(
+            classify_do_response(503, Some("not-a-number")),
+            DoForwardAction::Forward {
+                status: 503,
+                retry_after: None,
+            },
+        );
+        // Valid integer is preserved as-is.
+        assert_eq!(
+            classify_do_response(503, Some("60")),
+            DoForwardAction::Forward {
+                status: 503,
+                retry_after: Some("60".to_string()),
+            },
+        );
+    }
+
+    #[test]
+    fn classify_do_response_sanitizes_garbage_retry_after_on_429() {
+        // 429 with a garbage retry-after must be replaced with the default
+        // — the client must never see invalid header content.
+        assert_eq!(
+            classify_do_response(429, Some("forever")),
+            DoForwardAction::Forward {
+                status: 429,
+                retry_after: Some(DEFAULT_DO_RETRY_AFTER_SECS.to_string()),
+            },
+        );
+    }
 
     #[test]
     fn parse_limit_query_parses_valid_value() {

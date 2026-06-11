@@ -222,15 +222,65 @@ pub async fn register_agent(
     Ok(())
 }
 
-pub async fn list_agents(db: &D1Database, tenant_id: &str) -> Result<Vec<models::Agent>> {
-    let result: D1Result = db
-        .prepare("SELECT * FROM agents WHERE tenant_id = ?1 AND status = 'active' ORDER BY name")
-        .bind(&[JsValue::from_str(tenant_id)])?
-        .all()
-        .await?;
+/// List active agents for `tenant_id` ordered by `(name ASC, id ASC)`.
+///
+/// Returns `(rows, next_cursor)`. Mirrors the `list_runs` pattern: we fetch
+/// `limit + 1` and drop the overflow row to detect the next page without a
+/// second query. The cursor predicate uses an OR of two terms
+/// (`name > ?` OR `name = ? AND id > ?`) rather than a row-value comparison
+/// because SQLite/D1 cannot index `(a, b) > (?, ?)` as a single sargable
+/// expression.
+pub async fn list_agents(
+    db: &D1Database,
+    tenant_id: &str,
+    limit: u32,
+    cursor: Option<&crate::pagination::AgentsCursor>,
+) -> Result<(Vec<models::Agent>, Option<crate::pagination::AgentsCursor>)> {
+    let fetch_limit = limit.saturating_add(1);
 
-    let rows: Vec<AgentRow> = result.results()?;
-    Ok(rows.into_iter().map(|r| r.into_agent()).collect())
+    let mut clauses: Vec<String> =
+        vec!["tenant_id = ?".into(), "status = 'active'".into()];
+    let mut bindings: Vec<JsValue> = vec![JsValue::from_str(tenant_id)];
+
+    if let Some(c) = cursor {
+        clauses.push("(name > ? OR (name = ? AND id > ?))".into());
+        bindings.push(JsValue::from_str(&c.name));
+        bindings.push(JsValue::from_str(&c.name));
+        bindings.push(JsValue::from_str(&c.id));
+    }
+    bindings.push(JsValue::from(fetch_limit));
+
+    let query = format!(
+        "SELECT * FROM agents WHERE {} ORDER BY name ASC, id ASC LIMIT ?",
+        clauses.join(" AND ")
+    );
+
+    let result: D1Result = db.prepare(&query).bind(&bindings)?.all().await?;
+    let mut rows: Vec<AgentRow> = result.results()?;
+
+    let next_cursor = compute_agents_next_cursor(&mut rows, limit);
+
+    Ok((
+        rows.into_iter().map(|r| r.into_agent()).collect(),
+        next_cursor,
+    ))
+}
+
+/// Pure helper: trims the overflow row and produces the cursor for the next
+/// page. Extracted from `list_agents` so it can be unit-tested without D1.
+pub(crate) fn compute_agents_next_cursor(
+    rows: &mut Vec<AgentRow>,
+    limit: u32,
+) -> Option<crate::pagination::AgentsCursor> {
+    if rows.len() as u32 > limit {
+        rows.truncate(limit as usize);
+        rows.last().map(|r| crate::pagination::AgentsCursor {
+            name: r.name.clone(),
+            id: r.id.clone(),
+        })
+    } else {
+        None
+    }
 }
 
 // ── Checkpoints ─────────────────────────────────────────────────
@@ -1677,15 +1727,72 @@ async fn log_retrieval_query(
     Ok(())
 }
 
-pub async fn list_policy_rules(db: &D1Database, tenant_id: &str) -> Result<Vec<PolicyRuleRow>> {
-    let result: D1Result = db
-        .prepare(
-            "SELECT * FROM policy_rules WHERE tenant_id = ?1 ORDER BY priority DESC, created_at ASC",
-        )
-        .bind(&[JsValue::from_str(tenant_id)])?
-        .all()
-        .await?;
-    result.results()
+/// List policy rules for `tenant_id` ordered by
+/// `(priority DESC, created_at ASC, id ASC)`.
+///
+/// Returns `(rows, next_cursor)`. Mirrors the `list_runs` pattern: we fetch
+/// `limit + 1` and drop the overflow row to detect the next page. The cursor
+/// predicate is expressed as a three-level OR over `(priority, created_at, id)`
+/// because SQLite/D1 cannot index a row-value tuple comparison.
+pub async fn list_policy_rules(
+    db: &D1Database,
+    tenant_id: &str,
+    limit: u32,
+    cursor: Option<&crate::pagination::PolicyRulesCursor>,
+) -> Result<(Vec<PolicyRuleRow>, Option<crate::pagination::PolicyRulesCursor>)> {
+    let fetch_limit = limit.saturating_add(1);
+
+    let mut clauses: Vec<String> = vec!["tenant_id = ?".into()];
+    let mut bindings: Vec<JsValue> = vec![JsValue::from_str(tenant_id)];
+
+    if let Some(c) = cursor {
+        // Strict-after predicate on `(priority DESC, created_at ASC, id ASC)`:
+        //   priority < cursor.priority
+        //   OR (priority = cursor.priority AND created_at > cursor.created_at)
+        //   OR (priority = cursor.priority AND created_at = cursor.created_at AND id > cursor.id)
+        clauses.push(
+            "(priority < ? OR (priority = ? AND created_at > ?) OR (priority = ? AND created_at = ? AND id > ?))"
+                .into(),
+        );
+        bindings.push(JsValue::from(c.priority));
+        bindings.push(JsValue::from(c.priority));
+        bindings.push(JsValue::from_str(&c.created_at));
+        bindings.push(JsValue::from(c.priority));
+        bindings.push(JsValue::from_str(&c.created_at));
+        bindings.push(JsValue::from_str(&c.id));
+    }
+    bindings.push(JsValue::from(fetch_limit));
+
+    let query = format!(
+        "SELECT * FROM policy_rules WHERE {} ORDER BY priority DESC, created_at ASC, id ASC LIMIT ?",
+        clauses.join(" AND ")
+    );
+
+    let result: D1Result = db.prepare(&query).bind(&bindings)?.all().await?;
+    let mut rows: Vec<PolicyRuleRow> = result.results()?;
+
+    let next_cursor = compute_policy_rules_next_cursor(&mut rows, limit);
+
+    Ok((rows, next_cursor))
+}
+
+/// Pure helper: trims the overflow row and produces the cursor for the next
+/// page. Extracted from `list_policy_rules` so it can be unit-tested without
+/// D1.
+pub(crate) fn compute_policy_rules_next_cursor(
+    rows: &mut Vec<PolicyRuleRow>,
+    limit: u32,
+) -> Option<crate::pagination::PolicyRulesCursor> {
+    if rows.len() as u32 > limit {
+        rows.truncate(limit as usize);
+        rows.last().map(|r| crate::pagination::PolicyRulesCursor {
+            priority: r.priority,
+            created_at: r.created_at.clone(),
+            id: r.id.clone(),
+        })
+    } else {
+        None
+    }
 }
 
 pub async fn get_policy_rule(
@@ -3873,5 +3980,111 @@ mod tests {
         };
 
         assert!(build_entity_refs(&evt).is_none());
+    }
+
+    // ── Pagination helpers: list_policy_rules / list_agents ─────
+
+    fn agent_row(id: &str, name: &str) -> AgentRow {
+        AgentRow {
+            id: id.into(),
+            name: name.into(),
+            capabilities: "[]".into(),
+            endpoint: None,
+            last_heartbeat: None,
+            status: "active".into(),
+            metadata: None,
+        }
+    }
+
+    fn policy_row(id: &str, priority: i32, created_at: &str) -> PolicyRuleRow {
+        PolicyRuleRow {
+            id: id.into(),
+            name: format!("rule-{id}"),
+            action_pattern: "*".into(),
+            resource_pattern: "*".into(),
+            actor_pattern: "*".into(),
+            risk_level: "read".into(),
+            verdict: "allow".into(),
+            reason: "test".into(),
+            priority,
+            enabled: 1,
+            created_at: created_at.into(),
+            updated_at: created_at.into(),
+        }
+    }
+
+    #[test]
+    fn list_agents_helper_returns_no_cursor_when_results_under_limit() {
+        let mut rows = vec![agent_row("a1", "alpha"), agent_row("a2", "beta")];
+        let cursor = compute_agents_next_cursor(&mut rows, 5);
+        assert!(cursor.is_none());
+        assert_eq!(rows.len(), 2, "rows preserved when under limit");
+    }
+
+    #[test]
+    fn list_agents_helper_returns_no_cursor_when_results_exactly_at_limit() {
+        // Exactly `limit` rows means no overflow row was fetched -> no next.
+        let mut rows = vec![agent_row("a1", "alpha"), agent_row("a2", "beta")];
+        let cursor = compute_agents_next_cursor(&mut rows, 2);
+        assert!(cursor.is_none());
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn list_agents_helper_trims_overflow_and_returns_cursor() {
+        // limit=2 with 3 rows: the third is the overflow probe; should be
+        // dropped, and the cursor is built from the last *returned* row.
+        let mut rows = vec![
+            agent_row("a1", "alpha"),
+            agent_row("a2", "beta"),
+            agent_row("a3", "gamma"),
+        ];
+        let cursor = compute_agents_next_cursor(&mut rows, 2).expect("cursor");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(cursor.name, "beta");
+        assert_eq!(cursor.id, "a2");
+    }
+
+    #[test]
+    fn list_policy_rules_helper_returns_no_cursor_when_results_under_limit() {
+        let mut rows = vec![
+            policy_row("r1", 100, "2026-01-01T00:00:00Z"),
+            policy_row("r2", 50, "2026-01-02T00:00:00Z"),
+        ];
+        let cursor = compute_policy_rules_next_cursor(&mut rows, 5);
+        assert!(cursor.is_none());
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn list_policy_rules_helper_trims_overflow_and_returns_cursor() {
+        let mut rows = vec![
+            policy_row("r1", 100, "2026-01-01T00:00:00Z"),
+            policy_row("r2", 50, "2026-01-02T00:00:00Z"),
+            policy_row("r3", 25, "2026-01-03T00:00:00Z"),
+        ];
+        let cursor = compute_policy_rules_next_cursor(&mut rows, 2).expect("cursor");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(cursor.priority, 50);
+        assert_eq!(cursor.created_at, "2026-01-02T00:00:00Z");
+        assert_eq!(cursor.id, "r2");
+    }
+
+    #[test]
+    fn list_policy_rules_helper_preserves_order_after_truncation() {
+        // The returned rows must remain in caller-visible order; truncation
+        // removes the overflow probe from the *end*, not from the middle.
+        let mut rows = vec![
+            policy_row("r1", 100, "2026-01-01T00:00:00Z"),
+            policy_row("r2", 100, "2026-01-02T00:00:00Z"),
+            policy_row("r3", 50, "2026-01-03T00:00:00Z"),
+        ];
+        let cursor = compute_policy_rules_next_cursor(&mut rows, 2).expect("cursor");
+        assert_eq!(rows[0].id, "r1");
+        assert_eq!(rows[1].id, "r2");
+        // Cursor reflects the last *returned* row, breaking the priority tie
+        // on (created_at, id).
+        assert_eq!(cursor.priority, 100);
+        assert_eq!(cursor.id, "r2");
     }
 }
