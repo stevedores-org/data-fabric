@@ -201,10 +201,33 @@ impl Client {
         self.send_request(Method::POST, "/v1/tasks", Some(task)).await
     }
 
+    /// Build the HTTP request used by [`Client::claim_next_task`].
+    ///
+    /// Extracted so the method/URL/query-param shape can be unit-tested without
+    /// spinning up a mock server. The new contract (see PR #140) is:
+    ///
+    /// * `POST /mcp/task/next` — the operation is state-mutating (transfers
+    ///   ownership of a task), so it must use POST. GET now returns 405.
+    /// * `agent_id` is a required query parameter.
+    /// * `cap` is an optional comma-separated query parameter.
+    /// * No request body — inputs come exclusively from the query string.
+    pub fn build_claim_next_task_request(
+        &self,
+        agent_id: &str,
+        capabilities: &[String],
+    ) -> Result<reqwest::Request> {
+        let path = if capabilities.is_empty() {
+            format!("/mcp/task/next?agent_id={}", agent_id)
+        } else {
+            let caps = capabilities.join(",");
+            format!("/mcp/task/next?agent_id={}&cap={}", agent_id, caps)
+        };
+        self.prepare_request(Method::POST, &path).build().map_err(Error::from)
+    }
+
     pub async fn claim_next_task(&self, agent_id: &str, capabilities: &[String]) -> Result<Option<AgentTask>> {
-        let caps = capabilities.join(",");
-        let path = format!("/mcp/task/next?agent_id={}&cap={}", agent_id, caps);
-        let resp = self.prepare_request(Method::GET, &path).send().await?;
+        let req = self.build_claim_next_task_request(agent_id, capabilities)?;
+        let resp = self.http.execute(req).await?;
         if resp.status() == StatusCode::NO_CONTENT {
             return Ok(None);
         }
@@ -327,5 +350,63 @@ impl Client {
 
     pub async fn get_llama_context(&self, req: &ContextRequest) -> Result<ContextPackResponse> {
         self.send_request(Method::POST, "/v1/integrations/llama-rs/context", Some(req)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_client() -> Client {
+        Client::new(ClientConfig {
+            base_url: "https://df.example".to_string(),
+            tenant_id: "t-1".to_string(),
+            tenant_role: "builder".to_string(),
+            cf_client_id: None,
+            cf_client_secret: None,
+        })
+    }
+
+    /// Regression test for PR #140: `/mcp/task/next` flipped from GET to POST
+    /// in the worker, and the GET shim now returns 405. Every call from this
+    /// client must use POST or it will fail at runtime.
+    #[test]
+    fn claim_next_task_uses_post() {
+        let client = test_client();
+        let req = client
+            .build_claim_next_task_request("agent-1", &["rust".to_string(), "wasm".to_string()])
+            .expect("request must build");
+        assert_eq!(req.method(), &Method::POST, "must use POST per PR #140 contract");
+    }
+
+    /// `agent_id` and `cap` belong on the query string (the new POST handler
+    /// reads them from `url.query_pairs()`), not in a JSON body.
+    #[test]
+    fn claim_next_task_puts_inputs_in_query_string_not_body() {
+        let client = test_client();
+        let req = client
+            .build_claim_next_task_request("agent-1", &["rust".to_string(), "wasm".to_string()])
+            .expect("request must build");
+        let url = req.url();
+        assert_eq!(url.path(), "/mcp/task/next");
+        let query = url.query().expect("query string must be present");
+        assert!(query.contains("agent_id=agent-1"), "agent_id must be a query param, got: {query}");
+        assert!(query.contains("cap=rust,wasm"), "cap must be a comma-separated query param, got: {query}");
+        assert!(req.body().is_none(), "POST body must be empty; the handler reads from query params");
+    }
+
+    /// `cap` is optional per the OpenAPI spec — omit it entirely when no
+    /// capabilities are supplied (rather than sending `cap=`), so the
+    /// server-side parser doesn't see an empty capability set as a single
+    /// empty-string capability.
+    #[test]
+    fn claim_next_task_omits_cap_when_no_capabilities() {
+        let client = test_client();
+        let req = client
+            .build_claim_next_task_request("agent-1", &[])
+            .expect("request must build");
+        let query = req.url().query().unwrap_or("");
+        assert!(query.contains("agent_id=agent-1"));
+        assert!(!query.contains("cap="), "cap must be omitted when no capabilities are supplied, got: {query}");
     }
 }

@@ -1612,3 +1612,140 @@ fn step_type_from_storage_str_falls_back_on_unknown() {
     assert_eq!(StepType::from_storage_str("future_variant"), StepType::Other);
     assert_eq!(StepType::from_storage_str(""), StepType::Other);
 }
+
+// ── OpenAPI contract reconciliation (PR: fix/openapi-spec-reconciliation) ─────
+//
+// The following tests pin the documented response shapes for the three
+// endpoints whose OpenAPI schemas were reconciled with the handlers. They
+// are the canonical guard against silent drift between handler output and
+// the published OpenAPI spec.
+
+/// `/v1/policies/check` returns 9 fields total: 4 always-present and 5
+/// optional ones populated by the policy engine. The OpenAPI schema must
+/// document all 9. This test fixes the typed shape so a follow-up rename
+/// will trip CI before the OpenAPI doc drifts.
+#[test]
+fn policy_check_response_serializes_all_nine_documented_fields() {
+    let resp = PolicyCheckResponse {
+        id: "pd-1".into(),
+        action: "deploy".into(),
+        decision: "allow".into(),
+        reason: "matched rule allow-deploys".into(),
+        risk_level: Some("write".into()),
+        policy_version: Some("v3".into()),
+        matched_rule: Some("rule-deploys".into()),
+        escalation_id: Some("esc-1".into()),
+        rate_limited: Some(false),
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+
+    // Every documented field must serialize, with the documented JSON type.
+    assert!(json["id"].is_string(), "id must be string");
+    assert!(json["action"].is_string(), "action must be string");
+    assert!(json["decision"].is_string(), "decision must be string");
+    assert!(json["reason"].is_string(), "reason must be string");
+    assert!(json["risk_level"].is_string(), "risk_level must be string");
+    assert!(
+        json["policy_version"].is_string(),
+        "policy_version must be string"
+    );
+    assert!(
+        json["matched_rule"].is_string(),
+        "matched_rule must be string"
+    );
+    assert!(
+        json["escalation_id"].is_string(),
+        "escalation_id must be string"
+    );
+    assert!(
+        json["rate_limited"].is_boolean(),
+        "rate_limited must be boolean"
+    );
+
+    // Field count: ensure no undocumented fields slipped in.
+    let object = json.as_object().expect("response must be a JSON object");
+    assert_eq!(
+        object.len(),
+        9,
+        "PolicyCheckResponse must serialize to exactly 9 documented fields, got: {:?}",
+        object.keys().collect::<Vec<_>>()
+    );
+}
+
+/// When the optional fields are `None`, only the 4 required fields serialize
+/// (because of `#[serde(skip_serializing_if = "Option::is_none")]`). The
+/// OpenAPI schema reflects this by marking the 5 extra fields as optional.
+#[test]
+fn policy_check_response_minimal_serializes_only_required_fields() {
+    let resp = PolicyCheckResponse {
+        id: "pd-2".into(),
+        action: "read_secret".into(),
+        decision: "deny".into(),
+        reason: "no rule matched".into(),
+        risk_level: None,
+        policy_version: None,
+        matched_rule: None,
+        escalation_id: None,
+        rate_limited: None,
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    let object = json.as_object().expect("response must be a JSON object");
+    assert_eq!(
+        object.len(),
+        4,
+        "minimal PolicyCheckResponse must serialize exactly the 4 required fields, got: {:?}",
+        object.keys().collect::<Vec<_>>()
+    );
+    for required in ["id", "action", "decision", "reason"] {
+        assert!(
+            object.contains_key(required),
+            "required field {required} missing"
+        );
+    }
+}
+
+/// `/v1/checkpoints` POST returns `{id, thread_id, state_r2_key}` — clients
+/// need `state_r2_key` to recover state from R2. The OpenAPI schema was
+/// previously misdocumented as `{id, status}`.
+#[test]
+fn checkpoint_created_serializes_all_three_documented_fields() {
+    let cc = CheckpointCreated {
+        id: "cp-1".into(),
+        thread_id: "thread-abc".into(),
+        state_r2_key: "tenant-x/checkpoints/thread-abc/cp-1".into(),
+    };
+    let json = serde_json::to_value(&cc).unwrap();
+    let object = json.as_object().expect("response must be a JSON object");
+    assert_eq!(
+        object.len(),
+        3,
+        "CheckpointCreated must serialize exactly 3 documented fields, got: {:?}",
+        object.keys().collect::<Vec<_>>()
+    );
+    assert!(json["id"].is_string(), "id must be string");
+    assert!(json["thread_id"].is_string(), "thread_id must be string");
+    assert!(
+        json["state_r2_key"].is_string(),
+        "state_r2_key must be string"
+    );
+    // The legacy schema documented a `status` field that the handler never
+    // emitted; assert its absence so re-adding it requires updating the spec.
+    assert!(
+        !object.contains_key("status"),
+        "CheckpointCreated must not include a `status` field (legacy schema drift)"
+    );
+}
+
+/// Round-trip guard: clients deserializing the documented shape must be
+/// able to reconstruct an equal struct. Protects against accidental rename.
+#[test]
+fn checkpoint_created_round_trips_documented_shape() {
+    let original = CheckpointCreated {
+        id: "cp-rt".into(),
+        thread_id: "thread-rt".into(),
+        state_r2_key: "tenant-rt/checkpoints/thread-rt/cp-rt".into(),
+    };
+    let json = serde_json::to_string(&original).unwrap();
+    let parsed: CheckpointCreated = serde_json::from_str(&json).unwrap();
+    assert_eq!(original, parsed);
+}
