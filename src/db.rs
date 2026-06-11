@@ -2241,11 +2241,13 @@ fn days_ago_expr(days: i64) -> String {
 
 // ── Internal row types ──────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 struct TaskIdRow {
     id: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 struct RetryRow {
     retry_count: i32,

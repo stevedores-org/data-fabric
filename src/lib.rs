@@ -393,7 +393,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let namespace = ctx.env.durable_object("PLAY_MANAGER")?;
             let stub = namespace.id_from_name(&run_id)?.get_stub()?;
             
-            let mut do_req = Request::new_with_init(
+            let do_req = Request::new_with_init(
                 "https://do/launch",
                 &RequestInit {
                     method: Method::Post,
@@ -736,7 +736,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             
             let do_url = format!("https://do/heartbeat?task_id={}&agent_id={}", task_id, agent_id);
             let do_req = Request::new(&do_url, Method::Post)?;
-            let mut do_resp = stub.fetch_with_request(do_req).await?;
+            let do_resp = stub.fetch_with_request(do_req).await?;
 
             if do_resp.status_code() == 200 {
                 // Update D1 (best effort)

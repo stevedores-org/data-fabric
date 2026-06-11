@@ -23,6 +23,7 @@ pub struct PlayLaunchRequest {
     pub metadata: Option<serde_json::Value>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct PlayLaunchResponse {
     pub run_id: String,
