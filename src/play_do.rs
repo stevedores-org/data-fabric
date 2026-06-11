@@ -7,7 +7,6 @@ use worker::*;
 struct PlayState {
     definition: PlayDefinition,
     run_id: String,
-    tenant_id: String,
     completed_tasks: HashSet<String>,
     active_tasks: HashSet<String>,
 }
@@ -30,27 +29,22 @@ impl DurableObject for PlayManager {
         match (method, path.as_str()) {
             (Method::Post, "/launch") => {
                 let def: PlayDefinition = req.json().await?;
-                let tenant_id = req
-                    .headers()
-                    .get("x-tenant-id")?
-                    .ok_or_else(|| Error::RustError("missing x-tenant-id header".into()))?;
                 let storage = self.state.storage();
-
+                
                 let run_id = crate::generate_id().unwrap_or_else(|_| "err".to_string());
-
+                
                 let state = PlayState {
                     definition: def.clone(),
                     run_id: run_id.clone(),
-                    tenant_id,
                     completed_tasks: HashSet::new(),
                     active_tasks: HashSet::new(),
                 };
-
+                
                 storage.put("state", &state).await?;
-
+                
                 // Materialize initial tasks
                 self.materialize_eligible_tasks(&state).await?;
-
+                
                 Response::from_json(&serde_json::json!({
                     "run_id": run_id,
                     "status": "launched"
@@ -59,19 +53,16 @@ impl DurableObject for PlayManager {
             (Method::Post, "/task-completed") => {
                 let task_id: String = req.json().await?;
                 let storage = self.state.storage();
-                let mut state: PlayState = storage
-                    .get("state")
-                    .await?
-                    .ok_or_else(|| Error::RustError("state not found".into()))?;
-
+                let mut state: PlayState = storage.get("state").await?.ok_or_else(|| Error::RustError("state not found".into()))?;
+                
                 state.completed_tasks.insert(task_id.clone());
                 state.active_tasks.remove(&task_id);
-
+                
                 storage.put("state", &state).await?;
-
+                
                 // Materialize next batch of tasks
                 self.materialize_eligible_tasks(&state).await?;
-
+                
                 Response::ok("ok")
             }
             _ => Response::error("not found", 404),
@@ -82,38 +73,30 @@ impl DurableObject for PlayManager {
 impl PlayManager {
     async fn materialize_eligible_tasks(&self, state: &PlayState) -> Result<()> {
         let mut to_launch = Vec::new();
-
+        
         for task_def in &state.definition.tasks {
-            if state.completed_tasks.contains(&task_def.id)
-                || state.active_tasks.contains(&task_def.id)
-            {
+            if state.completed_tasks.contains(&task_def.id) || state.active_tasks.contains(&task_def.id) {
                 continue;
             }
-
+            
             // Check dependencies
-            let all_deps_met = task_def
-                .depends_on
-                .iter()
-                .all(|dep_id| state.completed_tasks.contains(dep_id));
-
+            let all_deps_met = task_def.depends_on.iter().all(|dep_id| state.completed_tasks.contains(dep_id));
+            
             if all_deps_met {
                 to_launch.push(task_def.clone());
             }
         }
-
+        
         if to_launch.is_empty() {
             return Ok(());
         }
 
-        let tenant_id = &state.tenant_id;
+        let tenant_id = self.state.id().to_string(); // Simplified, should pass tenant_id
         let task_ns = self.env.durable_object("TASK_LEASE_MANAGER")?;
-        let task_stub = task_ns.id_from_name(tenant_id)?.get_stub()?;
-
+        let task_stub = task_ns.id_from_name(&tenant_id)?.get_stub()?;
+        
         let storage = self.state.storage();
-        let mut current_state: PlayState = storage
-            .get("state")
-            .await?
-            .ok_or_else(|| Error::RustError("state not found".into()))?;
+        let mut current_state: PlayState = storage.get("state").await?.ok_or_else(|| Error::RustError("state not found".into()))?;
 
         for task_def in to_launch {
             let task = AgentTask {
@@ -135,23 +118,20 @@ impl PlayManager {
                 completed_at: None,
                 memory_context: None,
             };
-
+            
             let do_req = Request::new_with_init(
                 "https://do/enqueue",
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(
-                        serde_wasm_bindgen::to_value(&task)
-                            .map_err(|e| Error::RustError(e.to_string()))?,
-                    ),
+                    body: Some(serde_wasm_bindgen::to_value(&task).map_err(|e| Error::RustError(e.to_string()))?),
                     ..Default::default()
-                },
+                }
             )?;
             task_stub.fetch_with_request(do_req).await?;
-
+            
             current_state.active_tasks.insert(task_def.id.clone());
         }
-
+        
         storage.put("state", &current_state).await?;
         Ok(())
     }

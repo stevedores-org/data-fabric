@@ -8,11 +8,11 @@
 #[allow(dead_code)]
 mod entities;
 pub mod orchestration;
-mod plays;
 mod telemetry;
+mod plays;
 
-pub use plays::*;
 pub use telemetry::*;
+pub use plays::*;
 #[allow(dead_code)]
 mod relationships;
 mod requests;

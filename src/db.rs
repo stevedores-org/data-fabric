@@ -75,10 +75,7 @@ pub async fn sync_task_status(
     tenant_id: &str,
     task: &models::AgentTask,
 ) -> Result<()> {
-    let result_json = task
-        .result
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap());
+    let result_json = task.result.as_ref().map(|v| serde_json::to_string(v).unwrap());
 
     db.prepare(
         "UPDATE mcp_tasks SET status = ?1, agent_id = ?2, result = ?3, retry_count = ?4, lease_expires_at = ?5, completed_at = ?6
@@ -842,7 +839,7 @@ pub async fn retrieve_memory_hybrid(
     }
 
     let qlike = format!("%{}%", req.query.to_lowercase());
-
+    
     if !semantic_ids.is_empty() {
         let mut id_placeholders = Vec::new();
         for id in semantic_ids {
@@ -851,7 +848,7 @@ pub async fn retrieve_memory_hybrid(
             idx += 1;
         }
         let id_clause = id_placeholders.join(", ");
-
+        
         where_parts.push(format!(
             "(id IN ({}) OR (lower(summary) LIKE ?{} OR lower(COALESCE(title, '')) LIKE ?{} OR lower(COALESCE(tags, '')) LIKE ?{}))",
             id_clause, idx, idx + 1, idx + 2
@@ -863,7 +860,7 @@ pub async fn retrieve_memory_hybrid(
             idx + 2
         ));
     }
-
+    
     bind.push(JsValue::from_str(&qlike));
     bind.push(JsValue::from_str(&qlike));
     bind.push(JsValue::from_str(&qlike));
@@ -901,7 +898,7 @@ pub async fn retrieve_memory_hybrid(
         }
 
         let mut score = score_candidate(&row, &req.query, now_ms);
-
+        
         // Semantic boost: if ID was in semantic_ids, boost the score
         if semantic_ids.contains(&row.id) {
             score += 2.0; // High boost for vector match
@@ -2026,10 +2023,7 @@ pub async fn record_telemetry(
     body: &models::TelemetrySnapshot,
 ) -> Result<()> {
     let now = now_iso();
-    let payload_json = body
-        .payload
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap());
+    let payload_json = body.payload.as_ref().map(|v| serde_json::to_string(v).unwrap());
 
     db.prepare(
         "INSERT INTO telemetry_snapshots (

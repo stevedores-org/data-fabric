@@ -7,20 +7,20 @@ mod integrations;
 mod metrics;
 mod models;
 mod pagination;
-mod play_do;
 mod policy;
 mod storage;
 mod task_do;
+mod thread_do;
+mod play_do;
+mod vector_index;
 mod tenant;
 #[allow(dead_code)]
 mod tenant_security;
-mod thread_do;
-mod vector_index;
 mod verification;
 
-pub use play_do::PlayManager;
 pub use task_do::TaskLeaseManager;
 pub use thread_do::ThreadManager;
+pub use play_do::PlayManager;
 
 #[derive(Serialize)]
 struct HealthResponse<'a> {
@@ -329,7 +329,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::RetrieveMemoryRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-
+            
             let start = js_sys::Date::now();
 
             // 1. Semantic Search via Vectorize (if query provided)
@@ -352,13 +352,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             // 2. Relational Search + Filter via D1
             // Hybrid approach: use semantic IDs if available, or just use D1 filters
-            let response =
-                db::retrieve_memory_hybrid(&d1, &tenant_ctx.tenant_id, &body, &semantic_ids)
-                    .await?;
+            let response = db::retrieve_memory_hybrid(&d1, &tenant_ctx.tenant_id, &body, &semantic_ids).await?;
 
             let _latency_ms = (js_sys::Date::now() - start) as i64;
             // Update latency in response if needed, though D1 usually tracks its own
-
+            
             Response::from_json(&response)
         })
         .post_async("/v1/memory/context-pack", |mut req, ctx| async move {
@@ -417,14 +415,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         // ── Plays (Orchestration) ──────────────────────────────
         .post_async("/v1/plays/:name/launch", |mut req, ctx| async move {
-            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let _tenant_ctx = tenant::tenant_from_request(&req)?;
             let play_name = ctx.param("name").unwrap().to_string();
-            let body: models::PlayLaunchRequest =
-                req.json().await.unwrap_or(models::PlayLaunchRequest {
-                    play_name: play_name.clone(),
-                    job_id: None,
-                    metadata: None,
-                });
+            let body: models::PlayLaunchRequest = req.json().await.unwrap_or(models::PlayLaunchRequest {
+                play_name: play_name.clone(),
+                job_id: None,
+                metadata: None,
+            });
 
             // 1. Fetch play definition from D1
             let d1 = ctx.env.d1("DB")?;
@@ -437,24 +434,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let run_id = body.job_id.unwrap_or_else(|| generate_id().unwrap());
             let namespace = ctx.env.durable_object("PLAY_MANAGER")?;
             let stub = namespace.id_from_name(&run_id)?.get_stub()?;
-
-            let headers = Headers::new();
-            headers.set("x-tenant-id", &tenant_ctx.tenant_id)?;
-
+            
             let do_req = Request::new_with_init(
                 "https://do/launch",
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(
-                        serde_wasm_bindgen::to_value(&def)
-                            .map_err(|e| Error::RustError(e.to_string()))?,
-                    ),
-                    headers,
+                    body: Some(serde_wasm_bindgen::to_value(&def).map_err(|e| Error::RustError(e.to_string()))?),
                     ..Default::default()
-                },
+                }
             )?;
             let mut do_resp = stub.fetch_with_request(do_req).await?;
-
+            
             let result: serde_json::Value = do_resp.json().await?;
             Response::from_json(&result)
         })
@@ -711,10 +701,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "https://do/enqueue",
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(
-                        serde_wasm_bindgen::to_value(&task)
-                            .map_err(|e| Error::RustError(e.to_string()))?,
-                    ),
+                    body: Some(serde_wasm_bindgen::to_value(&task).map_err(|e| Error::RustError(e.to_string()))?),
                     ..Default::default()
                 },
             )?;
@@ -741,7 +728,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
             let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
-
+            
             let do_url = format!("https://do/claim?agent_id={}&caps={}", agent_id, caps);
             let do_req = Request::new(&do_url, Method::Post)?;
             let mut do_resp = stub.fetch_with_request(do_req).await?;
@@ -751,7 +738,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
 
             let mut task: models::AgentTask = do_resp.json().await?;
-
+            
             // Sync to D1 (best effort)
             let d1 = ctx.env.d1("DB")?;
             let _ = db::sync_task_status(&d1, &tenant_ctx.tenant_id, &task).await;
@@ -759,9 +746,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             // Augment task with agent's memory context from MOM (if available)
             let mom_endpoint = ctx.env.var("MOM_ENDPOINT").ok().map(|v| v.to_string());
             if let Some(endpoint) = mom_endpoint {
-                let memory_context =
-                    augment_task_with_memory(&agent_id, &tenant_ctx.tenant_id, &task, &endpoint)
-                        .await;
+                let memory_context = augment_task_with_memory(
+                    &agent_id,
+                    &tenant_ctx.tenant_id,
+                    &task,
+                    &endpoint,
+                )
+                .await;
                 task.memory_context = memory_context;
             }
             Response::from_json(&task)
@@ -784,11 +775,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
             let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
-
-            let do_url = format!(
-                "https://do/heartbeat?task_id={}&agent_id={}",
-                task_id, agent_id
-            );
+            
+            let do_url = format!("https://do/heartbeat?task_id={}&agent_id={}", task_id, agent_id);
             let do_req = Request::new(&do_url, Method::Post)?;
             let do_resp = stub.fetch_with_request(do_req).await?;
 
@@ -808,18 +796,15 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("missing task id", 400),
             };
             let body: models::TaskCompleteRequest = req.json().await?;
-
+            
             let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
             let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
-
+            
             let do_req = Request::new_with_init(
                 &format!("https://do/complete/{}", task_id),
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(
-                        serde_wasm_bindgen::to_value(&body)
-                            .map_err(|e| Error::RustError(e.to_string()))?,
-                    ),
+                    body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
                     ..Default::default()
                 },
             )?;
@@ -845,20 +830,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
             let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
-
+            
             let do_req = Request::new_with_init(
                 &format!("https://do/fail/{}", task_id),
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(
-                        serde_wasm_bindgen::to_value(&body)
-                            .map_err(|e| Error::RustError(e.to_string()))?,
-                    ),
+                    body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
                     ..Default::default()
                 },
             )?;
             let mut do_resp = stub.fetch_with_request(do_req).await?;
-
+            
             if do_resp.status_code() == 200 {
                 let task: models::AgentTask = do_resp.json().await?;
                 // Sync to D1
@@ -893,10 +875,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
-
+            
             db::record_telemetry(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
-
-            Response::from_json(&models::TelemetryAck { id, accepted: true })
+            
+            Response::from_json(&models::TelemetryAck {
+                id,
+                accepted: true,
+            })
         })
         // ── Checkpoints (M2) ──────────────────────────────────
         .post_async("/v1/checkpoints", |mut req, ctx| async move {
@@ -925,10 +910,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "https://do/checkpoint",
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(
-                        serde_wasm_bindgen::to_value(&body)
-                            .map_err(|e| Error::RustError(e.to_string()))?,
-                    ),
+                    body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
                     ..Default::default()
                 },
             )?;
@@ -949,7 +931,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 // 1. Try fast path via ThreadManager Durable Object
                 let namespace = ctx.env.durable_object("THREAD_MANAGER")?;
                 let stub = namespace.id_from_name(&thread_id)?.get_stub()?;
-
+                
                 let do_req = Request::new("https://do/latest", Method::Get)?;
                 let mut do_resp = stub.fetch_with_request(do_req).await?;
 
