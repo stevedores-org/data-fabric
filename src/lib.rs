@@ -435,7 +435,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let namespace = ctx.env.durable_object("PLAY_MANAGER")?;
             let stub = namespace.id_from_name(&run_id)?.get_stub()?;
             
-            let mut do_req = Request::new_with_init(
+            let do_req = Request::new_with_init(
                 "https://do/launch",
                 &RequestInit {
                     method: Method::Post,
