@@ -110,29 +110,50 @@ impl DurableObject for TaskLeaseManager {
                     task.status = "completed".to_string();
                     task.result = result;
                     task.completed_at = Some(js_sys::Date::new_0().to_iso_string().as_string().unwrap());
-                    
+
                     let job_id = task.job_id.clone();
-                    
+                    let task_tenant = task.tenant_id.clone();
+
                     storage.put("active", active).await?;
-                    
-                    // If task belongs to a play, notify PlayManager
-                    // Extract ID from job_id or play_id
-                    let play_ns = self.env.durable_object("PLAY_MANAGER")?;
-                    let play_stub = play_ns.id_from_name(&job_id)?.get_stub()?;
-                    
-                    // Map full task ID back to play task ID (usually suffix)
-                    let play_task_id = task_id.split('-').next_back().unwrap_or(&task_id).to_string();
-                    
-                    let do_req = Request::new_with_init(
-                        "https://do/task-completed",
-                        &RequestInit {
-                            method: Method::Post,
-                            body: Some(serde_wasm_bindgen::to_value(&play_task_id).unwrap()),
-                            ..Default::default()
+
+                    // If task belongs to a play, notify PlayManager. The
+                    // PlayManager DO is tenant-namespaced (see lib.rs
+                    // `/v1/plays/:name/launch`) so we must reconstruct the
+                    // name as `{tenant_id}:play:{run_id}`. If the task is
+                    // missing tenant_id (legacy persisted state from before
+                    // WS8), we skip the notification rather than routing to
+                    // a potentially cross-tenant DO instance.
+                    if let Some(tenant_id) = task_tenant.as_deref() {
+                        if !tenant_id.is_empty() {
+                            let do_name = format!("{}:play:{}", tenant_id, job_id);
+                            let play_ns = self.env.durable_object("PLAY_MANAGER")?;
+                            let play_stub = play_ns.id_from_name(&do_name)?.get_stub()?;
+
+                            // Map full task ID back to play task ID (usually suffix)
+                            let play_task_id = task_id.split('-').next_back().unwrap_or(&task_id).to_string();
+
+                            let do_req = Request::new_with_init(
+                                "https://do/task-completed",
+                                &RequestInit {
+                                    method: Method::Post,
+                                    body: Some(serde_wasm_bindgen::to_value(&play_task_id).unwrap()),
+                                    ..Default::default()
+                                }
+                            )?;
+                            let _ = play_stub.fetch_with_request(do_req).await;
+                        } else {
+                            worker::console_log!(
+                                "skipping PlayManager notify for task {}: empty tenant_id",
+                                task_id
+                            );
                         }
-                    )?;
-                    let _ = play_stub.fetch_with_request(do_req).await;
-                    
+                    } else {
+                        worker::console_log!(
+                            "skipping PlayManager notify for task {}: tenant_id missing (pre-WS8 task)",
+                            task_id
+                        );
+                    }
+
                     Response::from_json(&task)
                 } else {
                     Response::error("task not found or not running", 404)

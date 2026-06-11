@@ -38,6 +38,15 @@ pub struct AgentTask {
     /// Contains formatted memories from agent's past executions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_context: Option<String>,
+    /// Owning tenant_id. Required for cross-DO routing (TaskLeaseManager →
+    /// PlayManager) so the TLM can reconstruct the correct tenant-namespaced
+    /// PlayManager DO instance name on task completion. Optional in the
+    /// wire format for back-compat with pre-WS8 persisted state, but new
+    /// writes from db.rs and play_do.rs always populate it. A task with
+    /// `tenant_id = None` cannot route back to PlayManager and is treated
+    /// as stale (notification suppressed) rather than cross-tenant routed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
