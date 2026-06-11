@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use worker::*;
 
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug)]
 struct TaskLeaseState {
     pending_tasks: VecDeque<AgentTask>,
@@ -12,6 +13,7 @@ struct TaskLeaseState {
 #[durable_object]
 pub struct TaskLeaseManager {
     state: State,
+    #[allow(dead_code)]
     env: Env,
 }
 
@@ -119,9 +121,9 @@ impl DurableObject for TaskLeaseManager {
                     let play_stub = play_ns.id_from_name(&job_id)?.get_stub()?;
                     
                     // Map full task ID back to play task ID (usually suffix)
-                    let play_task_id = task_id.split('-').last().unwrap_or(&task_id).to_string();
+                    let play_task_id = task_id.split('-').next_back().unwrap_or(&task_id).to_string();
                     
-                    let mut do_req = Request::new_with_init(
+                    let do_req = Request::new_with_init(
                         "https://do/task-completed",
                         &RequestInit {
                             method: Method::Post,

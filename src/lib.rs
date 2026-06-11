@@ -17,9 +17,11 @@ mod tenant;
 #[allow(dead_code)]
 mod tenant_security;
 mod verification;
+mod openapi;
 
 pub use task_do::TaskLeaseManager;
 pub use thread_do::ThreadManager;
+
 pub use play_do::PlayManager;
 
 #[derive(Serialize)]
@@ -32,7 +34,7 @@ struct HealthResponse<'a> {
 const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 
 fn is_public_path(path: &str) -> bool {
-    path == "/" || path == "/health"
+    path == "/" || path == "/health" || path == "/openapi.json" || path == "/docs"
 }
 
 fn request_path(req: &Request) -> Result<String> {
@@ -124,6 +126,35 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 status: "ok",
                 mission: "velocity-for-autonomous-agent-builders",
             })
+        })
+        .get("/openapi.json", |_, _| {
+            let mut headers = Headers::new();
+            headers.set("content-type", "application/json")?;
+            headers.set("access-control-allow-origin", "*")?;
+            Ok(Response::ok(openapi::get_openapi_spec())?.with_headers(headers))
+        })
+        .get("/docs", |_, _| {
+            let html = r#"<!DOCTYPE html>
+<html>
+  <head>
+    <title>Data Fabric API Documentation</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <script
+      id="api-reference"
+      data-url="/openapi.json"
+    ></script>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+  </body>
+</html>"#;
+            Response::from_html(html)
         })
         // ── Tenants (WS8) ─────────────────────────────────────
         .post_async("/v1/tenants/provision", |mut req, ctx| async move {
@@ -435,7 +466,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let namespace = ctx.env.durable_object("PLAY_MANAGER")?;
             let stub = namespace.id_from_name(&run_id)?.get_stub()?;
             
-            let mut do_req = Request::new_with_init(
+            let do_req = Request::new_with_init(
                 "https://do/launch",
                 &RequestInit {
                     method: Method::Post,
@@ -737,6 +768,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 return Ok(Response::empty()?.with_status(204));
             }
 
+
             let mut task: models::AgentTask = do_resp.json().await?;
             
             // Sync to D1 (best effort)
@@ -778,7 +810,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             
             let do_url = format!("https://do/heartbeat?task_id={}&agent_id={}", task_id, agent_id);
             let do_req = Request::new(&do_url, Method::Post)?;
-            let mut do_resp = stub.fetch_with_request(do_req).await?;
+            let do_resp = stub.fetch_with_request(do_req).await?;
 
             if do_resp.status_code() == 200 {
                 // Update D1 (best effort)
