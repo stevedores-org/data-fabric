@@ -127,6 +127,37 @@ pub async fn heartbeat_task(
     Ok(changed)
 }
 
+pub async fn get_play_definition(
+    db: &D1Database,
+    name: &str,
+) -> Result<Option<models::PlayDefinition>> {
+    #[derive(serde::Deserialize)]
+    struct PlayRow {
+        name: String,
+        goal: String,
+        tasks_json: String,
+    }
+
+    let row: Option<PlayRow> = db
+        .prepare("SELECT name, goal, tasks_json FROM play_definitions WHERE name = ?1")
+        .bind(&[JsValue::from_str(name)])?
+        .first(None)
+        .await?;
+
+    match row {
+        Some(r) => {
+            let tasks: Vec<models::PlayTaskDefinition> = serde_json::from_str(&r.tasks_json)
+                .map_err(|e| Error::RustError(format!("failed to parse play tasks: {e}")))?;
+            Ok(Some(models::PlayDefinition {
+                name: r.name,
+                goal: r.goal,
+                tasks,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
 // ── Agents ──────────────────────────────────────────────────────
 
 pub async fn register_agent(
@@ -748,6 +779,185 @@ pub async fn record_tool_call(
     .run()
     .await?;
     Ok(())
+}
+
+pub async fn retrieve_memory_hybrid(
+    db: &D1Database,
+    tenant_id: &str,
+    req: &models::RetrieveMemoryRequest,
+    semantic_ids: &[String],
+) -> Result<models::RetrieveMemoryResponse> {
+    let start = js_sys::Date::now();
+    let now = now_iso();
+    let now_ms = js_sys::Date::parse(&now);
+    let query_id = random_hex_id()?;
+
+    let mut repos = vec![req.repo.clone()];
+    for r in &req.related_repos {
+        if !repos.iter().any(|x| x == r) {
+            repos.push(r.clone());
+        }
+    }
+
+    let mut bind: Vec<JsValue> = vec![];
+    let mut where_parts: Vec<String> = vec![];
+    let mut idx = 1usize;
+
+    where_parts.push(format!("tenant_id = ?{idx}"));
+    bind.push(JsValue::from_str(tenant_id));
+    idx += 1;
+
+    where_parts.push("status = 'active'".to_string());
+
+    let repo_clause = (0..repos.len())
+        .map(|_| {
+            let p = format!("?{idx}");
+            idx += 1;
+            p
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    where_parts.push(format!("repo IN ({repo_clause})"));
+    for repo in &repos {
+        bind.push(JsValue::from_str(repo));
+    }
+
+    if let Some(thread_id) = &req.thread_id {
+        where_parts.push(format!("thread_id = ?{idx}"));
+        bind.push(JsValue::from_str(thread_id));
+        idx += 1;
+    }
+    if let Some(run_id) = &req.run_id {
+        where_parts.push(format!("run_id = ?{idx}"));
+        bind.push(JsValue::from_str(run_id));
+        idx += 1;
+    }
+    if let Some(task_id) = &req.task_id {
+        where_parts.push(format!("task_id = ?{idx}"));
+        bind.push(JsValue::from_str(task_id));
+        idx += 1;
+    }
+
+    let qlike = format!("%{}%", req.query.to_lowercase());
+    
+    if !semantic_ids.is_empty() {
+        let mut id_placeholders = Vec::new();
+        for id in semantic_ids {
+            id_placeholders.push(format!("?{}", idx));
+            bind.push(JsValue::from_str(id));
+            idx += 1;
+        }
+        let id_clause = id_placeholders.join(", ");
+        
+        where_parts.push(format!(
+            "(id IN ({}) OR (lower(summary) LIKE ?{} OR lower(COALESCE(title, '')) LIKE ?{} OR lower(COALESCE(tags, '')) LIKE ?{}))",
+            id_clause, idx, idx + 1, idx + 2
+        ));
+    } else {
+        where_parts.push(format!(
+            "(lower(summary) LIKE ?{idx} OR lower(COALESCE(title, '')) LIKE ?{} OR lower(COALESCE(tags, '')) LIKE ?{})",
+            idx + 1,
+            idx + 2
+        ));
+    }
+    
+    bind.push(JsValue::from_str(&qlike));
+    bind.push(JsValue::from_str(&qlike));
+    bind.push(JsValue::from_str(&qlike));
+
+    let sql = format!(
+        "SELECT * FROM memory_index WHERE {} ORDER BY indexed_at DESC LIMIT 200",
+        where_parts.join(" AND ")
+    );
+
+    let result: D1Result = db.prepare(&sql).bind(&bind)?.all().await?;
+    let rows: Vec<MemoryIndexRow> = result.results()?;
+
+    let mut stale_filtered = 0usize;
+    let mut unsafe_filtered = 0usize;
+    let mut conflict_filtered = 0usize;
+
+    let latest_conflicts = latest_conflict_versions(&rows);
+
+    let mut candidates = vec![];
+    for row in rows {
+        let stale = is_stale(&row, &now);
+        let conflicted = is_conflicted(&row, &latest_conflicts);
+
+        if stale && !req.include_stale {
+            stale_filtered += 1;
+            continue;
+        }
+        if row.unsafe_reason.is_some() && !req.include_unsafe {
+            unsafe_filtered += 1;
+            continue;
+        }
+        if conflicted && !req.include_conflicted {
+            conflict_filtered += 1;
+            continue;
+        }
+
+        let mut score = score_candidate(&row, &req.query, now_ms);
+        
+        // Semantic boost: if ID was in semantic_ids, boost the score
+        if semantic_ids.contains(&row.id) {
+            score += 2.0; // High boost for vector match
+        }
+
+        let estimated_tokens = estimate_tokens(&row.title, &row.summary, &row.tags);
+        candidates.push(models::MemoryCandidate {
+            id: row.id,
+            repo: row.repo,
+            kind: row.kind,
+            run_id: row.run_id,
+            task_id: row.task_id,
+            thread_id: row.thread_id,
+            title: row.title,
+            summary: row.summary,
+            tags: parse_tags(&row.tags),
+            content_ref: row.content_ref,
+            success_rate: row.success_rate,
+            stale,
+            unsafe_reason: row.unsafe_reason,
+            conflicted,
+            estimated_tokens,
+            score,
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top_k = req.top_k.clamp(1, 50);
+    let selected = candidates.into_iter().take(top_k).collect::<Vec<_>>();
+
+    let elapsed = (js_sys::Date::now() - start).round() as i64;
+    log_retrieval_query(
+        db,
+        tenant_id,
+        &query_id,
+        req,
+        selected.len() as i64,
+        elapsed,
+        stale_filtered as i64,
+        unsafe_filtered as i64,
+        conflict_filtered as i64,
+    )
+    .await?;
+    touch_memory_items(db, tenant_id, &selected).await?;
+
+    Ok(models::RetrieveMemoryResponse {
+        query_id,
+        latency_ms: elapsed,
+        total_candidates: selected.len(), // This matches legacy retrieve_memory behavior
+        returned: selected.len(),
+        stale_filtered,
+        unsafe_filtered,
+        conflict_filtered,
+        items: selected,
+    })
 }
 
 pub async fn retrieve_memory(

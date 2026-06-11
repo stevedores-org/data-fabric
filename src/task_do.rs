@@ -111,7 +111,27 @@ impl DurableObject for TaskLeaseManager {
                     task.result = result;
                     task.completed_at = Some(js_sys::Date::new_0().to_iso_string().as_string().unwrap());
                     
+                    let job_id = task.job_id.clone();
+                    
                     storage.put("active", active).await?;
+                    
+                    // If task belongs to a play, notify PlayManager
+                    // Extract ID from job_id or play_id
+                    let play_ns = self.env.durable_object("PLAY_MANAGER")?;
+                    let play_stub = play_ns.id_from_name(&job_id)?.get_stub()?;
+                    
+                    // Map full task ID back to play task ID (usually suffix)
+                    let play_task_id = task_id.split('-').last().unwrap_or(&task_id).to_string();
+                    
+                    let mut do_req = Request::new_with_init(
+                        "https://do/task-completed",
+                        &RequestInit {
+                            method: Method::Post,
+                            body: Some(serde_wasm_bindgen::to_value(&play_task_id).unwrap()),
+                            ..Default::default()
+                        }
+                    )?;
+                    let _ = play_stub.fetch_with_request(do_req).await;
                     
                     Response::from_json(&task)
                 } else {

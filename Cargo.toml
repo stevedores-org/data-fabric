@@ -14,8 +14,8 @@ members = ["xtask"]
 crate-type = ["cdylib"]
 
 [dependencies]
-worker = { version = "0.8.1", features = ["d1", "queue"] }
-worker-macros = "0.8.1"
+worker = { version = "0.8.3", features = ["d1", "queue"] }
+worker-macros = "0.8.3"
 wasm-bindgen = "0.2"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

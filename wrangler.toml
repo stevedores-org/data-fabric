@@ -26,12 +26,20 @@ SERVICE_NAME = "data-fabric"
 [durable_objects]
 bindings = [
   { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
-  { name = "THREAD_MANAGER", class_name = "ThreadManager" }
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" },
+  { name = "PLAY_MANAGER", class_name = "PlayManager" }
 ]
 
 [[migrations]]
 tag = "v1"
-new_classes = ["TaskLeaseManager", "ThreadManager"]
+new_classes = ["TaskLeaseManager", "ThreadManager", "PlayManager"]
+
+[ai]
+binding = "AI"
+
+[[vectorize]]
+binding = "SEMANTIC_INDEX"
+index_name = "data-fabric-semantic-index"
 
 # ── D1: structured metadata, lineage, domain entities ───────────
 # Create DB: wrangler d1 create data-fabric
@@ -67,6 +75,19 @@ queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
 
+# ── Analytics Engine: API latency sink (WS10 pilot KPI #6) ──────
+# DEFERRED to a follow-up PR. Enabling AE at the account level alone is
+# not sufficient for CF Workers Builds to deploy with the binding —
+# diagnosis needs dashboard log access. The worker code in src/lib.rs
+# already calls env.analytics_engine("PILOT_LATENCY").ok() and treats
+# the missing binding as non-fatal, so KPI #6 (latency p50/p95/p99)
+# silently becomes a no-op until this binding is re-added. The other
+# five KPIs continue to flow via /v1/metrics/pilot (D1-backed). See
+# follow-up issue once filed.
+# [[analytics_engine_datasets]]
+# binding = "PILOT_LATENCY"
+# dataset = "data_fabric_pilot_latency"
+
 # ── Environments: MOM Integration (Phase 4 & 5) ──────────────────
 
 # Development: Local MOM (or lornu.com for testing)
@@ -80,8 +101,14 @@ migrations_dir = "migrations"
 [env.development.durable_objects]
 bindings = [
   { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
-  { name = "THREAD_MANAGER", class_name = "ThreadManager" }
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" },
+  { name = "PLAY_MANAGER", class_name = "PlayManager" }
 ]
+[env.development.ai]
+binding = "AI"
+[[env.development.vectorize]]
+binding = "SEMANTIC_INDEX"
+index_name = "data-fabric-semantic-index-dev"
 [[env.development.r2_buckets]]
 binding = "ARTIFACTS"
 bucket_name = "data-fabric-artifacts"
@@ -96,6 +123,10 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+# AE binding deferred — see top-level note above.
+# [[env.development.analytics_engine_datasets]]
+# binding = "PILOT_LATENCY"
+# dataset = "data_fabric_pilot_latency_dev"
 
 # Staging: Pre-production testing with stevedores.org
 [env.staging]
@@ -108,8 +139,14 @@ migrations_dir = "migrations"
 [env.staging.durable_objects]
 bindings = [
   { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
-  { name = "THREAD_MANAGER", class_name = "ThreadManager" }
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" },
+  { name = "PLAY_MANAGER", class_name = "PlayManager" }
 ]
+[env.staging.ai]
+binding = "AI"
+[[env.staging.vectorize]]
+binding = "SEMANTIC_INDEX"
+index_name = "data-fabric-semantic-index-staging"
 [[env.staging.r2_buckets]]
 binding = "ARTIFACTS"
 bucket_name = "data-fabric-artifacts"
@@ -124,6 +161,10 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+# AE binding deferred — see top-level note above.
+# [[env.staging.analytics_engine_datasets]]
+# binding = "PILOT_LATENCY"
+# dataset = "data_fabric_pilot_latency_staging"
 
 # Production: Primary lornu.com with stevedores.org fallback
 [env.production]
@@ -136,8 +177,14 @@ migrations_dir = "migrations"
 [env.production.durable_objects]
 bindings = [
   { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
-  { name = "THREAD_MANAGER", class_name = "ThreadManager" }
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" },
+  { name = "PLAY_MANAGER", class_name = "PlayManager" }
 ]
+[env.production.ai]
+binding = "AI"
+[[env.production.vectorize]]
+binding = "SEMANTIC_INDEX"
+index_name = "data-fabric-semantic-index-prod"
 [[env.production.r2_buckets]]
 binding = "ARTIFACTS"
 bucket_name = "data-fabric-artifacts"
@@ -152,3 +199,7 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+# AE binding deferred — see top-level note above.
+# [[env.production.analytics_engine_datasets]]
+# binding = "PILOT_LATENCY"
+# dataset = "data_fabric_pilot_latency"
