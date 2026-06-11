@@ -448,11 +448,31 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/v1/plays/:name/launch", |mut req, ctx| async move {
             let _tenant_ctx = tenant::tenant_from_request(&req)?;
             let play_name = ctx.param("name").unwrap().to_string();
-            let body: models::PlayLaunchRequest = req.json().await.unwrap_or(models::PlayLaunchRequest {
-                play_name: play_name.clone(),
-                job_id: None,
-                metadata: None,
-            });
+            // Bad JSON in the body is a client contract violation: explicitly
+            // reject with 400 instead of silently falling back to a default
+            // request (which would mask the violation as a 200 OK). An empty
+            // body is still accepted and treated as a no-arg launch.
+            let body: models::PlayLaunchRequest = {
+                let text = req.text().await?;
+                if text.trim().is_empty() {
+                    models::PlayLaunchRequest {
+                        play_name: play_name.clone(),
+                        job_id: None,
+                        metadata: None,
+                    }
+                } else {
+                    match parse_play_launch_body(&text) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return errors::error_response(
+                                "INVALID_JSON_BODY",
+                                "invalid JSON body for play launch",
+                                400,
+                            );
+                        }
+                    }
+                }
+            };
 
             // 1. Fetch play definition from D1
             let d1 = ctx.env.d1("DB")?;
@@ -694,7 +714,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             };
             match policy::activate_policy_version(&ctx.env, &version).await {
                 Ok(resp) => Response::from_json(&resp),
-                Err(err) => Response::error(format!("activation failed: {err}"), 500),
+                Err(err) => {
+                    // Log the underlying error server-side (visible in
+                    // `wrangler tail`) and return a sanitized envelope so we
+                    // don't leak internal paths/stack context to the client.
+                    worker::console_log!(
+                        "ERROR: policy activation failed for version {version}: {err:?}"
+                    );
+                    let (code, message, status) = policy_activation_error_response_parts();
+                    errors::error_response(code, message, status)
+                }
             }
         })
         .get_async("/v1/policies/active", |_req, ctx| async move {
@@ -2024,6 +2053,31 @@ fn degraded_response(source: &str, detail: &str) -> Result<Response> {
     Ok(resp.with_status(503))
 }
 
+/// Parse a `PlayLaunchRequest` from a raw JSON string.
+///
+/// Returns `Err(())` on a parse failure so callers can map to a stable error
+/// code without leaking serde's free-form parse message to clients. Empty
+/// bodies are NOT handled here — the caller is responsible for that fallback
+/// (and we want to surface "empty body" vs "malformed body" distinctly).
+fn parse_play_launch_body(text: &str) -> std::result::Result<models::PlayLaunchRequest, ()> {
+    serde_json::from_str::<models::PlayLaunchRequest>(text).map_err(|_| ())
+}
+
+/// Build the sanitized error response parts (code, message, status) for a
+/// failed policy activation. The underlying error is intentionally NOT
+/// included in the returned message — callers are expected to log the raw
+/// error server-side via `console_log!` so it appears in `wrangler tail`.
+///
+/// Extracted as a pure helper so the sanitization contract is unit-testable
+/// without a worker runtime.
+fn policy_activation_error_response_parts() -> (&'static str, &'static str, u16) {
+    (
+        "POLICY_ACTIVATION_FAILED",
+        "policy activation failed; see server logs",
+        500,
+    )
+}
+
 /// Parse a numeric query param (e.g. limit, hops). Returns None if URL is None or param missing/invalid.
 fn parse_limit_query(url: Option<worker::Url>, param: &str) -> Option<u32> {
     let url = url?;
@@ -2067,6 +2121,7 @@ fn build_trace_response_metadata(
 mod tests {
     use super::{
         build_trace_response_metadata, parse_limit_query, parse_limit_query_with_valid_presence,
+        parse_play_launch_body, policy_activation_error_response_parts,
     };
     use worker::Url;
 
@@ -2153,5 +2208,75 @@ mod tests {
         assert!(!super::is_public_path("/healthcheck"));
         assert!(!super::is_public_path("/health/"));
         assert!(!super::is_public_path(""));
+    }
+
+    // ── parse_play_launch_body (PR #132 finding @ src/lib.rs:451) ──
+    // Bad JSON in a `POST /v1/plays/:name/launch` request body must be
+    // rejected so the request surfaces as a 400 INVALID_JSON_BODY rather
+    // than silently degrading to a default `PlayLaunchRequest` and returning
+    // 200 OK (which masked the contract violation).
+
+    #[test]
+    fn parse_play_launch_body_accepts_valid_json() {
+        let parsed = parse_play_launch_body(
+            r#"{"play_name":"deploy","job_id":"j-1","metadata":null}"#,
+        )
+        .expect("valid JSON body should parse");
+        assert_eq!(parsed.play_name, "deploy");
+        assert_eq!(parsed.job_id.as_deref(), Some("j-1"));
+        assert!(parsed.metadata.is_none());
+    }
+
+    #[test]
+    fn parse_play_launch_body_rejects_malformed_json() {
+        // Truncated object — was previously absorbed by `unwrap_or_default`
+        // at the handler call site, producing a 200 OK with a default body.
+        assert!(parse_play_launch_body(r#"{"play_name":"deploy""#).is_err());
+        // Wrong shape (missing required field).
+        assert!(parse_play_launch_body(r#"{}"#).is_err());
+        // Not JSON at all.
+        assert!(parse_play_launch_body("not json").is_err());
+    }
+
+    // ── policy_activation_error_response_parts (PR #132 finding @ src/lib.rs:697) ──
+    // Sanitization contract: the *client-facing* parts of a failed policy
+    // activation response must NOT include the raw underlying error
+    // (which previously leaked internal paths / stack context via
+    // `format!("activation failed: {err}")`). The raw error is logged
+    // server-side via `console_log!` and visible in `wrangler tail`.
+
+    #[test]
+    fn policy_activation_error_response_uses_stable_sanitized_envelope() {
+        let (code, message, status) = policy_activation_error_response_parts();
+        assert_eq!(code, "POLICY_ACTIVATION_FAILED");
+        assert_eq!(status, 500);
+        // Message is a fixed, short, operator-pointer string — never the
+        // wrapped underlying error.
+        assert_eq!(message, "policy activation failed; see server logs");
+    }
+
+    #[test]
+    fn policy_activation_error_response_does_not_leak_raw_err() {
+        // Simulate a raw underlying error string that would have been
+        // interpolated into the old response (e.g. a worker::Error formatted
+        // with paths, stack frames, or KV binding internals). The sanitized
+        // response parts MUST NOT contain any of that.
+        let raw_err =
+            "KvError { binding: \"POLICY_KV\", path: \"/internal/policy/active\", source: ... }";
+        let (code, message, _status) = policy_activation_error_response_parts();
+        assert!(
+            !message.contains(raw_err),
+            "sanitized message must not embed raw err: got {message}",
+        );
+        assert!(
+            !message.contains("KvError"),
+            "sanitized message must not embed underlying error type",
+        );
+        assert!(
+            !message.contains("binding"),
+            "sanitized message must not embed binding details",
+        );
+        // The stable error code is also free of error context.
+        assert!(!code.contains(' '), "code should be a stable identifier");
     }
 }
