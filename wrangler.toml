@@ -41,7 +41,15 @@ bindings = [
 
 [[migrations]]
 tag = "v1"
-new_classes = ["TaskLeaseManager", "ThreadManager", "PlayManager"]
+new_classes = ["TaskLeaseManager"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["ThreadManager"]
+
+[[migrations]]
+tag = "v3"
+new_classes = ["PlayManager"]
 
 [ai]
 binding = "AI"
