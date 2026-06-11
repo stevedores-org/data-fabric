@@ -30,10 +30,12 @@ impl DurableObject for ThreadManager {
             (Method::Post, "/checkpoint") => {
                 let body: CreateCheckpoint = req.json().await?;
                 let storage = self.state.storage();
-                
+
                 let id = crate::generate_id().unwrap_or_else(|_| "err".to_string());
-                let now = js_sys::Date::now() as u64;
-                let created_at = js_sys::Date::new(&serde_wasm_bindgen::to_value(&now).unwrap()).to_iso_string().as_string().unwrap();
+                let created_at = js_sys::Date::new_0()
+                    .to_iso_string()
+                    .as_string()
+                    .unwrap_or_else(|| "unknown-time".to_string());
 
                 let checkpoint = Checkpoint {
                     id: id.clone(),
@@ -41,7 +43,9 @@ impl DurableObject for ThreadManager {
                     node_id: body.node_id.clone(),
                     parent_id: body.parent_id.clone(),
                     state_r2_key: format!("threads/{}/{}", body.thread_id, id), // We'll still use R2 for large blobs if needed, but DO can store small states
-                    state_size_bytes: Some(serde_json::to_string(&body.state).unwrap_or_default().len() as i64),
+                    state_size_bytes: Some(
+                        serde_json::to_string(&body.state).unwrap_or_default().len() as i64,
+                    ),
                     metadata: body.metadata.clone(),
                     created_at,
                 };
@@ -51,7 +55,12 @@ impl DurableObject for ThreadManager {
                 storage.put(&format!("state:{}", id), &body.state).await?;
                 storage.put("latest", &checkpoint).await?;
 
-                let mut history: VecDeque<Checkpoint> = storage.get("history").await.ok().flatten().unwrap_or_default();
+                let mut history: VecDeque<Checkpoint> = storage
+                    .get("history")
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
                 history.push_front(checkpoint.clone());
                 if history.len() > 50 {
                     history.pop_back();
@@ -63,10 +72,14 @@ impl DurableObject for ThreadManager {
             (Method::Get, "/latest") => {
                 let storage = self.state.storage();
                 let latest: Option<Checkpoint> = storage.get("latest").await.ok().flatten();
-                
+
                 if let Some(cp) = latest {
-                    let state: Option<serde_json::Value> = storage.get(&format!("state:{}", cp.id)).await.ok().flatten();
-                    // We need a way to return the state too. 
+                    let state: Option<serde_json::Value> = storage
+                        .get(&format!("state:{}", cp.id))
+                        .await
+                        .ok()
+                        .flatten();
+                    // We need a way to return the state too.
                     // Let's wrap it in a response that includes the state.
                     Response::from_json(&serde_json::json!({
                         "checkpoint": cp,
@@ -78,7 +91,12 @@ impl DurableObject for ThreadManager {
             }
             (Method::Get, "/history") => {
                 let storage = self.state.storage();
-                let history: VecDeque<Checkpoint> = storage.get("history").await.ok().flatten().unwrap_or_default();
+                let history: VecDeque<Checkpoint> = storage
+                    .get("history")
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
                 Response::from_json(&history)
             }
             _ => Response::error("not found", 404),

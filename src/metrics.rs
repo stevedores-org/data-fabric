@@ -271,7 +271,7 @@ pub fn assemble(
 
 #[derive(Debug, serde::Deserialize)]
 struct RateRow {
-    numerator: i64,
+    numerator: Option<i64>,
     total: i64,
 }
 
@@ -290,7 +290,7 @@ struct EventRow {
 impl From<&RateRow> for CountTotal {
     fn from(r: &RateRow) -> Self {
         Self {
-            numerator: r.numerator,
+            numerator: r.numerator.unwrap_or(0),
             denominator: r.total,
         }
     }
