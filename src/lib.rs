@@ -565,10 +565,42 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/v1/policies/rules", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
+            let cursor = match pagination::PolicyRulesCursor::decode(
+                params.get("cursor").map(|s| s.as_str()),
+            ) {
+                Ok(c) => c,
+                Err(_) => {
+                    return errors::error_response(
+                        "INVALID_CURSOR",
+                        "cursor is malformed; echo back the next_cursor from a prior response",
+                        400,
+                    );
+                }
+            };
             let d1 = ctx.env.d1("DB")?;
-            let rules = db::list_policy_rules(&d1, &tenant_ctx.tenant_id).await?;
+            let (rules, next_cursor) =
+                db::list_policy_rules(&d1, &tenant_ctx.tenant_id, limit, cursor.as_ref()).await?;
+            let next_cursor_str = match next_cursor.as_ref().map(|c| c.encode()).transpose() {
+                Ok(s) => s,
+                Err(_) => {
+                    return errors::error_response(
+                        "CURSOR_ENCODE_FAILED",
+                        "internal: failed to encode next cursor",
+                        500,
+                    );
+                }
+            };
             let responses: Vec<_> = rules.into_iter().map(|r| r.into_response()).collect();
-            Response::from_json(&serde_json::json!({ "rules": responses }))
+            Response::from_json(&serde_json::json!({
+                "rules": responses,
+                "next_cursor": next_cursor_str,
+            }))
         })
         .get_async("/v1/policies/rules/:id", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
@@ -898,9 +930,41 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/v1/agents", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
+            let cursor = match pagination::AgentsCursor::decode(
+                params.get("cursor").map(|s| s.as_str()),
+            ) {
+                Ok(c) => c,
+                Err(_) => {
+                    return errors::error_response(
+                        "INVALID_CURSOR",
+                        "cursor is malformed; echo back the next_cursor from a prior response",
+                        400,
+                    );
+                }
+            };
             let d1 = ctx.env.d1("DB")?;
-            let agents = db::list_agents(&d1, &tenant_ctx.tenant_id).await?;
-            Response::from_json(&serde_json::json!({ "agents": agents }))
+            let (agents, next_cursor) =
+                db::list_agents(&d1, &tenant_ctx.tenant_id, limit, cursor.as_ref()).await?;
+            let next_cursor_str = match next_cursor.as_ref().map(|c| c.encode()).transpose() {
+                Ok(s) => s,
+                Err(_) => {
+                    return errors::error_response(
+                        "CURSOR_ENCODE_FAILED",
+                        "internal: failed to encode next cursor",
+                        500,
+                    );
+                }
+            };
+            Response::from_json(&serde_json::json!({
+                "agents": agents,
+                "next_cursor": next_cursor_str,
+            }))
         })
         .post_async("/v1/telemetry", |mut req, ctx| async move {
             let body: models::TelemetrySnapshot = req.json().await?;
