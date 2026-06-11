@@ -18,15 +18,31 @@
 
 ALTER TABLE policy_escalations ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE policy_rate_limit_counters ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE play_definitions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
+
+-- Rebuild play_definitions to relax the PRIMARY KEY name constraint and
+-- enforce composite PRIMARY KEY (tenant_id, name) for multi-tenancy.
+ALTER TABLE play_definitions RENAME TO play_definitions_old;
+
+CREATE TABLE play_definitions (
+    tenant_id TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    tasks_json TEXT NOT NULL, -- JSON array of PlayTaskDefinition
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (tenant_id, name)
+);
+
+INSERT INTO play_definitions (tenant_id, name, goal, tasks_json, created_at, updated_at)
+SELECT '', name, goal, tasks_json, created_at, updated_at FROM play_definitions_old;
+
+DROP TABLE play_definitions_old;
 
 -- Indexes for tenant-scoped queries.
 CREATE INDEX IF NOT EXISTS idx_policy_escalations_tenant
     ON policy_escalations(tenant_id, status, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_policy_rate_limit_counters_tenant
     ON policy_rate_limit_counters(tenant_id, actor, action_class, window_start_epoch DESC);
-CREATE INDEX IF NOT EXISTS idx_play_definitions_tenant
-    ON play_definitions(tenant_id, name);
 
 -- The 'sre-incident' play was seeded by 0012 before tenant_id existed.
 -- Re-attribute it to the literal tenant 'default' so that the platform-
@@ -54,10 +70,6 @@ UPDATE play_definitions SET tenant_id = 'default' WHERE name = 'sre-incident';
 --
 -- Note on play_definitions PRIMARY KEY:
 --
--- 0012 declared `name TEXT PRIMARY KEY`. Strictly we now want
--- (tenant_id, name) as the primary key, but changing a SQLite PRIMARY KEY
--- requires a table rebuild. The application enforces the (tenant_id, name)
--- uniqueness on the write path via tenant-scoped UPSERT, and reads always
--- filter on tenant_id, so the existing PK remains correct (name remains
--- globally unique). A follow-up migration tracks the PK relaxation if
--- two tenants need to register plays with the same name.
+-- We relaxed the primary key of `play_definitions` by rebuilding the table.
+-- The primary key is now `(tenant_id, name)` so that different tenants
+-- can register plays with colliding names without interference or overwrites.
