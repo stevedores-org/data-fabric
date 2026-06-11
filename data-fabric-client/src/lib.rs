@@ -1,8 +1,30 @@
 pub mod types;
 
 use types::*;
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::{Client as HttpClient, Method, RequestBuilder, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
+
+/// Reserved character set for a single URI path segment per RFC 3986. Anything
+/// outside `pchar` (which excludes `/`, `?`, `#`, etc.) must be percent-encoded
+/// or a caller could smuggle additional path segments or query strings into
+/// the URL via a crafted ID.
+const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'%');
+
+fn encode_path_segment(s: &str) -> String {
+    utf8_percent_encode(s, PATH_SEGMENT_ENCODE_SET).to_string()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -211,18 +233,24 @@ impl Client {
     /// * `agent_id` is a required query parameter.
     /// * `cap` is an optional comma-separated query parameter.
     /// * No request body — inputs come exclusively from the query string.
+    ///
+    /// Query parameters are appended via `reqwest::RequestBuilder::query`, which
+    /// percent-encodes each value. Interpolating user-controlled inputs into the
+    /// URL string with `format!` would let a caller smuggle extra parameters
+    /// (e.g. `agent_id="agent-1&cap=evil"` would inject a second `cap`).
     pub fn build_claim_next_task_request(
         &self,
         agent_id: &str,
         capabilities: &[String],
     ) -> Result<reqwest::Request> {
-        let path = if capabilities.is_empty() {
-            format!("/mcp/task/next?agent_id={}", agent_id)
-        } else {
+        let mut builder = self
+            .prepare_request(Method::POST, "/mcp/task/next")
+            .query(&[("agent_id", agent_id)]);
+        if !capabilities.is_empty() {
             let caps = capabilities.join(",");
-            format!("/mcp/task/next?agent_id={}&cap={}", agent_id, caps)
-        };
-        self.prepare_request(Method::POST, &path).build().map_err(Error::from)
+            builder = builder.query(&[("cap", caps.as_str())]);
+        }
+        builder.build().map_err(Error::from)
     }
 
     pub async fn claim_next_task(&self, agent_id: &str, capabilities: &[String]) -> Result<Option<AgentTask>> {
@@ -236,8 +264,28 @@ impl Client {
     }
 
     pub async fn heartbeat_task(&self, task_id: &str, agent_id: &str) -> Result<serde_json::Value> {
-        let path = format!("/mcp/task/{}/heartbeat?agent_id={}", task_id, agent_id);
-        self.send_request::<(), serde_json::Value>(Method::POST, &path, None).await
+        let req = self.build_heartbeat_task_request(task_id, agent_id)?;
+        let resp = self.http.execute(req).await?;
+        self.handle_response(resp).await
+    }
+
+    /// Build the HTTP request used by [`Client::heartbeat_task`].
+    ///
+    /// `task_id` is percent-encoded into the path segment and `agent_id` is
+    /// appended as a percent-encoded query parameter (`reqwest`'s `.query()`
+    /// builder handles encoding). Interpolating either value with `format!`
+    /// would let a caller inject extra path segments or query parameters via
+    /// a crafted ID like `task_id = "abc/extra?injected=1"`.
+    pub fn build_heartbeat_task_request(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<reqwest::Request> {
+        let path = format!("/mcp/task/{}/heartbeat", encode_path_segment(task_id));
+        self.prepare_request(Method::POST, &path)
+            .query(&[("agent_id", agent_id)])
+            .build()
+            .map_err(Error::from)
     }
 
     pub async fn complete_task(&self, task_id: &str, req: &TaskCompleteRequest) -> Result<serde_json::Value> {
@@ -380,7 +428,10 @@ mod tests {
     }
 
     /// `agent_id` and `cap` belong on the query string (the new POST handler
-    /// reads them from `url.query_pairs()`), not in a JSON body.
+    /// reads them from `url.query_pairs()`), not in a JSON body. We assert
+    /// against the *decoded* query pairs because the URL builder may percent-
+    /// encode sub-delims like `,` — that's still a valid `cap=rust,wasm` from
+    /// the server's perspective (which decodes via `url.query_pairs()`).
     #[test]
     fn claim_next_task_puts_inputs_in_query_string_not_body() {
         let client = test_client();
@@ -389,9 +440,12 @@ mod tests {
             .expect("request must build");
         let url = req.url();
         assert_eq!(url.path(), "/mcp/task/next");
-        let query = url.query().expect("query string must be present");
-        assert!(query.contains("agent_id=agent-1"), "agent_id must be a query param, got: {query}");
-        assert!(query.contains("cap=rust,wasm"), "cap must be a comma-separated query param, got: {query}");
+        let pairs: std::collections::HashMap<String, String> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(pairs.get("agent_id").map(String::as_str), Some("agent-1"));
+        assert_eq!(pairs.get("cap").map(String::as_str), Some("rust,wasm"));
         assert!(req.body().is_none(), "POST body must be empty; the handler reads from query params");
     }
 
@@ -408,5 +462,92 @@ mod tests {
         let query = req.url().query().unwrap_or("");
         assert!(query.contains("agent_id=agent-1"));
         assert!(!query.contains("cap="), "cap must be omitted when no capabilities are supplied, got: {query}");
+    }
+
+    /// Regression test: `agent_id` and the `cap` values must be percent-encoded
+    /// so a malicious caller can't smuggle an extra query parameter through the
+    /// URL. Before the fix, `agent_id="user@host&cap=evil"` was interpolated
+    /// raw and injected a second `cap=evil` parameter that the server would
+    /// then merge with the legitimate `cap=rust`.
+    #[test]
+    fn claim_next_task_encodes_special_chars_in_agent_id() {
+        let client = test_client();
+        let req = client
+            .build_claim_next_task_request("user@host&cap=evil", &["rust".to_string()])
+            .expect("request must build");
+        let url = req.url();
+        let query = url.query().expect("query string must be present");
+
+        // The `&` and `=` in the supplied agent_id must be percent-encoded so
+        // they appear inside the single agent_id value, not as separators.
+        assert!(
+            !query.contains("agent_id=user@host&cap=evil"),
+            "agent_id must be percent-encoded; raw injection allowed extra cap, got: {query}"
+        );
+
+        // Exactly one `cap` parameter must be present (the legitimate one).
+        let cap_count = url
+            .query_pairs()
+            .filter(|(k, _)| k == "cap")
+            .count();
+        assert_eq!(cap_count, 1, "expected exactly one cap param, got {cap_count} in {query}");
+
+        // The agent_id pair must round-trip to the original (decoded) value.
+        let agent_id_value = url
+            .query_pairs()
+            .find(|(k, _)| k == "agent_id")
+            .map(|(_, v)| v.into_owned())
+            .expect("agent_id must be present");
+        assert_eq!(agent_id_value, "user@host&cap=evil");
+    }
+
+    /// Regression test: `task_id` is a path segment and `agent_id` is a query
+    /// parameter — both must be percent-encoded. Before the fix,
+    /// `task_id="abc/extra?injected=1"` was interpolated raw into the path and
+    /// turned a heartbeat into a request against `/mcp/task/abc/extra/heartbeat`
+    /// with a synthetic `injected=1` query parameter.
+    #[test]
+    fn heartbeat_task_encodes_special_chars_in_path_and_query() {
+        let client = test_client();
+        let req = client
+            .build_heartbeat_task_request("abc/extra?injected=1", "agent&id=evil")
+            .expect("request must build");
+        let url = req.url();
+        assert_eq!(req.method(), &Method::POST);
+
+        // The crafted `/` and `?` in task_id must be percent-encoded inside
+        // a single path segment, not interpreted as path/query separators.
+        let path = url.path();
+        assert!(
+            path.starts_with("/mcp/task/") && path.ends_with("/heartbeat"),
+            "path must wrap an encoded task_id segment, got: {path}"
+        );
+        assert!(
+            !path.contains("/extra/"),
+            "task_id slash must be encoded, got: {path}"
+        );
+        assert!(
+            !path.contains('?'),
+            "task_id question mark must be encoded, got: {path}"
+        );
+
+        // Exactly one `agent_id` query parameter; no injected ones.
+        let agent_count = url.query_pairs().filter(|(k, _)| k == "agent_id").count();
+        assert_eq!(agent_count, 1, "expected exactly one agent_id param");
+
+        // No injected `injected=1` parameter from the task_id.
+        assert!(
+            url.query_pairs().all(|(k, _)| k != "injected"),
+            "task_id must not be able to inject query params: {:?}",
+            url.query()
+        );
+
+        // agent_id round-trips with its `&` and `=` preserved as data.
+        let agent_id_value = url
+            .query_pairs()
+            .find(|(k, _)| k == "agent_id")
+            .map(|(_, v)| v.into_owned())
+            .expect("agent_id must be present");
+        assert_eq!(agent_id_value, "agent&id=evil");
     }
 }
