@@ -4,6 +4,7 @@ use worker::*;
 mod db;
 mod errors;
 mod integrations;
+mod metrics;
 mod models;
 mod pagination;
 mod policy;
@@ -512,6 +513,43 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 db::list_verification_evidence(&d1, &tenant_ctx.tenant_id, run_id, limit).await?;
             let responses: Vec<_> = evidence.into_iter().map(|e| e.into_response()).collect();
             Response::from_json(&serde_json::json!({ "evidence": responses }))
+        })
+        // ── WS10 Pilot Metrics (#105) ────────────────────────
+        .get_async("/v1/metrics/pilot", |req, ctx| async move {
+            let started = js_sys::Date::now();
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let window_raw = params
+                .get("window")
+                .cloned()
+                .unwrap_or_else(|| "1d".to_string());
+            let (window_label, window_seconds) = match metrics::parse_window(&window_raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    return errors::error_response(
+                        "INVALID_WINDOW",
+                        &format!("invalid window param: {e}"),
+                        400,
+                    );
+                }
+            };
+            let task_type = params.get("task_type").map(|s| s.as_str());
+            let d1 = ctx.env.d1("DB")?;
+            let generated_at = db::now_iso();
+            let resp = metrics::pilot_metrics(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &window_label,
+                window_seconds,
+                task_type,
+                generated_at,
+            )
+            .await?;
+            timed_json_response(started, &resp)
         })
         // ── Policy Definitions & Retention (WS4) ────────────────
         .put_async(
