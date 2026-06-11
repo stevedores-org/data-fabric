@@ -340,7 +340,7 @@ mod tests {
                 tasks,
             },
             run_id: "run-1".to_string(),
-            tenant_id: "test-tenant".to_string(),
+            tenant_id: "tenant-test".to_string(),
             completed_tasks: HashSet::new(),
             active_tasks: HashSet::new(),
             state_version: 0,

@@ -17,7 +17,7 @@ struct TaskLeaseState {
 /// retry mechanics.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct PendingNotify {
-    /// PlayManager DO target name (currently the task's `job_id`).
+    /// PlayManager DO target name (`{tenant_id}:play:{run_id}`).
     pub(crate) target_name: String,
     /// The play-side task id (suffix of the AgentTask id) to mark complete.
     pub(crate) play_task_id: String,
@@ -240,16 +240,15 @@ impl DurableObject for TaskLeaseManager {
                     // missing tenant_id (legacy persisted state from before
                     // WS8), we skip the notification rather than routing to
                     // a potentially cross-tenant DO instance.
+                    let play_task_id = task_id
+                        .split('-')
+                        .next_back()
+                        .unwrap_or(&task_id)
+                        .to_string();
+
                     if let Some(tenant_id) = task_tenant.as_deref() {
                         if !tenant_id.is_empty() {
                             let do_name = format!("{}:play:{}", tenant_id, job_id);
-
-                            // Extract ID from job_id or play_id
-                            let play_task_id = task_id
-                                .split('-')
-                                .next_back()
-                                .unwrap_or(&task_id)
-                                .to_string();
 
                             // PR #132 crr finding (task_do.rs:134): the previous
                             // notification was `let _ = play_stub.fetch_with_request().await;`
