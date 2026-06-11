@@ -128,7 +128,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             })
         })
         .get("/openapi.json", |_, _| {
-            let mut headers = Headers::new();
+            let headers = Headers::new();
             headers.set("content-type", "application/json")?;
             headers.set("access-control-allow-origin", "*")?;
             Ok(Response::ok(openapi::get_openapi_spec())?.with_headers(headers))
