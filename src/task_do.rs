@@ -1,4 +1,5 @@
 use crate::models::{AgentTask, TaskFailRequest};
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use worker::*;
@@ -84,8 +85,20 @@ impl DurableObject for TaskLeaseManager {
         // #142's tests. We now match by prefix and pull task_id out of
         // the trailing segment, mirroring the parsing the original
         // handler attempted via `req.path().split('/').nth(2)`.
-        let complete_task_id = path.strip_prefix("/complete/").map(|s| s.to_string());
-        let fail_task_id = path.strip_prefix("/fail/").map(|s| s.to_string());
+        //
+        // crr2 MEDIUM finding (task_do.rs:87): the strip_prefix path
+        // suffix is the raw URL path, which is percent-encoded by the
+        // caller (data-fabric-client PR #140's URL encoding fix, plus
+        // anything routed by Workers' router). If we used the encoded
+        // form as the hashmap key the lookup would silently miss vs.
+        // the `/enqueue` path which deserializes from JSON (no
+        // encoding). Decode to the canonical form here.
+        let complete_task_id = path
+            .strip_prefix("/complete/")
+            .and_then(decode_task_id_segment);
+        let fail_task_id = path
+            .strip_prefix("/fail/")
+            .and_then(decode_task_id_segment);
 
         match (method, path.as_str()) {
             (Method::Post, "/enqueue") => {
@@ -571,6 +584,34 @@ pub(crate) fn split_due_pending(
     (due, deferred)
 }
 
+/// Pure helper: percent-decode a `/complete/<task_id>` or
+/// `/fail/<task_id>` path tail into the canonical task id. Returns
+/// `None` for an empty segment, an invalid UTF-8 percent-encoding, or
+/// a decoded value that is empty after decoding.
+///
+/// crr2 MEDIUM finding (task_do.rs:87): the previous strip_prefix path
+/// kept the percent-encoded form (e.g. `task%2Dabc`) and used it as a
+/// hashmap key. The corresponding `/enqueue` path deserialises the
+/// task id from JSON, so the key in `active` was already in canonical
+/// form — meaning a percent-encoded `/complete/...` lookup silently
+/// missed and returned `404 task not found`. Decoding here makes the
+/// keying consistent regardless of caller encoding.
+///
+/// Extracted as a `pub(crate)` free function so it can be unit-tested
+/// without spinning up a Workers runtime.
+pub(crate) fn decode_task_id_segment(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    let decoded = percent_decode_str(raw).decode_utf8().ok()?;
+    let decoded = decoded.into_owned();
+    if decoded.is_empty() {
+        None
+    } else {
+        Some(decoded)
+    }
+}
+
 /// Pure helper: extract `task_id` from a DO request path of the form
 /// `/<route>/<task_id>` for the parameterised routes `/complete` and
 /// `/fail`. Returns `Some(task_id)` when the path matches the given
@@ -586,11 +627,9 @@ pub(crate) fn split_due_pending(
 pub(crate) fn parse_task_id_from_path(path: &str, route: &str) -> Option<String> {
     let prefix = format!("/{}/", route.trim_matches('/'));
     let tail = path.strip_prefix(&prefix)?;
-    if tail.is_empty() {
-        None
-    } else {
-        Some(tail.to_string())
-    }
+    // Mirror the production decode step (crr2 MEDIUM finding) so this
+    // helper stays a faithful model of the live `fetch` routing.
+    decode_task_id_segment(tail)
 }
 
 /// Pure helper: upsert a PendingNotify into the in-memory list, keyed
@@ -788,6 +827,93 @@ mod tests {
             .expect("lib.rs caller URL must yield a non-empty task id");
         assert!(!task_id.is_empty());
         assert_eq!(task_id, "run-42-summarise");
+    }
+
+    // ── crr2 MEDIUM finding: task_do.rs:87 — URL-decoded task_id ──────
+    //
+    // The strip_prefix("/complete/") path parsing kept the raw
+    // percent-encoded suffix. data-fabric-client (PR #140) URL-encodes
+    // path segments per RFC 3986, so a task id like
+    // `task-with space` arrives as `task-with%20space`. The hashmap
+    // key in `active` is the JSON-deserialised (canonical) form from
+    // `/enqueue`, so the encoded lookup would miss and return
+    // `404 task not found`. The fix decodes here.
+
+    #[test]
+    fn decode_task_id_segment_passes_through_unencoded_id() {
+        assert_eq!(
+            decode_task_id_segment("task-abc-123"),
+            Some("task-abc-123".to_string()),
+        );
+    }
+
+    #[test]
+    fn decode_task_id_segment_percent_decodes_spaces() {
+        // The bug shape: client encoded ' ' as '%20'; the DO key was
+        // stored as the canonical form on /enqueue. Pre-fix, the
+        // active.remove(&"task%20abc") missed; post-fix it hits.
+        assert_eq!(
+            decode_task_id_segment("task%20abc"),
+            Some("task abc".to_string()),
+        );
+    }
+
+    #[test]
+    fn decode_task_id_segment_handles_reserved_chars() {
+        // Reserved chars per RFC 3986 — client-side URL encoders
+        // typically escape `/`, `?`, `#`, `&`, `=` etc. when present
+        // inside a path segment. We must round-trip them back to the
+        // canonical form so the active-task lookup hits.
+        assert_eq!(
+            decode_task_id_segment("run%2F42%23summarise"),
+            Some("run/42#summarise".to_string()),
+        );
+    }
+
+    #[test]
+    fn decode_task_id_segment_returns_none_for_empty() {
+        // Empty segment is treated as a parse failure (mirrors the
+        // pre-existing `parse_task_id_from_path` contract that returns
+        // None for `/complete/`).
+        assert_eq!(decode_task_id_segment(""), None);
+    }
+
+    #[test]
+    fn decode_task_id_segment_returns_none_for_invalid_utf8_percent_encoding() {
+        // `%FF%FE` is not valid UTF-8 — should bail rather than
+        // produce a corrupted key that misses the active-task map.
+        assert_eq!(decode_task_id_segment("%FF%FE"), None);
+    }
+
+    #[test]
+    fn parse_task_id_decodes_percent_encoded_segment() {
+        // End-to-end on the parsing helper used by the routing
+        // contract test. Pre-crr2 this returned Some("task%20abc")
+        // verbatim and the active.remove lookup missed.
+        assert_eq!(
+            parse_task_id_from_path("/complete/task%20abc", "complete"),
+            Some("task abc".to_string()),
+        );
+        assert_eq!(
+            parse_task_id_from_path("/fail/task%2Fabc", "fail"),
+            Some("task/abc".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_task_id_round_trips_url_encoded_caller_url() {
+        // Regression: data-fabric-client PR #140 url-encodes path
+        // segments, so the lib.rs caller may forward an encoded
+        // task_id into the DO URL. The decoded form must match the
+        // canonical key stored on /enqueue.
+        let canonical = "run-42 summarise/v2";
+        let encoded =
+            percent_encoding::utf8_percent_encode(canonical, percent_encoding::NON_ALPHANUMERIC)
+                .to_string();
+        let path = format!("/complete/{}", encoded);
+        let task_id = parse_task_id_from_path(&path, "complete")
+            .expect("encoded caller URL must yield a decoded task id");
+        assert_eq!(task_id, canonical);
     }
 
     #[test]
