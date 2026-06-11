@@ -91,10 +91,11 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+max_retries = 3
 # Messages that exceed max_retries land here instead of being dropped
 # silently. Provisioned out-of-band:
-#   bunx wrangler queues create data-fabric-events-dlq
-dead_letter_queue = "data-fabric-events-dlq"
+#   bunx wrangler queues create data-fabric-events-dlq-dev
+dead_letter_queue = "data-fabric-events-dlq-dev"
 
 # ── Analytics Engine: API latency sink (WS10 pilot KPI #6) ──────
 # DEFERRED to a follow-up PR. Enabling AE at the account level alone is
@@ -144,7 +145,8 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
-dead_letter_queue = "data-fabric-events-dlq"
+max_retries = 3
+dead_letter_queue = "data-fabric-events-dlq-dev"
 [env.development.observability]
 enabled = true
 head_sampling_rate = 1.0
@@ -186,7 +188,8 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
-dead_letter_queue = "data-fabric-events-dlq"
+max_retries = 3
+dead_letter_queue = "data-fabric-events-dlq-staging"
 [env.staging.observability]
 enabled = true
 head_sampling_rate = 1.0
@@ -228,10 +231,11 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+max_retries = 3
 dead_letter_queue = "data-fabric-events-dlq"
 [env.production.observability]
 enabled = true
-head_sampling_rate = 1.0
+head_sampling_rate = 0.1
 # AE binding deferred — see top-level note above.
 # [[env.production.analytics_engine_datasets]]
 # binding = "PILOT_LATENCY"
