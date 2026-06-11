@@ -120,21 +120,21 @@ Status against current `src/` is checked against this branch's HEAD (`develop` a
 | `handlers/mcp.rs` | Adapt | partial: `GET /mcp/task/next` + `POST /mcp/response` exist | MCP surface is implemented but contracts need parity validation against the upstream — see [CAPABILITY_GAP_MAP P1 item 1](CAPABILITY_GAP_MAP.md). |
 | `services/play_launcher.rs` | Adapt | partial: `src/play_do.rs` (PlayManager DO from PR #122) | The DO model differs from the upstream service pattern. Decompose-into-task-graph logic carries over; persistence layer changes (DO SQLite + D1 instead of Surreal). |
 | `services/task_queue.rs` | Adapt | partial: `src/task_do.rs` + `src/db.rs` task tables | Queue/lease/retry semantics are the contract; the implementation uses a Durable Object (`TaskLeaseManager`) instead of in-memory `DashMap`+`BinaryHeap`. |
-| `services/memory.rs` | Adapt | partial: `src/storage.rs` + `src/vector_index.rs` | Memory write path exists at the storage layer; Bronze/Silver/Gold tiering and promotion semantics are still incomplete (CAPABILITY_GAP_MAP `P0-2`, `P1-2`). |
+| `services/memory.rs` | Adapt | partial: `src/storage.rs` + `src/vector_index.rs` + `src/models/memory.rs` | Memory write path exists at the storage layer with a single-tier `memory` table plus `memory_index` for retrieval. The upstream Bronze/Silver/Gold tiering for memory was **not adopted** for this repo — see the `storage/{bronze,silver,gold}` rows below. |
 | `storage/surreal.rs` | **Replace** | `src/db.rs` (D1 wrapper) | Storage backend swap — see §3 for the schema-level compatibility check. |
 | `storage/migrations.rs` | Replace | `migrations/*.sql` (13 D1 migrations) | D1 uses ordered numbered SQL files; preserve the migration *concept*, not the implementation. |
-| `storage/bronze.rs` | Adapt | partial: storage primitives in `src/storage.rs` | Move from a Surreal-backed `memory_bronze` table to a D1 table plus optional R2 blob references for large payloads (R2 is missing today). |
-| `storage/silver.rs` | Adapt | not yet ported | Same shape change as bronze, plus the PII-redaction gate must be wired in front (see CAPABILITY_GAP_MAP `P0-2`). |
-| `storage/gold.rs` | Adapt | not yet ported | Curated tier; tag search → D1 indexed columns or KV inverted index. |
-| `models/task.rs` | Keep | `src/models/` (WS2 schema present) | Type definitions port as-is via serde; field names already aligned to the WS2 entity model. |
-| `models/memory.rs` | Keep | not yet ported | Pure types; port verbatim once Bronze/Silver/Gold storage lands. |
+| `storage/bronze.rs` | Drop for memory; **kept for events** | `events_bronze` table (migration `0002_m1_m3_agent_infra.sql`) | This repo deliberately chose a single-tier memory model (single `memory` table + `memory_index`). The Bronze/Silver/Gold *concept* is preserved but applied to **events / provenance** (`events_bronze`, `events_silver` in migration `0003_ws3_provenance.sql`), not memory. |
+| `storage/silver.rs` | Drop for memory; **kept for events** | `events_silver` table (migration `0003_ws3_provenance.sql`) | Same deliberate scope shift: BSG tiering carries into the events domain, not memory. The PII-redaction gate (CAPABILITY_GAP_MAP `P0-2`) still applies wherever sensitive content is persisted, but binds to write-path middleware rather than a per-tier table. |
+| `storage/gold.rs` | Drop for memory | n/a — no `memory_gold` analog | The curated-tier query surface is collapsed into `memory_retrieval_queries` + `memory_retrieval_feedback` plus `Vectorize` semantic ranking. Tag search lands on indexed D1 columns. |
+| `models/task.rs` | Keep | `src/models/entities.rs` + `src/models/orchestration.rs` (WS2 schema present) | Type definitions port as-is via serde; field names already aligned to the WS2 entity model. |
+| `models/memory.rs` | Adapt | **ported** — `src/models/memory.rs` (`MemoryKind`, `UpsertMemoryItemRequest`, `RetrieveMemoryRequest`, `MemoryItemCreated`) | Already in tree but with an adapted shape: `MemoryKind` enum (`Checkpoint`/`Artifact`/`Decision`/`Context`/`RunSummary`) replaces the upstream Bronze/Silver/Gold layer enum, matching the single-tier storage decision above. |
 | `models/play.rs` | Keep | `src/models/plays.rs` | Already ported in PR #122. Keep parity by adding a fitness test against the upstream schema. |
 | `models/knowledge.rs` | Adapt | not yet ported | Domain shape will likely need pruning to match WS2 `Artifact` and `ToolCall` rather than re-introducing a parallel knowledge namespace. |
 | `security/pii_filter.rs` | **Replace** | not yet ported | Replace the regex-based scanner with a more robust pipeline at the Worker edge (regex baseline plus future Workers AI classifier). Contract = `(value) → (redacted_value, findings)` stays the same. |
 | `security/data_mesh.rs` | Adapt | partial: `src/policy.rs`, `src/tenant_security.rs` | Policy decision shape exists; runtime authorization engine (deny-by-default, layer/key scoping) is not yet built — CAPABILITY_GAP_MAP `P0-1`. |
-| `middleware/auth.rs` | Adapt | partial: auth checks in `lib.rs` per-route | Workers' middleware idiom is "compose before the route handler"; the constant-time bearer check carries over but the integration shape differs. |
+| `middleware/auth.rs` | Adapt | partial: `src/lib.rs:102` delegates to `tenant::authorize(&tenant_ctx, req.method(), &path)` | This repo went past the upstream's bearer-token primitive to a tenant-scoped policy check. The constant-time-compare primitive may not need to carry over; the tenant authorization path is the new contract. |
 
-**Summary**: 4 Replace decisions (`main`, `surreal`, `migrations`, `pii_filter`), 17 Adapt, 3 Keep (the pure models). Zero Drop beyond `main`. No upstream module is being copy-pasted unconditionally — every line crosses the SurrealDB→D1 / axum→Workers seam at least once.
+**Summary**: 4 Replace decisions (`main.rs` (Drop), `storage/surreal`, `storage/migrations`, `security/pii_filter`), 3 explicit Drop-for-memory rows on the Bronze/Silver/Gold storage modules (with the BSG concept deliberately retargeted at the events domain), 15 Adapt, 2 Keep (pure data types: `models/task`, `models/play`). The non-trivial finding here is **deliberate non-adoption** of the upstream BSG memory tiering — every other upstream module either ports across the SurrealDB→D1 / axum→Workers seam or has an explicit non-adoption rationale.
 
 ## 3) D1 vs SurrealDB schema compatibility
 
@@ -144,7 +144,7 @@ Upstream uses SurrealDB (document + graph). This repo uses D1 (SQLite). The two 
 |---|---|---|---|---|
 | `task` records | document; `RecordId` PKs, array fields for tags, nested object for `response`/`error` | `tasks` table (migration `0002`), TEXT for tags (JSON), separate `task_events` for state transitions | **Partial** — `RecordId` → TEXT id, nested objects → JSON columns | Adapt: add a repository abstraction that hides the shape; provide compatibility shims for legacy `tags` array reads |
 | `play` records | document; `tasks[]` inline array, `params` jsonb | `play_definitions` (`0012`) + `play_runs` + join table to `tasks` | **Lossy** — D1 normalizes; need a join query to reconstitute the inline array | Adapt: keep the API response shape (`{ tasks: [...] }`) by joining on read; document the difference in the OpenAPI spec |
-| `memory_bronze` / `memory_silver` / `memory_gold` | three tables in one Surreal namespace | three D1 tables planned but not all present (only partial in `0004_ws5_memory.sql`, `0007_ws3_gold_layer.sql`) | **Gap** — Silver tier missing | Adapt + new migration for `memory_silver` with content hash + PII findings column |
+| `memory_bronze` / `memory_silver` / `memory_gold` | three tables in one Surreal namespace | **not ported as-is** — replaced by single `memory` table (`0004_ws5_memory.sql`) + `memory_index` / `memory_retrieval_queries` / `memory_retrieval_feedback` (`0003_ws5_memory_retrieval.sql`) | **Drop** for memory — the BSG concept survives in the *events* domain only (`events_bronze` in `0002_m1_m3_agent_infra.sql`, `events_silver` in `0003_ws3_provenance.sql`) | Drop for memory; document the single-tier decision so future contributors don't re-introduce BSG memory tables by reflex |
 | `agent_permissions` | record per `(agent_id, layer, key_prefix)` | proposed `agent_policies` table | **New** — not yet in this repo | Build: matches `R2` in [MIGRATION_RISK_REGISTER](MIGRATION_RISK_REGISTER.md) |
 | Surreal graph relations (e.g. `task -> belongs_to -> play`) | first-class edge records | foreign keys + join tables | **Lossy** — no transitive query | Adapt: every graph traversal needs an explicit recursive CTE or a flattened materialized table |
 | Surreal LIVE queries (push subscriptions) | server-side change streams | no D1 equivalent | **Drop** — replace with Queues/DO storage events | Replace: any caller relying on LIVE migrates to a polling endpoint or queue-driven event consumer |
@@ -156,13 +156,13 @@ Upstream uses SurrealDB (document + graph). This repo uses D1 (SQLite). The two 
 
 | WS2 entity | Upstream source of data | This repo's D1 table(s) | Aligned? |
 |---|---|---|---|
-| `Run` | upstream `play` runtime instance | `play_runs` (in `0012`) + `tasks.run_id` FK | ✅ yes, after PR #122 |
-| `Task` | upstream `task` | `tasks` | ✅ yes |
-| `Plan` | upstream `play` definition | `play_definitions` | ✅ yes |
-| `ToolCall` | upstream MCP dispatcher events | not yet modeled | ❌ gap — needs new migration (sequel of `0006_integrations.sql`) |
-| `Artifact` | upstream knowledge/memory entries | `memory_bronze` / `memory_gold` partial | ⚠ partial — Silver missing |
-| `PolicyDecision` | upstream `data_mesh.rs` decisions | `policy_*` (`0004`) | ⚠ partial — decision *record* exists, runtime enforcement does not |
-| `Release` | upstream play terminal state | no dedicated table | ❌ gap — currently derivable from `play_runs.status` but no explicit Release projection |
+| `Run` | upstream `play` runtime instance | `runs` (`0001_ws2_domain_model.sql`) + `tasks.run_id` FK | ✅ yes |
+| `Task` | upstream `task` | `tasks` (`0001`) | ✅ yes |
+| `Plan` | upstream `play` definition | `plans` (`0001`) + `play_definitions` (`0012`) | ✅ yes |
+| `ToolCall` | upstream MCP dispatcher events | `tool_calls` (`0001`, FKs to `runs.id` + `tasks.id`) | ✅ yes |
+| `Artifact` | upstream knowledge/memory entries | `artifacts` (`0001`) + `memory` (`0004`) for in-flight context | ✅ yes |
+| `PolicyDecision` | upstream `data_mesh.rs` decisions | `policy_decisions` (`0001`) + `policy_rules` / `policy_escalations` / `policy_rate_limit_counters` (`0004`) | ⚠ partial — decision *record* and rule storage exist; runtime enforcement engine does not (CAPABILITY_GAP_MAP `P0-1`) |
+| `Release` | upstream play terminal state | `releases` (`0001`) | ✅ yes |
 
 ## 4) Runtime config inventory
 
@@ -226,7 +226,7 @@ The upstream `middleware/` directory contains only `auth.rs`. The four other mid
 
 | Concern | Upstream location | This-repo location / status | Migration decision |
 |---|---|---|---|
-| **Authentication** | `middleware/auth.rs` (Bearer token, constant-time compare) | inline in `src/lib.rs` per-route | Adapt — extract to a `with_auth` helper that wraps the handler closure; preserve the constant-time check |
+| **Authentication** | `middleware/auth.rs` (Bearer token, constant-time compare) | `src/lib.rs:102` delegates each request to `tenant::authorize(&tenant_ctx, req.method(), &path)` — a tenant-scoped policy check, not a bearer compare | Adapt — the tenant authorization path is the new contract; the upstream constant-time bearer primitive may not carry over since the policy check supersedes it. Confirm the tenant authorization path itself does constant-time comparisons where it compares token-shaped values. |
 | **Logging / tracing** | `tracing` initialized in `main.rs` via `LOG_LEVEL` env | **Missing** in this repo | Build — add `tracing-subscriber` with a Workers-compatible writer; emit JSON to `console.log` so Workers Logs picks it up |
 | **Error handling** | `error.rs` `IntoResponse` impl | `src/errors.rs` exists but not consistently used by handlers | Adapt — every handler should `return ApiError::*.into_response()` instead of building `Response::error()` ad-hoc |
 | **Rate limiting** | not present upstream | not present | Build — Cloudflare Rate Limiting Rules at the zone level for coarse limits, plus per-tenant token bucket in `POLICY_KV` for fine-grained limits |
@@ -242,9 +242,9 @@ The upstream `middleware/` directory contains only `auth.rs`. The four other mid
 Mapped against [issue #52](https://github.com/stevedores-org/data-fabric/issues/52):
 
 - [x] Every module in `crates/data-fabric` is inventoried with purpose, inputs, outputs, dependencies — see [SOURCE_INVENTORY_MATRIX §1](SOURCE_INVENTORY_MATRIX.md#1-core-crate-module-inventory-complete).
-- [x] Migration decisions are documented with explicit rationale — §2 above, 24 modules classified Keep / Adapt / Replace / Drop.
-- [x] Extracted patterns validate against WS2 entities — §3 WS2 alignment table.
-- [x] No blind copy-paste — every extracted pattern has a documented fitness assessment — §2 and §3 each include rationale columns; pure Keep decisions are limited to data types and are flagged as such.
+- [x] Migration decisions are documented with explicit rationale — §2 above, 24 modules classified Keep / Adapt / Replace / Drop (with explicit Drop-for-memory decisions on the BSG storage modules).
+- [x] Extracted patterns validate against WS2 entities — §3 WS2 alignment table; all seven canonical entities (`Run`, `Task`, `Plan`, `ToolCall`, `Artifact`, `PolicyDecision`, `Release`) have backing D1 tables in migration `0001_ws2_domain_model.sql` plus follow-ups, with `PolicyDecision` flagged as partial (storage exists, runtime enforcement engine pending).
+- [x] No blind copy-paste — every extracted pattern has a documented fitness assessment, and the BSG memory-tier decision is an explicit non-adoption with a rationale rather than a silent skip.
 
 ## Cross-references
 
