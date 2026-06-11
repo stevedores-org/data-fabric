@@ -4,20 +4,25 @@ use worker::*;
 mod db;
 mod errors;
 mod integrations;
+mod metrics;
 mod models;
 mod pagination;
 mod policy;
 mod storage;
 mod task_do;
 mod thread_do;
+mod play_do;
 mod vector_index;
 mod tenant;
 #[allow(dead_code)]
 mod tenant_security;
 mod verification;
+mod openapi;
 
 pub use task_do::TaskLeaseManager;
 pub use thread_do::ThreadManager;
+
+pub use play_do::PlayManager;
 
 #[derive(Serialize)]
 struct HealthResponse<'a> {
@@ -29,7 +34,7 @@ struct HealthResponse<'a> {
 const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 
 fn is_public_path(path: &str) -> bool {
-    path == "/" || path == "/health"
+    path == "/" || path == "/health" || path == "/openapi.json" || path == "/docs"
 }
 
 fn request_path(req: &Request) -> Result<String> {
@@ -84,8 +89,11 @@ async fn augment_task_with_memory(
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
+    let start_ms = js_sys::Date::now();
 
     let path = request_path(&req)?;
+    let method = req.method();
+    let mut tenant_id_for_metric: Option<String> = None;
     if !is_public_path(&path) {
         let tenant_ctx = match tenant::tenant_from_request(&req) {
             Ok(ctx) => ctx,
@@ -94,11 +102,22 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         if tenant::authorize(&tenant_ctx, req.method(), &path).is_err() {
             return Response::error("forbidden by tenant role policy", 403);
         }
+        tenant_id_for_metric = Some(tenant_ctx.tenant_id.clone());
     }
+
+    // Grab the Analytics Engine sink (and APP_ENV for cross-env filtering)
+    // before `env` is consumed by the router. Missing binding in local dev /
+    // tests is non-fatal — emission below is best-effort.
+    let latency_sink = env.analytics_engine("PILOT_LATENCY").ok();
+    let app_env = env
+        .var("APP_ENV")
+        .ok()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
 
     let router = Router::new();
 
-    router
+    let response = router
         // ── Health ──────────────────────────────────────────────
         .get("/", |_, _| Response::ok("data-fabric-worker online"))
         .get("/health", |_, _| {
@@ -107,6 +126,35 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 status: "ok",
                 mission: "velocity-for-autonomous-agent-builders",
             })
+        })
+        .get("/openapi.json", |_, _| {
+            let mut headers = Headers::new();
+            headers.set("content-type", "application/json")?;
+            headers.set("access-control-allow-origin", "*")?;
+            Ok(Response::ok(openapi::get_openapi_spec())?.with_headers(headers))
+        })
+        .get("/docs", |_, _| {
+            let html = r#"<!DOCTYPE html>
+<html>
+  <head>
+    <title>Data Fabric API Documentation</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <script
+      id="api-reference"
+      data-url="/openapi.json"
+    ></script>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+  </body>
+</html>"#;
+            Response::from_html(html)
         })
         // ── Tenants (WS8) ─────────────────────────────────────
         .post_async("/v1/tenants/provision", |mut req, ctx| async move {
@@ -182,6 +230,33 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(run) => Response::from_json(&run),
                 None => errors::error_response("RUN_NOT_FOUND", "run not found", 404),
             }
+        })
+        // ── WS10 pilot baseline metrics (issue #105) ────────
+        .get_async("/v1/metrics/pilot", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let window_raw = params.get("window").map(|s| s.as_str()).unwrap_or("1d");
+            let (window, window_seconds) = match metrics::parse_window(window_raw) {
+                Ok(w) => w,
+                Err(e) => {
+                    return errors::error_response("INVALID_WINDOW", &e.to_string(), 400);
+                }
+            };
+            let task_type = params.get("task_type").map(|s| s.as_str());
+            let d1 = ctx.env.d1("DB")?;
+            let body = metrics::pilot(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &window,
+                window_seconds,
+                task_type,
+            )
+            .await?;
+            Response::from_json(&body)
         })
         // ── WS2 Tasks (run-scoped, D1-backed) ───────────────
         .post_async("/v1/runs/:run_id/tasks", |mut req, ctx| async move {
@@ -368,6 +443,41 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let d1 = ctx.env.d1("DB")?;
             let summary = db::memory_eval_summary(&d1, &tenant_ctx.tenant_id).await?;
             Response::from_json(&summary)
+        })
+        // ── Plays (Orchestration) ──────────────────────────────
+        .post_async("/v1/plays/:name/launch", |mut req, ctx| async move {
+            let _tenant_ctx = tenant::tenant_from_request(&req)?;
+            let play_name = ctx.param("name").unwrap().to_string();
+            let body: models::PlayLaunchRequest = req.json().await.unwrap_or(models::PlayLaunchRequest {
+                play_name: play_name.clone(),
+                job_id: None,
+                metadata: None,
+            });
+
+            // 1. Fetch play definition from D1
+            let d1 = ctx.env.d1("DB")?;
+            let def = match db::get_play_definition(&d1, &play_name).await? {
+                Some(d) => d,
+                None => return Response::error(format!("play '{}' not found", play_name), 404),
+            };
+
+            // 2. Launch via PlayManager Durable Object
+            let run_id = body.job_id.unwrap_or_else(|| generate_id().unwrap());
+            let namespace = ctx.env.durable_object("PLAY_MANAGER")?;
+            let stub = namespace.id_from_name(&run_id)?.get_stub()?;
+            
+            let do_req = Request::new_with_init(
+                "https://do/launch",
+                &RequestInit {
+                    method: Method::Post,
+                    body: Some(serde_wasm_bindgen::to_value(&def).map_err(|e| Error::RustError(e.to_string()))?),
+                    ..Default::default()
+                }
+            )?;
+            let mut do_resp = stub.fetch_with_request(do_req).await?;
+            
+            let result: serde_json::Value = do_resp.json().await?;
+            Response::from_json(&result)
         })
         // ── Artifacts (R2-backed) ─────────────────────────────
         .put_async("/v1/artifacts/:key", |mut req, ctx| async move {
@@ -657,6 +767,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if do_resp.status_code() == 204 {
                 return Ok(Response::empty()?.with_status(204));
             }
+
 
             let mut task: models::AgentTask = do_resp.json().await?;
             
@@ -1532,7 +1643,64 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             )
         })
         .run(req, env)
-        .await
+        .await;
+
+    if !is_public_path(&path) {
+        if let Some(sink) = latency_sink.as_ref() {
+            let status = response
+                .as_ref()
+                .ok()
+                .map(|r| r.status_code())
+                .unwrap_or(500);
+            emit_pilot_latency(
+                sink,
+                &path,
+                &method,
+                tenant_id_for_metric.as_deref().unwrap_or("unknown"),
+                &app_env,
+                js_sys::Date::now() - start_ms,
+                status,
+            );
+        }
+    }
+
+    response
+}
+
+/// Best-effort emit of one request-latency sample to the `PILOT_LATENCY`
+/// Analytics Engine dataset. Failures are deliberately swallowed: a missing
+/// dataset or transient sink error must not turn a successful request into
+/// a 500.
+///
+/// Path is currently emitted as-is. High-cardinality routes (`/v1/runs/:id`)
+/// inflate the dataset row count — templating the path is a follow-up.
+///
+/// Sample schema (kept in sync with `docs/ws10/METRICS_ENDPOINT.md`):
+/// * `index1` — `tenant_id` (sampling key)
+/// * `blob1`  — request path
+/// * `blob2`  — HTTP method
+/// * `blob3`  — `APP_ENV` (dev / staging / production)
+/// * `double1`— elapsed milliseconds
+/// * `double2`— response status code
+fn emit_pilot_latency(
+    sink: &AnalyticsEngineDataset,
+    path: &str,
+    method: &Method,
+    tenant_id: &str,
+    app_env: &str,
+    elapsed_ms: f64,
+    status_code: u16,
+) {
+    let method_str = method.to_string();
+    let dp = AnalyticsEngineDataPointBuilder::new()
+        .indexes([tenant_id])
+        .add_blob(path)
+        .add_blob(method_str.as_str())
+        .add_blob(app_env)
+        .add_double(elapsed_ms)
+        .add_double(status_code as f64)
+        .build();
+    let _ = sink.write_data_point(&dp);
 }
 
 /// Queue consumer: enriches events — causality edges, gold summaries, task deps.

@@ -127,6 +127,37 @@ pub async fn heartbeat_task(
     Ok(changed)
 }
 
+pub async fn get_play_definition(
+    db: &D1Database,
+    name: &str,
+) -> Result<Option<models::PlayDefinition>> {
+    #[derive(serde::Deserialize)]
+    struct PlayRow {
+        name: String,
+        goal: String,
+        tasks_json: String,
+    }
+
+    let row: Option<PlayRow> = db
+        .prepare("SELECT name, goal, tasks_json FROM play_definitions WHERE name = ?1")
+        .bind(&[JsValue::from_str(name)])?
+        .first(None)
+        .await?;
+
+    match row {
+        Some(r) => {
+            let tasks: Vec<models::PlayTaskDefinition> = serde_json::from_str(&r.tasks_json)
+                .map_err(|e| Error::RustError(format!("failed to parse play tasks: {e}")))?;
+            Ok(Some(models::PlayDefinition {
+                name: r.name,
+                goal: r.goal,
+                tasks,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
 // ── Agents ──────────────────────────────────────────────────────
 
 pub async fn register_agent(
