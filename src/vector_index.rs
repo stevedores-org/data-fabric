@@ -22,9 +22,11 @@
 //!      `env.SEMANTIC_INDEX.{insert,query}`, and bind to it as a service
 //!      binding from this Rust worker (so `env.service(...)` is correct).
 //!
-//! Until then the `fail_*` helpers at the bottom of this module log a
-//! diagnostic so the broken path is observable (`wrangler tail`) instead of
-//! silently dropping memory items.
+//! Until then, every binding-acquire and fetch_request error path runs
+//! `inspect_err(|e| console_warn!(...))` so the broken path is observable
+//! via `wrangler tail` instead of silently dropping memory items. Log
+//! messages avoid embedding raw user-controlled values (memory IDs are
+//! truncated to a short prefix) to bound log cardinality on retry storms.
 
 use serde_json::json;
 use worker::*;
@@ -100,9 +102,13 @@ impl SemanticIndex {
 
         // See module doc comment — this call is expected to fail at runtime
         // against the live Vectorize binding. The caller handles the error.
+        // Truncate id to a short prefix in the log to bound cardinality
+        // when retry storms hit (one log line per unique full id would
+        // blow up `wrangler tail` throughput).
+        let id_short: &str = id.get(..id.len().min(8)).unwrap_or("");
         self.index.fetch_request(req).await.inspect_err(|e| {
             console_warn!(
-                "vector_index: SEMANTIC_INDEX.fetch_request(insert) failed (id={id}) — binding-type mismatch, see vector_index.rs doc comment ({e:?})"
+                "vector_index: SEMANTIC_INDEX.fetch_request(insert) failed (id_prefix={id_short}) — binding-type mismatch, see vector_index.rs doc comment ({e:?})"
             );
         })?;
         Ok(())
@@ -128,9 +134,10 @@ impl SemanticIndex {
         )?;
 
         // See module doc comment — expected to fail at runtime.
+        // top_k is omitted from the log to keep cardinality bounded.
         let mut resp = self.index.fetch_request(req).await.inspect_err(|e| {
             console_warn!(
-                "vector_index: SEMANTIC_INDEX.fetch_request(query) failed (top_k={top_k}) — binding-type mismatch, see vector_index.rs doc comment ({e:?})"
+                "vector_index: SEMANTIC_INDEX.fetch_request(query) failed — binding-type mismatch, see vector_index.rs doc comment ({e:?})"
             );
         })?;
         resp.json().await
