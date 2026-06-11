@@ -71,6 +71,22 @@ impl DurableObject for TaskLeaseManager {
         let path = req.path();
         let method = req.method();
 
+        // Extract the path-tail for parameterised routes. The lib.rs
+        // callers build `https://do/complete/{task_id}` and
+        // `https://do/fail/{task_id}` (see lib.rs:836 / lib.rs:867), so
+        // the DO receives e.g. `/complete/<task_id>` as `req.path()`.
+        //
+        // The previous match arms `"/complete"` and `"/fail"` matched on
+        // the *static* string and therefore never fired against a path
+        // that carried a task_id — every call returned the catch-all
+        // `404 not found`. PR #132 crr finding (task_do.rs:194 / :241):
+        // this bug shipped to production and was first surfaced by PR
+        // #142's tests. We now match by prefix and pull task_id out of
+        // the trailing segment, mirroring the parsing the original
+        // handler attempted via `req.path().split('/').nth(2)`.
+        let complete_task_id = path.strip_prefix("/complete/").map(|s| s.to_string());
+        let fail_task_id = path.strip_prefix("/fail/").map(|s| s.to_string());
+
         match (method, path.as_str()) {
             (Method::Post, "/enqueue") => {
                 let task: AgentTask = req.json().await?;
@@ -191,8 +207,11 @@ impl DurableObject for TaskLeaseManager {
                 }
                 Response::error("task not found or not owned by agent", 404)
             }
-            (Method::Post, "/complete") => {
-                let task_id = req.path().split('/').nth(2).unwrap_or_default().to_string();
+            (Method::Post, _) if complete_task_id.is_some() => {
+                let task_id = complete_task_id.unwrap_or_default();
+                if task_id.is_empty() {
+                    return Response::error("missing task id", 400);
+                }
                 let result: Option<serde_json::Value> = req.json().await.ok();
 
                 let storage = self.state.storage();
@@ -238,8 +257,11 @@ impl DurableObject for TaskLeaseManager {
                     Response::error("task not found or not running", 404)
                 }
             }
-            (Method::Post, "/fail") => {
-                let task_id = req.path().split('/').nth(2).unwrap_or_default().to_string();
+            (Method::Post, _) if fail_task_id.is_some() => {
+                let task_id = fail_task_id.unwrap_or_default();
+                if task_id.is_empty() {
+                    return Response::error("missing task id", 400);
+                }
                 let fail_req: TaskFailRequest = req.json().await?;
 
                 let storage = self.state.storage();
@@ -549,6 +571,28 @@ pub(crate) fn split_due_pending(
     (due, deferred)
 }
 
+/// Pure helper: extract `task_id` from a DO request path of the form
+/// `/<route>/<task_id>` for the parameterised routes `/complete` and
+/// `/fail`. Returns `Some(task_id)` when the path matches the given
+/// route prefix and the task_id segment is non-empty; `None` otherwise.
+///
+/// Extracted as a test-only free function so the routing contract
+/// (mirroring `path.strip_prefix("/complete/")` in the live `fetch`
+/// handler) is unit-testable on host without spinning up a Workers
+/// runtime. This backs the regression test for the PR #132 routing bug
+/// where the old `/complete` static match arm never fired against the
+/// lib.rs caller's `/complete/<task_id>` path.
+#[cfg(test)]
+pub(crate) fn parse_task_id_from_path(path: &str, route: &str) -> Option<String> {
+    let prefix = format!("/{}/", route.trim_matches('/'));
+    let tail = path.strip_prefix(&prefix)?;
+    if tail.is_empty() {
+        None
+    } else {
+        Some(tail.to_string())
+    }
+}
+
 /// Pure helper: upsert a PendingNotify into the in-memory list, keyed
 /// by `(target_name, play_task_id)`. If the key already exists we
 /// replace it (matters for retry re-enqueue with bumped attempt count).
@@ -689,6 +733,61 @@ mod tests {
         assert_eq!(due.len(), 2);
         assert_eq!(deferred.len(), 1);
         assert_eq!(deferred[0].play_task_id, "t2");
+    }
+
+    // ── PR #132 finding: task_do.rs:194 / :241 — /complete and /fail
+    //    routing was unreachable. The static match arms `"/complete"`
+    //    and `"/fail"` never fired against the lib.rs caller's
+    //    `https://do/complete/<task_id>` URL (req.path() carries the
+    //    full path including the id), so every call returned 404.
+    //    These tests pin the path-parsing contract that backs the new
+    //    prefix-match arms.
+
+    #[test]
+    fn parse_task_id_extracts_segment_from_complete_path() {
+        assert_eq!(
+            parse_task_id_from_path("/complete/task-abc-123", "complete"),
+            Some("task-abc-123".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_task_id_extracts_segment_from_fail_path() {
+        assert_eq!(
+            parse_task_id_from_path("/fail/task-xyz", "fail"),
+            Some("task-xyz".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_task_id_returns_none_for_static_path() {
+        // The pre-fix bug shape: the lib caller never sends a bare
+        // "/complete" — but if it did, we must produce None (and the
+        // DO returns 400 / 404), not silently treat empty as a valid id.
+        assert_eq!(parse_task_id_from_path("/complete", "complete"), None);
+        assert_eq!(parse_task_id_from_path("/complete/", "complete"), None);
+    }
+
+    #[test]
+    fn parse_task_id_returns_none_for_unrelated_path() {
+        assert_eq!(parse_task_id_from_path("/enqueue", "complete"), None);
+        assert_eq!(parse_task_id_from_path("/claim", "fail"), None);
+    }
+
+    #[test]
+    fn parse_task_id_round_trips_lib_rs_caller_url() {
+        // Regression for the production bug: the lib.rs handler builds
+        // `https://do/complete/{task_id}` via Request::new_with_init, and
+        // worker-rs surfaces `req.path()` as `/complete/{task_id}`. The
+        // old `.nth(2)` parsing assumed three segments — but the path
+        // only ever has two, and the match arm itself never matched
+        // anyway. Pin the contract: a representative caller path must
+        // produce a non-empty task_id.
+        let path = "/complete/run-42-summarise";
+        let task_id = parse_task_id_from_path(path, "complete")
+            .expect("lib.rs caller URL must yield a non-empty task id");
+        assert!(!task_id.is_empty());
+        assert_eq!(task_id, "run-42-summarise");
     }
 
     #[test]
