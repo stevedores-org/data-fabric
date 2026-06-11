@@ -127,22 +127,36 @@ impl PlayManager {
             return Ok(());
         }
 
-        // Mark eligible tasks as active and bump version BEFORE outbound
-        // RPCs so a concurrent /task-completed cannot double-launch them.
-        for task_def in &to_launch {
-            state.active_tasks.insert(task_def.id.clone());
-        }
-        state.state_version = state.state_version.wrapping_add(1);
-        let snapshot_version = state.state_version;
-        storage.put("state", &state).await?;
-
         let tenant_id = self.state.id().to_string(); // Simplified, should pass tenant_id
         let task_ns = self.env.durable_object("TASK_LEASE_MANAGER")?;
         let task_stub = task_ns.id_from_name(&tenant_id)?.get_stub()?;
 
-        // Issue outbound RPCs. Each await may yield the input gate, but
-        // the state-write above is already durable so any interleaved
-        // /task-completed will observe the updated active_tasks set.
+        // PR #132 crr finding (play_do.rs:178): the previous implementation
+        // marked ALL `to_launch` tasks as active and persisted that state
+        // BEFORE issuing any outbound RPCs. If any RPC then failed
+        // (`.await?`), the loop bailed but the active-set write had
+        // already landed — leaving every task in the batch marked active
+        // forever, even though TaskLeaseManager never received them.
+        // `derive_to_launch` excludes already-active tasks, and TLM
+        // never lease-expires what it never knew about, so these tasks
+        // were silently stuck.
+        //
+        // Fix (per-task atomicity, option (b) from the crr brief): mark
+        // a task active ONLY AFTER its `/enqueue` RPC has succeeded,
+        // persisting between each. This costs N writes instead of 1 but
+        // guarantees the invariant: a task is in `active_tasks` iff TLM
+        // has been told about it. A failed RPC short-circuits with the
+        // error bubbled up (caller can retry); already-enqueued tasks
+        // stay durably active; not-yet-enqueued tasks stay un-marked
+        // and will be re-picked-up by the next `materialize_eligible_tasks`
+        // call (e.g. via the next `/task-completed`).
+
+        // Persist the seed state (first launch path) before issuing any
+        // outbound RPCs so a concurrent handler observing storage sees a
+        // consistent baseline. On the `/task-completed` path this is a
+        // no-op rewrite of the just-persisted state from the caller.
+        storage.put("state", &state).await?;
+
         for task_def in to_launch {
             let task = AgentTask {
                 id: format!("{}-{}", state.run_id, task_def.id),
@@ -175,26 +189,78 @@ impl PlayManager {
                     ..Default::default()
                 },
             )?;
-            task_stub.fetch_with_request(do_req).await?;
-        }
 
-        // Defensive drift assertion: if our snapshot's state_version no
-        // longer matches what's in storage, a concurrent /task-completed
-        // ran during the outbound RPC loop. That handler is responsible
-        // for re-running materialize, so we can safely return — we do not
-        // overwrite storage with a stale snapshot here.
-        if let Some(current) = storage.get::<PlayState>("state").await? {
-            if current.state_version != snapshot_version {
+            // Issue the outbound RPC FIRST. If it fails, return without
+            // marking this task active — leaving the durable state at
+            // the last successfully-enqueued task. The caller surfaces
+            // the error; the next materialize call will retry this and
+            // remaining tasks because `derive_to_launch` still includes
+            // anything not yet in `active_tasks`/`completed_tasks`.
+            if let Err(e) = task_stub.fetch_with_request(do_req).await {
                 worker::console_log!(
-                    "play_do: state_version drift detected ({} -> {}); skipping stale write",
-                    snapshot_version,
-                    current.state_version
+                    "play_do: enqueue RPC failed for task {} of run {}: {}; \
+                     leaving active_tasks unchanged so a future materialize \
+                     call will retry",
+                    task_def.id,
+                    state.run_id,
+                    e,
                 );
+                return Err(e);
             }
+
+            // RPC succeeded — now mark active and persist. We re-read
+            // state from storage to fold in any concurrent
+            // `/task-completed` mutation that may have landed while our
+            // input gate yielded on the outbound RPC's await. Without
+            // this re-read we would clobber concurrent `completed_tasks`
+            // / `active_tasks.remove(...)` updates.
+            let mut latest: PlayState = storage
+                .get("state")
+                .await?
+                .ok_or_else(|| Error::RustError("state not found".into()))?;
+            latest.active_tasks.insert(task_def.id.clone());
+            latest.state_version = latest.state_version.wrapping_add(1);
+            storage.put("state", &latest).await?;
+            state = latest;
         }
 
         Ok(())
     }
+}
+
+/// Pure helper backing the per-task-atomicity invariant in
+/// `materialize_eligible_tasks` (PR #132 crr finding on play_do.rs:178).
+///
+/// Simulates the per-task loop in pure terms: given an initial state,
+/// the list of tasks to launch, and a per-task RPC outcome closure,
+/// returns the (final_state, error_at_index) tuple. Any task whose RPC
+/// errored is NOT marked active; tasks before it ARE marked active
+/// (their RPCs succeeded). The first failing task aborts iteration.
+///
+/// Invariant: `final_state.active_tasks.contains(t)` <=> RPC for t
+/// returned Ok. This is exactly what the production loop guarantees.
+/// Test-only so it can stay tightly aligned with the live loop without
+/// leaking the private `PlayState` type into the crate API surface.
+#[cfg(test)]
+fn simulate_per_task_materialize<F>(
+    initial: PlayState,
+    to_launch: &[PlayTaskDefinition],
+    mut rpc: F,
+) -> (PlayState, Option<usize>)
+where
+    F: FnMut(&PlayTaskDefinition) -> std::result::Result<(), String>,
+{
+    let mut state = initial;
+    for (idx, task_def) in to_launch.iter().enumerate() {
+        match rpc(task_def) {
+            Ok(()) => {
+                state.active_tasks.insert(task_def.id.clone());
+                state.state_version = state.state_version.wrapping_add(1);
+            }
+            Err(_) => return (state, Some(idx)),
+        }
+    }
+    (state, None)
 }
 
 /// Pure derivation of eligible-to-launch tasks from a PlayState snapshot.
@@ -313,6 +379,107 @@ mod tests {
         let launched = derive_to_launch(&state);
         let ids: Vec<_> = launched.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["c"]);
+    }
+
+    // ── PR #132 finding: play_do.rs:178 — partial-enqueue stuck-active ─
+    //
+    // The pre-fix code marked every `to_launch` task as `active` and
+    // persisted that state BEFORE issuing outbound RPCs. If any RPC then
+    // failed (`.await?`), the active write was already durable but TLM
+    // had never received the task. `derive_to_launch` excluded
+    // already-active tasks, so the task was stuck active forever, and
+    // TLM never lease-expired it because it never knew about it. These
+    // tests pin the per-task atomicity contract that fixes that.
+
+    #[test]
+    fn per_task_materialize_only_marks_active_on_rpc_success() {
+        let state = make_state(vec![task("a", &[]), task("b", &[]), task("c", &[])]);
+        let to_launch = derive_to_launch(&state);
+        // RPC succeeds for everyone.
+        let (final_state, err_idx) = simulate_per_task_materialize(state, &to_launch, |_| Ok(()));
+        assert_eq!(err_idx, None);
+        let active: HashSet<_> = final_state.active_tasks.iter().cloned().collect();
+        assert_eq!(
+            active,
+            HashSet::from(["a".to_string(), "b".to_string(), "c".to_string()]),
+        );
+    }
+
+    #[test]
+    fn per_task_materialize_aborts_and_leaves_failed_task_inactive() {
+        // This is the partial-enqueue regression test. Task "b"'s RPC
+        // fails; "a"'s RPC succeeded; "c" should never be attempted.
+        // The contract: post-failure state has ONLY "a" marked active,
+        // and "b" / "c" can be re-attempted by a subsequent materialize.
+        let state = make_state(vec![task("a", &[]), task("b", &[]), task("c", &[])]);
+        let to_launch = derive_to_launch(&state);
+        let (final_state, err_idx) = simulate_per_task_materialize(state, &to_launch, |t| {
+            if t.id == "b" {
+                Err("TLM enqueue RPC failed".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(err_idx, Some(1), "loop aborts at failed task");
+        let active: HashSet<_> = final_state.active_tasks.iter().cloned().collect();
+        assert_eq!(
+            active,
+            HashSet::from(["a".to_string()]),
+            "only successfully-enqueued tasks marked active",
+        );
+        // Crucially, the failed task is NOT marked active — so the next
+        // materialize call will re-derive it as eligible (see test
+        // `per_task_materialize_recovers_failed_task_on_retry`).
+        assert!(!final_state.active_tasks.contains("b"));
+        assert!(!final_state.active_tasks.contains("c"));
+    }
+
+    #[test]
+    fn per_task_materialize_recovers_failed_task_on_retry() {
+        // After a partial failure, the next materialize call must
+        // re-include the un-enqueued tasks. This is the load-bearing
+        // recovery property: a transient TLM outage no longer
+        // permanently strands tasks.
+        let mut state = make_state(vec![task("a", &[]), task("b", &[]), task("c", &[])]);
+        // Simulate the post-failure state from the previous test: only
+        // "a" was successfully enqueued.
+        state.active_tasks.insert("a".to_string());
+
+        // derive_to_launch on the post-failure state must re-emit b and c.
+        let to_launch = derive_to_launch(&state);
+        let ids: HashSet<_> = to_launch.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(
+            ids,
+            HashSet::from(["b".to_string(), "c".to_string()]),
+            "failed tasks are re-eligible on next materialize",
+        );
+
+        // And the retry now succeeds for everyone.
+        let (final_state, err_idx) = simulate_per_task_materialize(state, &to_launch, |_| Ok(()));
+        assert_eq!(err_idx, None);
+        let active: HashSet<_> = final_state.active_tasks.iter().cloned().collect();
+        assert_eq!(
+            active,
+            HashSet::from(["a".to_string(), "b".to_string(), "c".to_string()]),
+        );
+    }
+
+    #[test]
+    fn per_task_materialize_first_task_fails_leaves_nothing_active() {
+        // Edge case: the very first task's RPC fails. No task should be
+        // marked active. The pre-fix bug would have left ALL three
+        // marked active (because they were marked pre-loop) — that's
+        // exactly the production bug shape.
+        let state = make_state(vec![task("a", &[]), task("b", &[]), task("c", &[])]);
+        let to_launch = derive_to_launch(&state);
+        let (final_state, err_idx) =
+            simulate_per_task_materialize(state, &to_launch, |_| Err("nope".into()));
+        assert_eq!(err_idx, Some(0));
+        assert!(
+            final_state.active_tasks.is_empty(),
+            "no task marked active when first RPC fails — \
+             pre-fix would have stranded all three"
+        );
     }
 
     #[test]
