@@ -1,20 +1,37 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use data_fabric_client::{CreateRunRequest, DataFabricClient, PolicyCheckRequest};
+use data_fabric_client::{
+    types::{CreateCheckpoint, CreateRun, PolicyCheckRequest},
+    Client, ClientConfig,
+};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "dfctl")]
-#[command(about = "Command-line control interface for Stevedores Data Fabric", long_about = None)]
+#[command(
+    about = "Command-line control interface for Stevedores Data Fabric",
+    long_about = None,
+)]
 struct Cli {
-    #[arg(long, env = "DF_URL", default_value = "http://localhost:8787")]
+    /// Base URL of the Data Fabric service.
+    #[arg(long, env = "DATA_FABRIC_URL", default_value = "http://localhost:8787")]
     url: String,
 
-    #[arg(long, env = "DF_TENANT", default_value = "lornu-ai")]
+    /// Tenant identifier (sent as `x-tenant-id`).
+    #[arg(long, env = "DATA_FABRIC_TENANT_ID", default_value = "lornu-ai")]
     tenant_id: String,
 
-    #[arg(long, env = "DF_TOKEN")]
-    token: Option<String>,
+    /// Tenant role (sent as `x-tenant-role`).
+    #[arg(long, env = "DATA_FABRIC_TENANT_ROLE", default_value = "builder")]
+    tenant_role: String,
+
+    /// Cloudflare Access service token client id.
+    #[arg(long, env = "CF_ACCESS_CLIENT_ID")]
+    cf_client_id: Option<String>,
+
+    /// Cloudflare Access service token client secret.
+    #[arg(long, env = "CF_ACCESS_CLIENT_SECRET")]
+    cf_client_secret: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -22,28 +39,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Check health of the Data Fabric service
+    /// Check health of the Data Fabric service.
     Health,
 
-    /// Manage execution runs
+    /// Manage execution runs.
     Runs {
         #[command(subcommand)]
         cmd: RunCommands,
     },
 
-    /// Manage state checkpoints
+    /// Manage state checkpoints.
     Checkpoints {
         #[command(subcommand)]
         cmd: CheckpointCommands,
     },
 
-    /// Evaluate policy rules
+    /// Evaluate policy rules.
     Policy {
         #[command(subcommand)]
         cmd: PolicyCommands,
     },
 
-    /// Manage agents
+    /// Manage agents.
     Agents {
         #[command(subcommand)]
         cmd: AgentCommands,
@@ -52,7 +69,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum RunCommands {
-    /// List runs for the tenant
+    /// List runs for the tenant.
     List {
         #[arg(long)]
         repo: Option<String>,
@@ -61,7 +78,7 @@ enum RunCommands {
         #[arg(long)]
         cursor: Option<String>,
     },
-    /// Create a new execution run
+    /// Create a new execution run.
     Create {
         #[arg(long)]
         repo: String,
@@ -70,33 +87,39 @@ enum RunCommands {
         #[arg(long)]
         actor: Option<String>,
     },
-    /// Inspect traces for a run
-    Inspect {
-        run_id: String,
-    },
+    /// Inspect a run by id.
+    Inspect { run_id: String },
 }
 
 #[derive(Subcommand)]
 enum CheckpointCommands {
-    /// Save a checkpoint for a run
+    /// Save a checkpoint for a thread/node.
+    ///
+    /// The Data Fabric checkpoint API is keyed on `thread_id` + `node_id`, not
+    /// on `run_id`. Callers wanting to associate a checkpoint with a run should
+    /// pass the run id as the thread id (the orchestrator's convention).
     Save {
-        run_id: String,
-        /// Path to a JSON file containing the state
+        /// Thread the checkpoint belongs to.
+        #[arg(long)]
+        thread_id: String,
+        /// Node within the graph that produced this state.
+        #[arg(long)]
+        node_id: String,
+        /// Optional parent checkpoint id.
+        #[arg(long)]
+        parent_id: Option<String>,
+        /// Path to a JSON file containing the state.
         state_file: PathBuf,
     },
-    /// Get details of a checkpoint
-    Get {
-        id: String,
-    },
-    /// Delete a checkpoint
-    Delete {
-        id: String,
-    },
+    /// Get details of a checkpoint.
+    Get { id: String },
+    /// Delete a checkpoint.
+    Delete { id: String },
 }
 
 #[derive(Subcommand)]
 enum PolicyCommands {
-    /// Evaluate a policy request
+    /// Evaluate a policy request.
     Check {
         #[arg(long)]
         action: String,
@@ -111,14 +134,25 @@ enum PolicyCommands {
 
 #[derive(Subcommand)]
 enum AgentCommands {
-    /// List active agents
+    /// List registered agents.
     List,
+}
+
+fn build_client(cli: &Cli) -> Client {
+    let config = ClientConfig {
+        base_url: cli.url.clone(),
+        tenant_id: cli.tenant_id.clone(),
+        tenant_role: cli.tenant_role.clone(),
+        cf_client_id: cli.cf_client_id.clone(),
+        cf_client_secret: cli.cf_client_secret.clone(),
+    };
+    Client::new(config)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = DataFabricClient::new(&cli.url, &cli.tenant_id, cli.token.as_deref());
+    let client = build_client(&cli);
 
     match cli.command {
         Commands::Health => {
@@ -127,114 +161,106 @@ async fn main() -> Result<()> {
             println!("Status:  {}", res.status);
             println!("Mission: {}", res.mission);
         }
+
         Commands::Runs { cmd } => match cmd {
-            RunCommands::List { repo, limit, cursor } => {
-                let res = client.list_runs(repo.as_deref(), Some(limit), cursor.as_deref()).await?;
-                println!("--- Runs List ---");
-                use cli_table::{Cell, Style, Table, print_stdout};
-                let mut rows = Vec::new();
-                for run in res.runs {
-                    let id = run.get("id").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-                    let repo = run.get("repo").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-                    let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-                    let trigger = run.get("trigger").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-                    let actor = run.get("actor").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-                    let created_at = run.get("created_at").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-                    rows.push(vec![
-                        id.cell(),
-                        repo.cell(),
-                        status.cell(),
-                        trigger.cell(),
-                        actor.cell(),
-                        created_at.cell(),
-                    ]);
-                }
-                let table = rows.table().title(vec![
-                    "Run ID".cell().bold(true),
-                    "Repository".cell().bold(true),
-                    "Status".cell().bold(true),
-                    "Trigger".cell().bold(true),
-                    "Actor".cell().bold(true),
-                    "Created At".cell().bold(true),
-                ]);
-                print_stdout(table)?;
-                if let Some(c) = res.next_cursor {
-                    println!("Next cursor: {}", c);
-                }
+            RunCommands::List {
+                repo,
+                limit,
+                cursor,
+            } => {
+                let res = client
+                    .list_runs(repo.as_deref(), Some(limit), cursor.as_deref())
+                    .await
+                    .context("Failed to list runs")?;
+                print_runs(&res)?;
             }
-            RunCommands::Create { repo, trigger, actor } => {
-                let req = CreateRunRequest {
+            RunCommands::Create {
+                repo,
+                trigger,
+                actor,
+            } => {
+                let req = CreateRun {
                     repo,
                     trigger,
                     actor,
                     metadata: None,
                 };
-                let res = client.create_run(req).await?;
+                let created = client
+                    .create_run(&req)
+                    .await
+                    .context("Failed to create run")?;
                 println!("Run created successfully!");
-                println!("ID:     {}", res.id);
-                println!("Status: {}", res.status);
+                println!("ID:     {}", created.id);
+                println!("Status: {}", created.status);
             }
             RunCommands::Inspect { run_id } => {
-                println!("Fetching trace lineage for run: {}...", run_id);
-                let trace = client.get_trace(&run_id, Some(50)).await?;
-                println!("Run ID: {}", trace.run_id);
-                if let Some(total) = trace.total {
-                    println!("Total trace events: {}", total);
+                let run = client
+                    .get_run(&run_id)
+                    .await
+                    .context("Failed to fetch run")?;
+                println!("ID:         {}", run.id);
+                println!("Repository: {}", run.repo);
+                println!("Status:     {:?}", run.status);
+                println!("Trigger:    {}", run.trigger.as_deref().unwrap_or("-"));
+                println!("Actor:      {}", run.actor);
+                println!("Created:    {}", run.created_at);
+                println!("Updated:    {}", run.updated_at);
+                if let Some(meta) = run.metadata {
+                    println!("Metadata:\n{}", serde_json::to_string_pretty(&meta)?);
                 }
-                
-                use cli_table::{Cell, Style, Table, print_stdout};
-                let mut rows = Vec::new();
-                for event in trace.events {
-                    let payload_str = match event.payload {
-                        Some(p) => {
-                            let s = p.to_string();
-                            if s.len() > 30 {
-                                format!("{}...", &s[..27])
-                            } else {
-                                s
-                            }
-                        }
-                        None => "-".to_string(),
-                    };
-                    rows.push(vec![
-                        event.id.cell(),
-                        event.event_type.cell(),
-                        event.actor.unwrap_or_else(|| "-".to_string()).cell(),
-                        event.created_at.cell(),
-                        payload_str.cell(),
-                    ]);
-                }
-                let table = rows.table().title(vec![
-                    "Event ID".cell().bold(true),
-                    "Type".cell().bold(true),
-                    "Actor".cell().bold(true),
-                    "Created At".cell().bold(true),
-                    "Payload".cell().bold(true),
-                ]);
-                print_stdout(table)?;
             }
         },
+
         Commands::Checkpoints { cmd } => match cmd {
-            CheckpointCommands::Save { run_id, state_file } => {
-                let content = std::fs::read_to_string(&state_file)
-                    .context("Failed to read state file")?;
-                let state: serde_json::Value = serde_json::from_str(&content)
-                    .context("Invalid JSON in state file")?;
-                let res = client.save_checkpoint(&run_id, state, None).await?;
-                println!("Checkpoint saved successfully!");
-                println!("{}", serde_json::to_string_pretty(&res)?);
+            CheckpointCommands::Save {
+                thread_id,
+                node_id,
+                parent_id,
+                state_file,
+            } => {
+                let content =
+                    std::fs::read_to_string(&state_file).context("Failed to read state file")?;
+                let state: serde_json::Value =
+                    serde_json::from_str(&content).context("Invalid JSON in state file")?;
+                let req = CreateCheckpoint {
+                    thread_id,
+                    node_id,
+                    parent_id,
+                    state,
+                    metadata: None,
+                };
+                let res = client
+                    .create_checkpoint(&req)
+                    .await
+                    .context("Failed to create checkpoint")?;
+                println!("Checkpoint created successfully!");
+                println!("ID:           {}", res.id);
+                println!("Thread:       {}", res.thread_id);
+                println!("State R2 key: {}", res.state_r2_key);
             }
             CheckpointCommands::Get { id } => {
-                let res = client.get_checkpoint(&id).await?;
+                let res = client
+                    .get_checkpoint(&id)
+                    .await
+                    .context("Failed to fetch checkpoint")?;
                 println!("{}", serde_json::to_string_pretty(&res)?);
             }
             CheckpointCommands::Delete { id } => {
-                client.delete_checkpoint(&id).await?;
+                client
+                    .delete_checkpoint(&id)
+                    .await
+                    .context("Failed to delete checkpoint")?;
                 println!("Checkpoint {} deleted.", id);
             }
         },
+
         Commands::Policy { cmd } => match cmd {
-            PolicyCommands::Check { action, actor, resource, run_id } => {
+            PolicyCommands::Check {
+                action,
+                actor,
+                resource,
+                run_id,
+            } => {
                 let req = PolicyCheckRequest {
                     action,
                     actor,
@@ -242,20 +268,108 @@ async fn main() -> Result<()> {
                     context: None,
                     run_id,
                 };
-                let res = client.check_policy(req).await?;
+                let res = client
+                    .check_policy(&req)
+                    .await
+                    .context("Failed to check policy")?;
                 println!("--- Policy Evaluation ---");
                 println!("Decision: {}", res.decision);
                 println!("Reason:   {}", res.reason);
+                if let Some(level) = res.risk_level {
+                    println!("Risk:     {}", level);
+                }
             }
         },
+
         Commands::Agents { cmd } => match cmd {
             AgentCommands::List => {
-                println!("Listing registered agents:");
-                println!("  - ogre-builder-agent-0 (active)");
-                println!("  - ogre-reviewer-agent-0 (idle)");
+                let res = client
+                    .list_agents()
+                    .await
+                    .context("Failed to list agents")?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
             }
         },
     }
 
+    Ok(())
+}
+
+fn print_runs(res: &serde_json::Value) -> Result<()> {
+    use cli_table::{print_stdout, Cell, Style, Table};
+
+    // The list endpoint returns an opaque JSON document. Look for the most
+    // common shapes (`{ runs: [...] }`, `{ items: [...] }`, or a bare array).
+    let runs: Vec<&serde_json::Value> = if let Some(arr) = res.as_array() {
+        arr.iter().collect()
+    } else if let Some(arr) = res.get("runs").and_then(|v| v.as_array()) {
+        arr.iter().collect()
+    } else if let Some(arr) = res.get("items").and_then(|v| v.as_array()) {
+        arr.iter().collect()
+    } else {
+        // Unknown shape — fall back to pretty-printing the raw JSON.
+        println!("{}", serde_json::to_string_pretty(res)?);
+        return Ok(());
+    };
+
+    let mut rows = Vec::new();
+    for run in runs {
+        let id = run
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string();
+        let repo = run
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string();
+        let status = run
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string();
+        let trigger = run
+            .get("trigger")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string();
+        let actor = run
+            .get("actor")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string();
+        let created_at = run
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string();
+        rows.push(vec![
+            id.cell(),
+            repo.cell(),
+            status.cell(),
+            trigger.cell(),
+            actor.cell(),
+            created_at.cell(),
+        ]);
+    }
+
+    let table = rows.table().title(vec![
+        "Run ID".cell().bold(true),
+        "Repository".cell().bold(true),
+        "Status".cell().bold(true),
+        "Trigger".cell().bold(true),
+        "Actor".cell().bold(true),
+        "Created At".cell().bold(true),
+    ]);
+    print_stdout(table)?;
+
+    if let Some(cursor) = res
+        .get("next_cursor")
+        .and_then(|v| v.as_str())
+        .or_else(|| res.get("cursor").and_then(|v| v.as_str()))
+    {
+        println!("Next cursor: {}", cursor);
+    }
     Ok(())
 }

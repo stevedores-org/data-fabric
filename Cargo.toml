@@ -8,9 +8,7 @@ repository = "https://github.com/stevedores-org/data-fabric"
 description = "Cloudflare-native data fabric for autonomous AI agent builder orchestration"
 
 [workspace]
-members = ["xtask", "data-fabric-client", "dfctl"]
-
-
+members = ["xtask", "data-fabric-repo", "data-fabric-client", "dfctl"]
 
 [lib]
 crate-type = ["cdylib"]
@@ -27,6 +25,8 @@ getrandom = { version = "0.2", features = ["js"] }
 hex = "0.4"
 js-sys = "0.3"
 serde-wasm-bindgen = "0.6"
+percent-encoding = "2.3"
+url = "2"
 
 [profile.release]
 lto = true

@@ -4,6 +4,35 @@ use std::collections::{HashMap, HashSet};
 use wasm_bindgen::JsValue;
 use worker::*;
 
+// ── Tenant-scoped SQL constants ─────────────────────────────────────
+//
+// These statements are extracted as named constants so the
+// cross-tenant isolation tests (see `mod tests` at the bottom) can
+// assert their shape — specifically that every read and every write
+// against the WS8-protected tables binds `tenant_id` in the WHERE /
+// INSERT column list. The SQL text is authoritative for what runs
+// against D1; if a future edit removes `tenant_id` from one of these
+// statements the cross_tenant_sql_shape tests will fail.
+
+/// SELECT for `get_play_definition` — scoped by tenant_id then name.
+const SQL_GET_PLAY_DEFINITION: &str =
+    "SELECT name, goal, tasks_json FROM play_definitions \
+     WHERE tenant_id = ?1 AND name = ?2";
+
+/// INSERT for `create_policy_escalation` — tenant_id is the first column.
+const SQL_INSERT_POLICY_ESCALATION: &str =
+    "INSERT INTO policy_escalations (tenant_id, id, decision_id, action, actor, resource, risk_level, status, context, created_at)\n         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9)";
+
+/// INSERT/UPSERT for `check_and_increment_rate_limit` — tenant_id is the
+/// first column and is also embedded in the synthetic counter id.
+const SQL_UPSERT_RATE_LIMIT_COUNTER: &str =
+    "INSERT INTO policy_rate_limit_counters (\n            tenant_id, id, actor, action_class, window_start_epoch, window_seconds, count, updated_at\n         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)\n         ON CONFLICT(id) DO UPDATE SET\n            count = count + 1,\n            updated_at = excluded.updated_at";
+
+/// SELECT for the rate-limit count, also tenant-scoped.
+const SQL_SELECT_RATE_LIMIT_COUNT: &str =
+    "SELECT count FROM policy_rate_limit_counters \
+     WHERE tenant_id = ?1 AND id = ?2";
+
 pub fn now_iso() -> String {
     js_sys::Date::new_0().to_iso_string().as_string().unwrap()
 }
@@ -129,6 +158,7 @@ pub async fn heartbeat_task(
 
 pub async fn get_play_definition(
     db: &D1Database,
+    tenant_id: &str,
     name: &str,
 ) -> Result<Option<models::PlayDefinition>> {
     #[derive(serde::Deserialize)]
@@ -138,9 +168,13 @@ pub async fn get_play_definition(
         tasks_json: String,
     }
 
+    // Tenant-scoped lookup: a play named "foo" in tenant A is invisible
+    // to tenant B. Migration 0014_ws8_tenant_id_addendum.sql adds the
+    // `tenant_id` column and seeds the platform-default `sre-incident`
+    // play under `tenant_id = 'default'`.
     let row: Option<PlayRow> = db
-        .prepare("SELECT name, goal, tasks_json FROM play_definitions WHERE name = ?1")
-        .bind(&[JsValue::from_str(name)])?
+        .prepare(SQL_GET_PLAY_DEFINITION)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(name)])?
         .first(None)
         .await?;
 
@@ -188,15 +222,65 @@ pub async fn register_agent(
     Ok(())
 }
 
-pub async fn list_agents(db: &D1Database, tenant_id: &str) -> Result<Vec<models::Agent>> {
-    let result: D1Result = db
-        .prepare("SELECT * FROM agents WHERE tenant_id = ?1 AND status = 'active' ORDER BY name")
-        .bind(&[JsValue::from_str(tenant_id)])?
-        .all()
-        .await?;
+/// List active agents for `tenant_id` ordered by `(name ASC, id ASC)`.
+///
+/// Returns `(rows, next_cursor)`. Mirrors the `list_runs` pattern: we fetch
+/// `limit + 1` and drop the overflow row to detect the next page without a
+/// second query. The cursor predicate uses an OR of two terms
+/// (`name > ?` OR `name = ? AND id > ?`) rather than a row-value comparison
+/// because SQLite/D1 cannot index `(a, b) > (?, ?)` as a single sargable
+/// expression.
+pub async fn list_agents(
+    db: &D1Database,
+    tenant_id: &str,
+    limit: u32,
+    cursor: Option<&crate::pagination::AgentsCursor>,
+) -> Result<(Vec<models::Agent>, Option<crate::pagination::AgentsCursor>)> {
+    let fetch_limit = limit.saturating_add(1);
 
-    let rows: Vec<AgentRow> = result.results()?;
-    Ok(rows.into_iter().map(|r| r.into_agent()).collect())
+    let mut clauses: Vec<String> =
+        vec!["tenant_id = ?".into(), "status = 'active'".into()];
+    let mut bindings: Vec<JsValue> = vec![JsValue::from_str(tenant_id)];
+
+    if let Some(c) = cursor {
+        clauses.push("(name > ? OR (name = ? AND id > ?))".into());
+        bindings.push(JsValue::from_str(&c.name));
+        bindings.push(JsValue::from_str(&c.name));
+        bindings.push(JsValue::from_str(&c.id));
+    }
+    bindings.push(JsValue::from(fetch_limit));
+
+    let query = format!(
+        "SELECT * FROM agents WHERE {} ORDER BY name ASC, id ASC LIMIT ?",
+        clauses.join(" AND ")
+    );
+
+    let result: D1Result = db.prepare(&query).bind(&bindings)?.all().await?;
+    let mut rows: Vec<AgentRow> = result.results()?;
+
+    let next_cursor = compute_agents_next_cursor(&mut rows, limit);
+
+    Ok((
+        rows.into_iter().map(|r| r.into_agent()).collect(),
+        next_cursor,
+    ))
+}
+
+/// Pure helper: trims the overflow row and produces the cursor for the next
+/// page. Extracted from `list_agents` so it can be unit-tested without D1.
+pub(crate) fn compute_agents_next_cursor(
+    rows: &mut Vec<AgentRow>,
+    limit: u32,
+) -> Option<crate::pagination::AgentsCursor> {
+    if rows.len() as u32 > limit {
+        rows.truncate(limit as usize);
+        rows.last().map(|r| crate::pagination::AgentsCursor {
+            name: r.name.clone(),
+            id: r.id.clone(),
+        })
+    } else {
+        None
+    }
 }
 
 // ── Checkpoints ─────────────────────────────────────────────────
@@ -1351,6 +1435,7 @@ pub async fn record_policy_check_detailed(
 #[allow(clippy::too_many_arguments)]
 pub async fn create_policy_escalation(
     db: &D1Database,
+    tenant_id: &str,
     escalation_id: &str,
     decision_id: &str,
     action: &str,
@@ -1363,11 +1448,9 @@ pub async fn create_policy_escalation(
     let payload = context
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
         .unwrap_or_else(|| "{}".into());
-    db.prepare(
-        "INSERT INTO policy_escalations (id, decision_id, action, actor, resource, risk_level, status, context, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
-    )
+    db.prepare(SQL_INSERT_POLICY_ESCALATION)
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(escalation_id),
         JsValue::from_str(decision_id),
         JsValue::from_str(action),
@@ -1644,15 +1727,72 @@ async fn log_retrieval_query(
     Ok(())
 }
 
-pub async fn list_policy_rules(db: &D1Database, tenant_id: &str) -> Result<Vec<PolicyRuleRow>> {
-    let result: D1Result = db
-        .prepare(
-            "SELECT * FROM policy_rules WHERE tenant_id = ?1 ORDER BY priority DESC, created_at ASC",
-        )
-        .bind(&[JsValue::from_str(tenant_id)])?
-        .all()
-        .await?;
-    result.results()
+/// List policy rules for `tenant_id` ordered by
+/// `(priority DESC, created_at ASC, id ASC)`.
+///
+/// Returns `(rows, next_cursor)`. Mirrors the `list_runs` pattern: we fetch
+/// `limit + 1` and drop the overflow row to detect the next page. The cursor
+/// predicate is expressed as a three-level OR over `(priority, created_at, id)`
+/// because SQLite/D1 cannot index a row-value tuple comparison.
+pub async fn list_policy_rules(
+    db: &D1Database,
+    tenant_id: &str,
+    limit: u32,
+    cursor: Option<&crate::pagination::PolicyRulesCursor>,
+) -> Result<(Vec<PolicyRuleRow>, Option<crate::pagination::PolicyRulesCursor>)> {
+    let fetch_limit = limit.saturating_add(1);
+
+    let mut clauses: Vec<String> = vec!["tenant_id = ?".into()];
+    let mut bindings: Vec<JsValue> = vec![JsValue::from_str(tenant_id)];
+
+    if let Some(c) = cursor {
+        // Strict-after predicate on `(priority DESC, created_at ASC, id ASC)`:
+        //   priority < cursor.priority
+        //   OR (priority = cursor.priority AND created_at > cursor.created_at)
+        //   OR (priority = cursor.priority AND created_at = cursor.created_at AND id > cursor.id)
+        clauses.push(
+            "(priority < ? OR (priority = ? AND created_at > ?) OR (priority = ? AND created_at = ? AND id > ?))"
+                .into(),
+        );
+        bindings.push(JsValue::from(c.priority));
+        bindings.push(JsValue::from(c.priority));
+        bindings.push(JsValue::from_str(&c.created_at));
+        bindings.push(JsValue::from(c.priority));
+        bindings.push(JsValue::from_str(&c.created_at));
+        bindings.push(JsValue::from_str(&c.id));
+    }
+    bindings.push(JsValue::from(fetch_limit));
+
+    let query = format!(
+        "SELECT * FROM policy_rules WHERE {} ORDER BY priority DESC, created_at ASC, id ASC LIMIT ?",
+        clauses.join(" AND ")
+    );
+
+    let result: D1Result = db.prepare(&query).bind(&bindings)?.all().await?;
+    let mut rows: Vec<PolicyRuleRow> = result.results()?;
+
+    let next_cursor = compute_policy_rules_next_cursor(&mut rows, limit);
+
+    Ok((rows, next_cursor))
+}
+
+/// Pure helper: trims the overflow row and produces the cursor for the next
+/// page. Extracted from `list_policy_rules` so it can be unit-tested without
+/// D1.
+pub(crate) fn compute_policy_rules_next_cursor(
+    rows: &mut Vec<PolicyRuleRow>,
+    limit: u32,
+) -> Option<crate::pagination::PolicyRulesCursor> {
+    if rows.len() as u32 > limit {
+        rows.truncate(limit as usize);
+        rows.last().map(|r| crate::pagination::PolicyRulesCursor {
+            priority: r.priority,
+            created_at: r.created_at.clone(),
+            id: r.id.clone(),
+        })
+    } else {
+        None
+    }
 }
 
 pub async fn get_policy_rule(
@@ -2306,8 +2446,24 @@ fn random_hex_id() -> Result<String> {
     Ok(hex::encode(buf))
 }
 
+/// Compose the synthetic rate-limit counter id used as the SQLite
+/// PRIMARY KEY for `policy_rate_limit_counters`. Tenant_id is the first
+/// segment so two tenants sharing an actor name (e.g. "agent-1") cannot
+/// collide into a single counter row. Exposed at module scope so the
+/// cross-tenant SQL-shape tests can assert the format.
+fn rate_limit_counter_id(
+    tenant_id: &str,
+    actor: &str,
+    action_class: &str,
+    window_start: i64,
+    window_seconds: i64,
+) -> String {
+    format!("{tenant_id}|{actor}|{action_class}|{window_start}|{window_seconds}")
+}
+
 pub async fn check_and_increment_rate_limit(
     db: &D1Database,
+    tenant_id: &str,
     actor: &str,
     action_class: &str,
     window_seconds: i64,
@@ -2315,18 +2471,16 @@ pub async fn check_and_increment_rate_limit(
 ) -> Result<bool> {
     let now = js_sys::Date::now() as i64 / 1000;
     let window_start = now - (now % window_seconds.max(1));
-    let counter_id = format!("{actor}|{action_class}|{window_start}|{window_seconds}");
+    // Tenant_id is the first segment of the counter id so each tenant gets
+    // its own per-(actor, action_class, window) slot. Before this change
+    // two tenants sharing an actor name (e.g. "agent-1") collided into a
+    // single counter and one tenant could exhaust the other's quota.
+    let counter_id = rate_limit_counter_id(tenant_id, actor, action_class, window_start, window_seconds);
     let now_iso = now_iso();
 
-    db.prepare(
-        "INSERT INTO policy_rate_limit_counters (
-            id, actor, action_class, window_start_epoch, window_seconds, count, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
-         ON CONFLICT(id) DO UPDATE SET
-            count = count + 1,
-            updated_at = excluded.updated_at",
-    )
+    db.prepare(SQL_UPSERT_RATE_LIMIT_COUNTER)
     .bind(&[
+        JsValue::from_str(tenant_id),
         JsValue::from_str(&counter_id),
         JsValue::from_str(actor),
         JsValue::from_str(action_class),
@@ -2337,9 +2491,12 @@ pub async fn check_and_increment_rate_limit(
     .run()
     .await?;
 
+    // SELECT is also tenant-scoped as defense-in-depth: even though the
+    // counter_id already includes tenant_id, the WHERE clause makes the
+    // tenant boundary explicit and protects against id-shape regressions.
     let row: Option<RateCounterRow> = db
-        .prepare("SELECT count FROM policy_rate_limit_counters WHERE id = ?1")
-        .bind(&[JsValue::from_str(&counter_id)])?
+        .prepare(SQL_SELECT_RATE_LIMIT_COUNT)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(&counter_id)])?
         .first(None)
         .await?;
 
@@ -2488,6 +2645,8 @@ pub struct TaskRow {
     pub lease_expires_at: Option<String>,
     pub created_at: String,
     pub completed_at: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 impl TaskRow {
@@ -2510,6 +2669,7 @@ impl TaskRow {
             created_at: self.created_at,
             completed_at: self.completed_at,
             memory_context: None,
+            tenant_id: self.tenant_id,
         }
     }
 }
@@ -3686,6 +3846,128 @@ mod tests {
         assert_eq!(parsed["tool_call_id"], "tool-call-7");
     }
 
+    // ── Cross-tenant SQL shape (WS8 isolation) ──────────────────
+    //
+    // These tests are the unit-level companion to the multi-tenant
+    // isolation PR. They cannot run against a live D1 from `cargo test`
+    // (the worker crate is wasm-only at runtime), so instead they lock
+    // in the *shape* of each tenant-sensitive SQL statement. If a
+    // future edit drops `tenant_id` from a WHERE clause or column list,
+    // the assertions below will fail — surfacing the regression at
+    // PR-review time rather than as a cross-tenant data leak in prod.
+    //
+    // Each test covers one of the CONFIRMED crr findings (see PR body):
+    //   • get_play_definition          → src/db.rs:130 / src/lib.rs:449
+    //   • create_policy_escalation     → src/db.rs:1352
+    //   • check_and_increment_rate_limit → src/db.rs:2309
+    // and the synthetic counter_id construction that backs uniqueness
+    // for the rate-limit counter.
+
+    #[test]
+    fn cross_tenant_sql_get_play_definition_filters_on_tenant_id() {
+        // The SELECT must include `tenant_id = ?1` in the WHERE clause.
+        // Without it, tenant B could fetch a play definition registered
+        // by tenant A and launch it.
+        let sql = SQL_GET_PLAY_DEFINITION;
+        assert!(
+            sql.contains("WHERE tenant_id = ?1 AND name = ?2"),
+            "get_play_definition SQL must filter by tenant_id and name; got: {sql}",
+        );
+        assert!(
+            sql.contains("FROM play_definitions"),
+            "get_play_definition SQL must target play_definitions; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_sql_create_policy_escalation_writes_tenant_id() {
+        // The INSERT must include `tenant_id` in the column list and
+        // bind it as the first parameter so a write performed under
+        // tenant A's request context is not visible to tenant B's
+        // tenant-scoped queries.
+        let sql = SQL_INSERT_POLICY_ESCALATION;
+        assert!(
+            sql.contains("INTO policy_escalations"),
+            "create_policy_escalation SQL must target policy_escalations; got: {sql}",
+        );
+        // First column in the INSERT list must be tenant_id, bound to ?1.
+        let col_list_start = sql
+            .find("policy_escalations (")
+            .expect("expected column list");
+        let col_list_tail = &sql[col_list_start..];
+        assert!(
+            col_list_tail.starts_with("policy_escalations (tenant_id,"),
+            "tenant_id must be the first column of the INSERT list; got: {col_list_tail}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_sql_rate_limit_writes_and_reads_tenant_id() {
+        let upsert = SQL_UPSERT_RATE_LIMIT_COUNTER;
+        let select = SQL_SELECT_RATE_LIMIT_COUNT;
+        assert!(
+            upsert.contains("policy_rate_limit_counters"),
+            "rate-limit upsert SQL must target policy_rate_limit_counters; got: {upsert}",
+        );
+        // tenant_id must be the first column of the insert list.
+        let col_list_start = upsert
+            .find("policy_rate_limit_counters (")
+            .expect("expected column list");
+        let col_list_tail = &upsert[col_list_start..];
+        assert!(
+            col_list_tail
+                .lines()
+                .next()
+                .map(|l| l.contains("policy_rate_limit_counters ("))
+                .unwrap_or(false),
+            "expected column list on first line; got: {col_list_tail}",
+        );
+        // Column-list content must contain tenant_id as the first entry.
+        assert!(
+            upsert.contains("tenant_id, id, actor, action_class"),
+            "tenant_id must be the first column in the rate-limit INSERT list; got: {upsert}",
+        );
+        // SELECT must filter by tenant_id.
+        assert!(
+            select.contains("WHERE tenant_id = ?1 AND id = ?2"),
+            "rate-limit SELECT must filter by tenant_id and id; got: {select}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_rate_limit_counter_id_includes_tenant_id() {
+        // The synthetic counter id is the SQLite PRIMARY KEY for the
+        // rate-limit table; if two tenants generated the same id, they
+        // would share a counter row and one tenant's quota would impact
+        // the other. The PR asserts tenant_id is the leading segment.
+        let alpha = rate_limit_counter_id("alpha", "agent-1", "read", 1_700_000_000, 60);
+        let beta = rate_limit_counter_id("beta", "agent-1", "read", 1_700_000_000, 60);
+        assert_ne!(
+            alpha, beta,
+            "tenants alpha and beta must produce distinct counter ids \
+             for the same actor/action_class/window",
+        );
+        assert!(
+            alpha.starts_with("alpha|"),
+            "tenant_id must be the leading segment of the counter id; got: {alpha}",
+        );
+        assert!(
+            beta.starts_with("beta|"),
+            "tenant_id must be the leading segment of the counter id; got: {beta}",
+        );
+        // Exact shape — `{tenant_id}|{actor}|{action_class}|{window_start}|{window_seconds}`.
+        assert_eq!(alpha, "alpha|agent-1|read|1700000000|60");
+    }
+
+    #[test]
+    fn cross_tenant_rate_limit_counter_id_distinguishes_tenants_on_window_boundary() {
+        // Belt-and-suspenders: same actor, same action_class, same
+        // window — only tenant_id differs. The ids must differ.
+        let a = rate_limit_counter_id("tenant-alpha", "shared-actor", "write", 0, 60);
+        let b = rate_limit_counter_id("tenant-beta", "shared-actor", "write", 0, 60);
+        assert_ne!(a, b);
+    }
+
     #[test]
     fn build_entity_refs_returns_none_when_no_supported_refs() {
         let evt = models::GraphEvent {
@@ -3698,5 +3980,111 @@ mod tests {
         };
 
         assert!(build_entity_refs(&evt).is_none());
+    }
+
+    // ── Pagination helpers: list_policy_rules / list_agents ─────
+
+    fn agent_row(id: &str, name: &str) -> AgentRow {
+        AgentRow {
+            id: id.into(),
+            name: name.into(),
+            capabilities: "[]".into(),
+            endpoint: None,
+            last_heartbeat: None,
+            status: "active".into(),
+            metadata: None,
+        }
+    }
+
+    fn policy_row(id: &str, priority: i32, created_at: &str) -> PolicyRuleRow {
+        PolicyRuleRow {
+            id: id.into(),
+            name: format!("rule-{id}"),
+            action_pattern: "*".into(),
+            resource_pattern: "*".into(),
+            actor_pattern: "*".into(),
+            risk_level: "read".into(),
+            verdict: "allow".into(),
+            reason: "test".into(),
+            priority,
+            enabled: 1,
+            created_at: created_at.into(),
+            updated_at: created_at.into(),
+        }
+    }
+
+    #[test]
+    fn list_agents_helper_returns_no_cursor_when_results_under_limit() {
+        let mut rows = vec![agent_row("a1", "alpha"), agent_row("a2", "beta")];
+        let cursor = compute_agents_next_cursor(&mut rows, 5);
+        assert!(cursor.is_none());
+        assert_eq!(rows.len(), 2, "rows preserved when under limit");
+    }
+
+    #[test]
+    fn list_agents_helper_returns_no_cursor_when_results_exactly_at_limit() {
+        // Exactly `limit` rows means no overflow row was fetched -> no next.
+        let mut rows = vec![agent_row("a1", "alpha"), agent_row("a2", "beta")];
+        let cursor = compute_agents_next_cursor(&mut rows, 2);
+        assert!(cursor.is_none());
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn list_agents_helper_trims_overflow_and_returns_cursor() {
+        // limit=2 with 3 rows: the third is the overflow probe; should be
+        // dropped, and the cursor is built from the last *returned* row.
+        let mut rows = vec![
+            agent_row("a1", "alpha"),
+            agent_row("a2", "beta"),
+            agent_row("a3", "gamma"),
+        ];
+        let cursor = compute_agents_next_cursor(&mut rows, 2).expect("cursor");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(cursor.name, "beta");
+        assert_eq!(cursor.id, "a2");
+    }
+
+    #[test]
+    fn list_policy_rules_helper_returns_no_cursor_when_results_under_limit() {
+        let mut rows = vec![
+            policy_row("r1", 100, "2026-01-01T00:00:00Z"),
+            policy_row("r2", 50, "2026-01-02T00:00:00Z"),
+        ];
+        let cursor = compute_policy_rules_next_cursor(&mut rows, 5);
+        assert!(cursor.is_none());
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn list_policy_rules_helper_trims_overflow_and_returns_cursor() {
+        let mut rows = vec![
+            policy_row("r1", 100, "2026-01-01T00:00:00Z"),
+            policy_row("r2", 50, "2026-01-02T00:00:00Z"),
+            policy_row("r3", 25, "2026-01-03T00:00:00Z"),
+        ];
+        let cursor = compute_policy_rules_next_cursor(&mut rows, 2).expect("cursor");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(cursor.priority, 50);
+        assert_eq!(cursor.created_at, "2026-01-02T00:00:00Z");
+        assert_eq!(cursor.id, "r2");
+    }
+
+    #[test]
+    fn list_policy_rules_helper_preserves_order_after_truncation() {
+        // The returned rows must remain in caller-visible order; truncation
+        // removes the overflow probe from the *end*, not from the middle.
+        let mut rows = vec![
+            policy_row("r1", 100, "2026-01-01T00:00:00Z"),
+            policy_row("r2", 100, "2026-01-02T00:00:00Z"),
+            policy_row("r3", 50, "2026-01-03T00:00:00Z"),
+        ];
+        let cursor = compute_policy_rules_next_cursor(&mut rows, 2).expect("cursor");
+        assert_eq!(rows[0].id, "r1");
+        assert_eq!(rows[1].id, "r2");
+        // Cursor reflects the last *returned* row, breaking the priority tie
+        // on (created_at, id).
+        assert_eq!(cursor.priority, 100);
+        assert_eq!(cursor.id, "r2");
     }
 }

@@ -6,11 +6,11 @@
 
 1. Sync often:
 ```bash
-git checkout main
+git checkout develop
 git pull --ff-only
 ```
 
-2. Create a focused branch:
+2. Create a focused branch off **`develop`**:
 ```bash
 git checkout -b feat/<short-topic>
 ```
@@ -20,18 +20,18 @@ git checkout -b feat/<short-topic>
 4. Re-sync before push:
 ```bash
 git fetch origin
-git rebase origin/main
+git rebase origin/develop
 ```
 
-5. Push and open a PR:
+5. Push and open a PR **against `develop`** (never `main` for feature/fix work):
 ```bash
 git push -u origin feat/<short-topic>
-gh pr create --base main --head feat/<short-topic>
+gh pr create --base develop --head feat/<short-topic>
 ```
 
 ## Team Norms
 
-- Open PRs often, even for small increments.
+- **All PRs target `develop`.** `main` is production; merges to `main` happen via release promotion, not direct feature PRs.
 - Prefer multiple small PRs over large batches.
 - Pull (`git pull --ff-only`) frequently to avoid drift.
 - Keep PRs single-purpose with clear scope and evidence.
