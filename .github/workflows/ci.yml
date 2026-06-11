@@ -11,6 +11,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  dfctl-check:
+    # The host-target `dfctl` binary is not covered by `local-ci`, whose
+    # `check`/`clippy` stages run against `wasm32-unknown-unknown` for the
+    # Worker. This job guards against host-only regressions in dfctl such as
+    # calling client APIs that don't exist (see PR #132, where dfctl shipped
+    # against a fictional `DataFabricClient` surface and the wasm-only `check`
+    # stage silently ignored it).
+    name: dfctl-check (host target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: cargo check -p dfctl
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo check -p dfctl --locked
+
+      - name: cargo check -p dfctl --tests
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo check -p dfctl --tests --locked
+
+      - name: cargo clippy -p dfctl
+        run: cargo clippy -p dfctl --locked -- -D warnings
+
   local-ci:
     name: local-ci (fmt, clippy, check, test)
     runs-on: ubuntu-latest
