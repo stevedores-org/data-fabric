@@ -2085,12 +2085,16 @@ async fn ingest_events_bronze_silver(
 /// handler. Pure so the routing rule is unit-testable without a wasm runtime.
 #[derive(Debug, PartialEq, Eq)]
 enum DoForwardAction {
-    /// 2xx — handler should proceed with its normal success path.
+    /// 2xx or 3xx — handler should proceed with its normal success path.
+    /// 3xx is included so a future DO update that emits a redirect isn't
+    /// surfaced as a synthetic gateway error.
     Success,
-    /// Non-2xx — handler should mirror this status back to the client. For
-    /// 429 the DO's `retry-after` header is preserved (defaulting to
-    /// `DEFAULT_DO_RETRY_AFTER_SECS` when absent), so the backpressure
-    /// contract surfaces end-to-end.
+    /// 4xx/5xx — handler should mirror this status back to the client.
+    /// For 429 the DO's `retry-after` is preserved through
+    /// [`sanitize_retry_after`] (defaulting to
+    /// `DEFAULT_DO_RETRY_AFTER_SECS` when absent or malformed) so the
+    /// backpressure contract surfaces end-to-end. For other non-2xx/3xx
+    /// statuses the header is only forwarded when syntactically valid.
     Forward {
         status: u16,
         retry_after: Option<String>,
@@ -2102,20 +2106,92 @@ enum DoForwardAction {
 /// so a missing header doesn't downgrade the client-visible contract.
 const DEFAULT_DO_RETRY_AFTER_SECS: u32 = 30;
 
+/// Validate a `retry-after` header value per RFC 7231 §7.1.3 and return a
+/// non-negative integer delta-seconds value. Accepts either:
+///   * a non-negative integer (delta-seconds form), or
+///   * an HTTP-date (IMF-fixdate / RFC 850 / asctime per RFC 7231 §7.1.1.1).
+///
+/// Garbage (or absent) input falls back to [`DEFAULT_DO_RETRY_AFTER_SECS`] so
+/// we never forward an invalid header to the client. The output is always
+/// expressed in seconds — for the HTTP-date form we use the default rather
+/// than parsing the timestamp (we lack a date dep and the DO contract is
+/// to emit delta-seconds), but we still accept the date form as syntactically
+/// valid so a conformant peer is not rejected.
+fn sanitize_retry_after(raw: Option<&str>) -> u32 {
+    let Some(value) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_DO_RETRY_AFTER_SECS;
+    };
+    if let Ok(secs) = value.parse::<u32>() {
+        return secs;
+    }
+    if looks_like_http_date(value) {
+        // Accept as valid per RFC 7231, but normalise to the default
+        // because we don't carry a date-parsing dep in the worker.
+        return DEFAULT_DO_RETRY_AFTER_SECS;
+    }
+    DEFAULT_DO_RETRY_AFTER_SECS
+}
+
+/// Cheap structural check for an RFC 7231 §7.1.1.1 HTTP-date. Recognises
+/// the three permitted forms by their leading weekday token plus a
+/// trailing time component (HH:MM:SS). Intentionally tolerant — the goal
+/// is to distinguish well-formed HTTP-date strings from garbage, not to
+/// fully parse the timestamp.
+fn looks_like_http_date(s: &str) -> bool {
+    const WEEKDAYS_SHORT: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const WEEKDAYS_LONG: [&str; 7] = [
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    ];
+    // Length sanity — shortest legal form (asctime: "Sun Nov  6 08:49:37 1994") is 24 chars;
+    // longest legal form (RFC 850 with "Wednesday") is around 33 chars. Allow some slack.
+    if s.len() < 20 || s.len() > 40 {
+        return false;
+    }
+    let starts_with_weekday = WEEKDAYS_SHORT
+        .iter()
+        .chain(WEEKDAYS_LONG.iter())
+        .any(|wd| s.starts_with(wd));
+    if !starts_with_weekday {
+        return false;
+    }
+    // Must contain a time-of-day "HH:MM:SS" — two colons separating digits.
+    let colon_count = s.bytes().filter(|&b| b == b':').count();
+    colon_count == 2
+}
+
 /// Classify a DO response status + retry-after header into a forward action.
 /// Pure: takes primitives so it's testable without a JS runtime.
+///
+/// The success range is `(200..400)` rather than `(200..300)` so that any
+/// 3xx redirect emitted by a (future) DO update is treated as a normal
+/// pass-through. Gateways shouldn't surface a downstream redirect as an
+/// error, and DOs in this worker don't intentionally redirect today.
+///
+/// Any `retry-after` header on a forwarded (non-2xx, non-3xx) response is
+/// sanitised through [`sanitize_retry_after`] so a malformed value from
+/// the DO can't propagate to clients.
 fn classify_do_response(status: u16, retry_after_header: Option<&str>) -> DoForwardAction {
-    if (200..300).contains(&status) {
+    if (200..400).contains(&status) {
         DoForwardAction::Success
     } else {
         let retry_after = if status == 429 {
-            Some(
-                retry_after_header
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| DEFAULT_DO_RETRY_AFTER_SECS.to_string()),
-            )
+            // 429 always carries a retry-after — synthesize the default
+            // when the DO omitted (or garbled) the header.
+            Some(sanitize_retry_after(retry_after_header).to_string())
         } else {
-            retry_after_header.map(|s| s.to_string())
+            // Other 4xx/5xx: only forward retry-after if the DO actually
+            // provided a syntactically valid value. We don't synthesize a
+            // default outside the 429 backpressure contract.
+            retry_after_header.and_then(|raw| {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else if trimmed.parse::<u32>().is_ok() || looks_like_http_date(trimmed) {
+                    Some(trimmed.to_string())
+                } else {
+                    None
+                }
+            })
         };
         DoForwardAction::Forward { status, retry_after }
     }
@@ -2220,7 +2296,8 @@ fn build_trace_response_metadata(
 mod tests {
     use super::{
         build_trace_response_metadata, classify_do_response, parse_limit_query,
-        parse_limit_query_with_valid_presence, DoForwardAction, DEFAULT_DO_RETRY_AFTER_SECS,
+        parse_limit_query_with_valid_presence, sanitize_retry_after, DoForwardAction,
+        DEFAULT_DO_RETRY_AFTER_SECS,
     };
     use worker::Url;
 
@@ -2315,6 +2392,111 @@ mod tests {
         // doesn't downgrade the contract.
         assert_eq!(DEFAULT_DO_RETRY_AFTER_SECS, 30);
         assert_eq!(DEFAULT_DO_RETRY_AFTER_SECS, super::task_do::ENQUEUE_RETRY_AFTER_SECS);
+    }
+
+    #[test]
+    fn classify_do_response_passes_through_3xx() {
+        // 3xx redirect codes are not errors and must not be forwarded
+        // through the error-mirroring path. DOs in this worker don't
+        // intentionally redirect today, but a future update that does
+        // shouldn't surface as a synthetic worker error.
+        for status in [300u16, 301, 302, 303, 304, 307, 308, 399] {
+            assert_eq!(
+                classify_do_response(status, None),
+                DoForwardAction::Success,
+                "status {status} should pass through as Success",
+            );
+        }
+        // Even with a retry-after header set, 3xx still passes through:
+        // the redirect semantics take precedence over backpressure.
+        assert_eq!(
+            classify_do_response(302, Some("5")),
+            DoForwardAction::Success,
+        );
+    }
+
+    #[test]
+    fn sanitize_retry_after_rejects_garbage() {
+        // Numeric delta-seconds — accepted verbatim.
+        assert_eq!(sanitize_retry_after(Some("0")), 0);
+        assert_eq!(sanitize_retry_after(Some("30")), 30);
+        assert_eq!(sanitize_retry_after(Some("3600")), 3600);
+        // Leading/trailing whitespace is normalised.
+        assert_eq!(sanitize_retry_after(Some("  42  ")), 42);
+
+        // HTTP-date forms (RFC 7231 §7.1.1.1) — accepted as syntactically
+        // valid; normalised to the default because we don't carry a date
+        // dep. The point is they are NOT treated as garbage.
+        assert_eq!(
+            sanitize_retry_after(Some("Sun, 06 Nov 1994 08:49:37 GMT")),
+            DEFAULT_DO_RETRY_AFTER_SECS,
+        );
+        assert_eq!(
+            sanitize_retry_after(Some("Sunday, 06-Nov-94 08:49:37 GMT")),
+            DEFAULT_DO_RETRY_AFTER_SECS,
+        );
+
+        // Garbage — falls back to default rather than forwarding to client.
+        for garbage in [
+            "",                              // empty
+            "   ",                           // whitespace-only
+            "soon",                          // arbitrary token
+            "-5",                            // negative (rejected by u32 parse)
+            "30.5",                          // fractional
+            "30s",                           // unit-suffixed
+            "9999999999",                    // overflows u32
+            "0x1e",                          // hex
+            "\u{0007}garbage\u{0007}",       // control chars
+            "Notaday, 06 Nov 1994 08:49:37", // bogus weekday
+            "Sun 06 Nov 1994",               // missing time component
+        ] {
+            assert_eq!(
+                sanitize_retry_after(Some(garbage)),
+                DEFAULT_DO_RETRY_AFTER_SECS,
+                "garbage value {garbage:?} should fall back to default",
+            );
+        }
+
+        // Absent header — falls back to default.
+        assert_eq!(
+            sanitize_retry_after(None),
+            DEFAULT_DO_RETRY_AFTER_SECS,
+        );
+    }
+
+    #[test]
+    fn classify_do_response_drops_garbage_retry_after_on_non_429() {
+        // Non-429 errors must not propagate a malformed retry-after value
+        // to the client. We drop the header rather than synthesizing a
+        // default (which only applies to the 429 backpressure contract).
+        assert_eq!(
+            classify_do_response(503, Some("not-a-number")),
+            DoForwardAction::Forward {
+                status: 503,
+                retry_after: None,
+            },
+        );
+        // Valid integer is preserved as-is.
+        assert_eq!(
+            classify_do_response(503, Some("60")),
+            DoForwardAction::Forward {
+                status: 503,
+                retry_after: Some("60".to_string()),
+            },
+        );
+    }
+
+    #[test]
+    fn classify_do_response_sanitizes_garbage_retry_after_on_429() {
+        // 429 with a garbage retry-after must be replaced with the default
+        // — the client must never see invalid header content.
+        assert_eq!(
+            classify_do_response(429, Some("forever")),
+            DoForwardAction::Forward {
+                status: 429,
+                retry_after: Some(DEFAULT_DO_RETRY_AFTER_SECS.to_string()),
+            },
+        );
     }
 
     #[test]
