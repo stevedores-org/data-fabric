@@ -743,7 +743,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 status: "pending".into(),
             })
         })
-        .get_async("/mcp/task/next", |req, ctx| async move {
+        // POST /mcp/task/next — claims the next pending task for an agent.
+        // This is a state-mutating, non-idempotent operation, so POST is the correct
+        // HTTP method. Caching proxies must not cache a "claimed" state, and retry
+        // middleware that auto-retries idempotent verbs must not double-claim.
+        .post_async("/mcp/task/next", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let url = req.url()?;
             let params: std::collections::HashMap<String, String> = url
@@ -759,7 +763,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
             let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
-            
+
             let do_url = format!("https://do/claim?agent_id={}&caps={}", agent_id, caps);
             let do_req = Request::new(&do_url, Method::Post)?;
             let mut do_resp = stub.fetch_with_request(do_req).await?;
@@ -770,7 +774,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 
             let mut task: models::AgentTask = do_resp.json().await?;
-            
+
             // Sync to D1 (best effort)
             let d1 = ctx.env.d1("DB")?;
             let _ = db::sync_task_status(&d1, &tenant_ctx.tenant_id, &task).await;
@@ -788,6 +792,37 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 task.memory_context = memory_context;
             }
             Response::from_json(&task)
+        })
+        // DEPRECATED: GET /mcp/task/next was the original (incorrect) shape of this
+        // endpoint. It is being kept for one release as a compatibility shim that
+        // returns 405 Method Not Allowed with `Allow: POST` and a `Deprecation`
+        // header so legacy clients get an immediate, actionable failure rather than
+        // silently double-claiming tasks through retry middleware.
+        //
+        // 405 was chosen over 308 Permanent Redirect because RFC 9110 308 preserves
+        // the original request method — a GET-redirected-to-the-same-URL client
+        // would loop, not switch to POST. 405 is the correct semantic for
+        // "wrong method, use this one instead".
+        //
+        // Removal target: next minor release after clients in
+        // data-fabric-client (and any other in-tree consumers) are upgraded.
+        .get_async("/mcp/task/next", |_req, _ctx| async move {
+            worker::console_log!(
+                "WARN: deprecated GET /mcp/task/next called; clients must migrate to POST. \
+                 GET will be removed in the next minor release."
+            );
+            let headers = Headers::new();
+            headers.set("allow", "POST")?;
+            headers.set("deprecation", "true")?;
+            headers.set(
+                "sunset",
+                "GET /mcp/task/next is deprecated; use POST /mcp/task/next",
+            )?;
+            Ok(Response::error(
+                "Method Not Allowed: GET /mcp/task/next is deprecated; use POST /mcp/task/next",
+                405,
+            )?
+            .with_headers(headers))
         })
         .post_async("/mcp/task/:id/heartbeat", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
