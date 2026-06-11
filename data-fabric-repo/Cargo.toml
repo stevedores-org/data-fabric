@@ -1,0 +1,26 @@
+[package]
+name = "data-fabric-repo"
+version = "0.1.0"
+edition = "2021"
+authors = ["Stevedores Org"]
+license = "Apache-2.0"
+repository = "https://github.com/stevedores-org/data-fabric"
+description = "Shared D1/R2 repository abstraction, typed error taxonomy, and retry policy for the data-fabric worker (WS1B / issue #53)."
+
+# This crate is a library used inside the Workers wasm runtime. It must
+# compile to `wasm32-unknown-unknown` and must not pull in std-net/native
+# random sources. See `src/retry.rs` for the rand-free jitter rationale.
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# Same major.minor as the root worker crate so types line up across the
+# workspace. `d1` enables the `D1Database` type used by `D1Repository`.
+worker = { version = "0.8.1", features = ["d1"] }
+async-trait = "0.1"
+thiserror = "1"
+
+[dev-dependencies]
+# Unit tests for status-code mapping, retry attempt counting, and backoff
+# bounds are pure-Rust and don't need wasm. They run on the host target via
+# `cargo test -p data-fabric-repo`.

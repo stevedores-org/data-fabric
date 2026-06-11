@@ -8,9 +8,7 @@ repository = "https://github.com/stevedores-org/data-fabric"
 description = "Cloudflare-native data fabric for autonomous AI agent builder orchestration"
 
 [workspace]
-members = ["xtask", "data-fabric-client", "dfctl"]
-
-
+members = ["xtask", "data-fabric-repo", "data-fabric-client", "dfctl"]
 
 [lib]
 crate-type = ["cdylib"]
