@@ -427,3 +427,29 @@ pub struct GraphEventAck {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<f64>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunsResponse {
+    pub runs: Vec<serde_json::Value>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TraceEvent {
+    pub id: String,
+    pub run_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub event_type: String,
+    pub node_id: Option<String>,
+    pub actor: Option<String>,
+    pub payload: Option<serde_json::Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TraceResponse {
+    pub run_id: String,
+    pub events: Vec<TraceEvent>,
+    pub total: Option<u64>,
+    pub truncated: Option<bool>,
+}

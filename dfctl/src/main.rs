@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use data_fabric_client::{CreateRunRequest, DataFabricClient, PolicyCheckRequest};
+use data_fabric_client::{ClientConfig, CreateRunRequest, DataFabricClient, PolicyCheckRequest};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -71,9 +71,7 @@ enum RunCommands {
         actor: Option<String>,
     },
     /// Inspect traces for a run
-    Inspect {
-        run_id: String,
-    },
+    Inspect { run_id: String },
 }
 
 #[derive(Subcommand)]
@@ -85,13 +83,9 @@ enum CheckpointCommands {
         state_file: PathBuf,
     },
     /// Get details of a checkpoint
-    Get {
-        id: String,
-    },
+    Get { id: String },
     /// Delete a checkpoint
-    Delete {
-        id: String,
-    },
+    Delete { id: String },
 }
 
 #[derive(Subcommand)]
@@ -118,7 +112,15 @@ enum AgentCommands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = DataFabricClient::new(&cli.url, &cli.tenant_id, cli.token.as_deref());
+    let role = cli.token.clone().unwrap_or_else(|| "builder".to_string());
+    let config = ClientConfig {
+        base_url: cli.url.clone(),
+        tenant_id: cli.tenant_id.clone(),
+        tenant_role: role,
+        cf_client_id: std::env::var("CF_ACCESS_CLIENT_ID").ok(),
+        cf_client_secret: std::env::var("CF_ACCESS_CLIENT_SECRET").ok(),
+    };
+    let client = DataFabricClient::new(config);
 
     match cli.command {
         Commands::Health => {
@@ -128,18 +130,48 @@ async fn main() -> Result<()> {
             println!("Mission: {}", res.mission);
         }
         Commands::Runs { cmd } => match cmd {
-            RunCommands::List { repo, limit, cursor } => {
-                let res = client.list_runs(repo.as_deref(), Some(limit), cursor.as_deref()).await?;
+            RunCommands::List {
+                repo,
+                limit,
+                cursor,
+            } => {
+                let res = client
+                    .list_runs(repo.as_deref(), Some(limit), cursor.as_deref())
+                    .await?;
                 println!("--- Runs List ---");
-                use cli_table::{Cell, Style, Table, print_stdout};
+                use cli_table::{print_stdout, Cell, Style, Table};
                 let mut rows = Vec::new();
                 for run in res.runs {
-                    let id = run.get("id").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-                    let repo = run.get("repo").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-                    let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-                    let trigger = run.get("trigger").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-                    let actor = run.get("actor").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-                    let created_at = run.get("created_at").and_then(|v| v.as_str()).unwrap_or("-").to_string();
+                    let id = run
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("-")
+                        .to_string();
+                    let repo = run
+                        .get("repo")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("-")
+                        .to_string();
+                    let status = run
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("-")
+                        .to_string();
+                    let trigger = run
+                        .get("trigger")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("-")
+                        .to_string();
+                    let actor = run
+                        .get("actor")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("-")
+                        .to_string();
+                    let created_at = run
+                        .get("created_at")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("-")
+                        .to_string();
                     rows.push(vec![
                         id.cell(),
                         repo.cell(),
@@ -162,7 +194,11 @@ async fn main() -> Result<()> {
                     println!("Next cursor: {}", c);
                 }
             }
-            RunCommands::Create { repo, trigger, actor } => {
+            RunCommands::Create {
+                repo,
+                trigger,
+                actor,
+            } => {
                 let req = CreateRunRequest {
                     repo,
                     trigger,
@@ -181,8 +217,8 @@ async fn main() -> Result<()> {
                 if let Some(total) = trace.total {
                     println!("Total trace events: {}", total);
                 }
-                
-                use cli_table::{Cell, Style, Table, print_stdout};
+
+                use cli_table::{print_stdout, Cell, Style, Table};
                 let mut rows = Vec::new();
                 for event in trace.events {
                     let payload_str = match event.payload {
@@ -216,10 +252,10 @@ async fn main() -> Result<()> {
         },
         Commands::Checkpoints { cmd } => match cmd {
             CheckpointCommands::Save { run_id, state_file } => {
-                let content = std::fs::read_to_string(&state_file)
-                    .context("Failed to read state file")?;
-                let state: serde_json::Value = serde_json::from_str(&content)
-                    .context("Invalid JSON in state file")?;
+                let content =
+                    std::fs::read_to_string(&state_file).context("Failed to read state file")?;
+                let state: serde_json::Value =
+                    serde_json::from_str(&content).context("Invalid JSON in state file")?;
                 let res = client.save_checkpoint(&run_id, state, None).await?;
                 println!("Checkpoint saved successfully!");
                 println!("{}", serde_json::to_string_pretty(&res)?);
@@ -234,7 +270,12 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Policy { cmd } => match cmd {
-            PolicyCommands::Check { action, actor, resource, run_id } => {
+            PolicyCommands::Check {
+                action,
+                actor,
+                resource,
+                run_id,
+            } => {
                 let req = PolicyCheckRequest {
                     action,
                     actor,
