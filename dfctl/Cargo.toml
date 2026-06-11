@@ -1,0 +1,16 @@
+[package]
+name = "dfctl"
+version = "0.1.0"
+edition = "2021"
+authors = ["Stevedores Org"]
+license = "Apache-2.0"
+description = "Command-line control interface for Stevedores Data Fabric"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive", "env"] }
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+data-fabric-client = { path = "../data-fabric-client" }
+cli-table = "0.4"

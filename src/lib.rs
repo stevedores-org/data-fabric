@@ -17,9 +17,11 @@ mod tenant;
 #[allow(dead_code)]
 mod tenant_security;
 mod verification;
+mod openapi;
 
 pub use task_do::TaskLeaseManager;
 pub use thread_do::ThreadManager;
+
 pub use play_do::PlayManager;
 
 #[derive(Serialize)]
@@ -32,7 +34,7 @@ struct HealthResponse<'a> {
 const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 
 fn is_public_path(path: &str) -> bool {
-    path == "/" || path == "/health"
+    path == "/" || path == "/health" || path == "/openapi.json" || path == "/docs"
 }
 
 fn request_path(req: &Request) -> Result<String> {
@@ -124,6 +126,35 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 status: "ok",
                 mission: "velocity-for-autonomous-agent-builders",
             })
+        })
+        .get("/openapi.json", |_, _| {
+            let mut headers = Headers::new();
+            headers.set("content-type", "application/json")?;
+            headers.set("access-control-allow-origin", "*")?;
+            Ok(Response::ok(openapi::get_openapi_spec())?.with_headers(headers))
+        })
+        .get("/docs", |_, _| {
+            let html = r#"<!DOCTYPE html>
+<html>
+  <head>
+    <title>Data Fabric API Documentation</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <script
+      id="api-reference"
+      data-url="/openapi.json"
+    ></script>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+  </body>
+</html>"#;
+            Response::from_html(html)
         })
         // ── Tenants (WS8) ─────────────────────────────────────
         .post_async("/v1/tenants/provision", |mut req, ctx| async move {
