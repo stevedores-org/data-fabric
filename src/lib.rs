@@ -4,14 +4,25 @@ use worker::*;
 mod db;
 mod errors;
 mod integrations;
+mod metrics;
 mod models;
 mod pagination;
 mod policy;
 mod storage;
+mod task_do;
+mod thread_do;
+mod play_do;
+mod vector_index;
 mod tenant;
 #[allow(dead_code)]
 mod tenant_security;
 mod verification;
+mod openapi;
+
+pub use task_do::TaskLeaseManager;
+pub use thread_do::ThreadManager;
+
+pub use play_do::PlayManager;
 
 #[derive(Serialize)]
 struct HealthResponse<'a> {
@@ -23,7 +34,7 @@ struct HealthResponse<'a> {
 const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 
 fn is_public_path(path: &str) -> bool {
-    path == "/" || path == "/health"
+    path == "/" || path == "/health" || path == "/openapi.json" || path == "/docs"
 }
 
 fn request_path(req: &Request) -> Result<String> {
@@ -78,8 +89,11 @@ async fn augment_task_with_memory(
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
+    let start_ms = js_sys::Date::now();
 
     let path = request_path(&req)?;
+    let method = req.method();
+    let mut tenant_id_for_metric: Option<String> = None;
     if !is_public_path(&path) {
         let tenant_ctx = match tenant::tenant_from_request(&req) {
             Ok(ctx) => ctx,
@@ -88,11 +102,22 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         if tenant::authorize(&tenant_ctx, req.method(), &path).is_err() {
             return Response::error("forbidden by tenant role policy", 403);
         }
+        tenant_id_for_metric = Some(tenant_ctx.tenant_id.clone());
     }
+
+    // Grab the Analytics Engine sink (and APP_ENV for cross-env filtering)
+    // before `env` is consumed by the router. Missing binding in local dev /
+    // tests is non-fatal — emission below is best-effort.
+    let latency_sink = env.analytics_engine("PILOT_LATENCY").ok();
+    let app_env = env
+        .var("APP_ENV")
+        .ok()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
 
     let router = Router::new();
 
-    router
+    let response = router
         // ── Health ──────────────────────────────────────────────
         .get("/", |_, _| Response::ok("data-fabric-worker online"))
         .get("/health", |_, _| {
@@ -101,6 +126,35 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 status: "ok",
                 mission: "velocity-for-autonomous-agent-builders",
             })
+        })
+        .get("/openapi.json", |_, _| {
+            let headers = Headers::new();
+            headers.set("content-type", "application/json")?;
+            headers.set("access-control-allow-origin", "*")?;
+            Ok(Response::ok(openapi::get_openapi_spec())?.with_headers(headers))
+        })
+        .get("/docs", |_, _| {
+            let html = r#"<!DOCTYPE html>
+<html>
+  <head>
+    <title>Data Fabric API Documentation</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <script
+      id="api-reference"
+      data-url="/openapi.json"
+    ></script>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+  </body>
+</html>"#;
+            Response::from_html(html)
         })
         // ── Tenants (WS8) ─────────────────────────────────────
         .post_async("/v1/tenants/provision", |mut req, ctx| async move {
@@ -177,6 +231,33 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => errors::error_response("RUN_NOT_FOUND", "run not found", 404),
             }
         })
+        // ── WS10 pilot baseline metrics (issue #105) ────────
+        .get_async("/v1/metrics/pilot", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let window_raw = params.get("window").map(|s| s.as_str()).unwrap_or("1d");
+            let (window, window_seconds) = match metrics::parse_window(window_raw) {
+                Ok(w) => w,
+                Err(e) => {
+                    return errors::error_response("INVALID_WINDOW", &e.to_string(), 400);
+                }
+            };
+            let task_type = params.get("task_type").map(|s| s.as_str());
+            let d1 = ctx.env.d1("DB")?;
+            let body = metrics::pilot(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &window,
+                window_seconds,
+                task_type,
+            )
+            .await?;
+            Response::from_json(&body)
+        })
         // ── WS2 Tasks (run-scoped, D1-backed) ───────────────
         .post_async("/v1/runs/:run_id/tasks", |mut req, ctx| async move {
             let run_id = ctx.param("run_id").unwrap().to_string();
@@ -252,7 +333,23 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let body: models::UpsertMemoryItemRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
+
+            // 1. Persistent storage in D1
             let expires_at = db::upsert_memory_item(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
+
+            // 2. Semantic indexing in Vectorize
+            if let Ok(index) = vector_index::SemanticIndex::new(&ctx.env) {
+                if let Ok(vector) = index.embed(&body.summary).await {
+                    let metadata = serde_json::json!({
+                        "repo": body.repo,
+                        "kind": format!("{:?}", body.kind),
+                        "run_id": body.run_id,
+                        "tenant_id": tenant_ctx.tenant_id
+                    });
+                    let _ = index.insert(&id, vector, metadata).await;
+                }
+            }
+
             Response::from_json(&models::MemoryItemCreated {
                 id,
                 status: "indexed".into(),
@@ -263,7 +360,34 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::RetrieveMemoryRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-            let response = db::retrieve_memory(&d1, &tenant_ctx.tenant_id, &body).await?;
+            
+            let start = js_sys::Date::now();
+
+            // 1. Semantic Search via Vectorize (if query provided)
+            let mut semantic_ids = Vec::new();
+            if !body.query.is_empty() {
+                if let Ok(index) = vector_index::SemanticIndex::new(&ctx.env) {
+                    if let Ok(vector) = index.embed(&body.query).await {
+                        if let Ok(results) = index.query(vector, body.top_k).await {
+                            if let Some(matches) = results["matches"].as_array() {
+                                for m in matches {
+                                    if let Some(id) = m["id"].as_str() {
+                                        semantic_ids.push(id.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Relational Search + Filter via D1
+            // Hybrid approach: use semantic IDs if available, or just use D1 filters
+            let response = db::retrieve_memory_hybrid(&d1, &tenant_ctx.tenant_id, &body, &semantic_ids).await?;
+
+            let _latency_ms = (js_sys::Date::now() - start) as i64;
+            // Update latency in response if needed, though D1 usually tracks its own
+            
             Response::from_json(&response)
         })
         .post_async("/v1/memory/context-pack", |mut req, ctx| async move {
@@ -319,6 +443,41 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let d1 = ctx.env.d1("DB")?;
             let summary = db::memory_eval_summary(&d1, &tenant_ctx.tenant_id).await?;
             Response::from_json(&summary)
+        })
+        // ── Plays (Orchestration) ──────────────────────────────
+        .post_async("/v1/plays/:name/launch", |mut req, ctx| async move {
+            let _tenant_ctx = tenant::tenant_from_request(&req)?;
+            let play_name = ctx.param("name").unwrap().to_string();
+            let body: models::PlayLaunchRequest = req.json().await.unwrap_or(models::PlayLaunchRequest {
+                play_name: play_name.clone(),
+                job_id: None,
+                metadata: None,
+            });
+
+            // 1. Fetch play definition from D1
+            let d1 = ctx.env.d1("DB")?;
+            let def = match db::get_play_definition(&d1, &play_name).await? {
+                Some(d) => d,
+                None => return Response::error(format!("play '{}' not found", play_name), 404),
+            };
+
+            // 2. Launch via PlayManager Durable Object
+            let run_id = body.job_id.unwrap_or_else(|| generate_id().unwrap());
+            let namespace = ctx.env.durable_object("PLAY_MANAGER")?;
+            let stub = namespace.id_from_name(&run_id)?.get_stub()?;
+            
+            let do_req = Request::new_with_init(
+                "https://do/launch",
+                &RequestInit {
+                    method: Method::Post,
+                    body: Some(serde_wasm_bindgen::to_value(&def).map_err(|e| Error::RustError(e.to_string()))?),
+                    ..Default::default()
+                }
+            )?;
+            let mut do_resp = stub.fetch_with_request(do_req).await?;
+            
+            let result: serde_json::Value = do_resp.json().await?;
+            Response::from_json(&result)
         })
         // ── Artifacts (R2-backed) ─────────────────────────────
         .put_async("/v1/artifacts/:key", |mut req, ctx| async move {
@@ -555,7 +714,30 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
             let id = generate_id()?;
+
+            // Create in D1 for persistence
             db::create_task(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
+
+            // Fetch the task as an AgentTask for the DO
+            let task = match db::get_mcp_task_by_id(&d1, &tenant_ctx.tenant_id, &id).await? {
+                Some(t) => t,
+                None => return Response::error("failed to fetch created task", 500),
+            };
+
+            // Enqueue in Durable Object for active management
+            let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
+            let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
+
+            let do_req = Request::new_with_init(
+                "https://do/enqueue",
+                &RequestInit {
+                    method: Method::Post,
+                    body: Some(serde_wasm_bindgen::to_value(&task).map_err(|e| Error::RustError(e.to_string()))?),
+                    ..Default::default()
+                },
+            )?;
+            stub.fetch_with_request(do_req).await?;
+
             Response::from_json(&models::TaskCreated {
                 id,
                 status: "pending".into(),
@@ -573,33 +755,39 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(id) => id.clone(),
                 None => return Response::error("agent_id required", 400),
             };
-            let caps_str = params.get("cap").cloned().unwrap_or_default();
-            let caps: Vec<&str> = if caps_str.is_empty() {
-                vec![]
-            } else {
-                caps_str.split(',').collect()
-            };
+            let caps = params.get("cap").cloned().unwrap_or_default();
 
-            let d1 = ctx.env.d1("DB")?;
-            match db::claim_next_task(&d1, &tenant_ctx.tenant_id, &agent_id, &caps).await? {
-                Some(mut task) => {
-                    // Augment task with agent's memory context from MOM (if available)
-                    // This allows agents to reason with past experience
-                    let mom_endpoint = ctx.env.var("MOM_ENDPOINT").ok().map(|v| v.to_string());
-                    if let Some(endpoint) = mom_endpoint {
-                        let memory_context = augment_task_with_memory(
-                            &agent_id,
-                            &tenant_ctx.tenant_id,
-                            &task,
-                            &endpoint,
-                        )
-                        .await;
-                        task.memory_context = memory_context;
-                    }
-                    Response::from_json(&task)
-                }
-                None => Ok(Response::empty()?.with_status(204)),
+            let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
+            let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
+            
+            let do_url = format!("https://do/claim?agent_id={}&caps={}", agent_id, caps);
+            let do_req = Request::new(&do_url, Method::Post)?;
+            let mut do_resp = stub.fetch_with_request(do_req).await?;
+
+            if do_resp.status_code() == 204 {
+                return Ok(Response::empty()?.with_status(204));
             }
+
+
+            let mut task: models::AgentTask = do_resp.json().await?;
+            
+            // Sync to D1 (best effort)
+            let d1 = ctx.env.d1("DB")?;
+            let _ = db::sync_task_status(&d1, &tenant_ctx.tenant_id, &task).await;
+
+            // Augment task with agent's memory context from MOM (if available)
+            let mom_endpoint = ctx.env.var("MOM_ENDPOINT").ok().map(|v| v.to_string());
+            if let Some(endpoint) = mom_endpoint {
+                let memory_context = augment_task_with_memory(
+                    &agent_id,
+                    &tenant_ctx.tenant_id,
+                    &task,
+                    &endpoint,
+                )
+                .await;
+                task.memory_context = memory_context;
+            }
+            Response::from_json(&task)
         })
         .post_async("/mcp/task/:id/heartbeat", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
@@ -617,10 +805,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("agent_id required", 400),
             };
 
-            let d1 = ctx.env.d1("DB")?;
-            let updated =
-                db::heartbeat_task(&d1, &tenant_ctx.tenant_id, &task_id, &agent_id).await?;
-            if updated {
+            let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
+            let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
+            
+            let do_url = format!("https://do/heartbeat?task_id={}&agent_id={}", task_id, agent_id);
+            let do_req = Request::new(&do_url, Method::Post)?;
+            let do_resp = stub.fetch_with_request(do_req).await?;
+
+            if do_resp.status_code() == 200 {
+                // Update D1 (best effort)
+                let d1 = ctx.env.d1("DB")?;
+                let _ = db::heartbeat_task(&d1, &tenant_ctx.tenant_id, &task_id, &agent_id).await;
                 Response::from_json(&serde_json::json!({ "ok": true }))
             } else {
                 Response::error("task not found or not owned by agent", 404)
@@ -633,11 +828,25 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("missing task id", 400),
             };
             let body: models::TaskCompleteRequest = req.json().await?;
-            let d1 = ctx.env.d1("DB")?;
-            let updated =
-                db::complete_task(&d1, &tenant_ctx.tenant_id, &task_id, body.result.as_ref())
-                    .await?;
-            if updated {
+            
+            let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
+            let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
+            
+            let do_req = Request::new_with_init(
+                &format!("https://do/complete/{}", task_id),
+                &RequestInit {
+                    method: Method::Post,
+                    body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
+                    ..Default::default()
+                },
+            )?;
+            let mut do_resp = stub.fetch_with_request(do_req).await?;
+
+            if do_resp.status_code() == 200 {
+                let task: models::AgentTask = do_resp.json().await?;
+                // Sync to D1
+                let d1 = ctx.env.d1("DB")?;
+                db::sync_task_status(&d1, &tenant_ctx.tenant_id, &task).await?;
                 Response::from_json(&serde_json::json!({ "status": "completed" }))
             } else {
                 Response::error("task not found or not running", 404)
@@ -650,10 +859,29 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("missing task id", 400),
             };
             let body: models::TaskFailRequest = req.json().await?;
-            let d1 = ctx.env.d1("DB")?;
-            let new_status =
-                db::fail_task(&d1, &tenant_ctx.tenant_id, &task_id, &body.error).await?;
-            Response::from_json(&serde_json::json!({ "status": new_status }))
+
+            let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
+            let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
+            
+            let do_req = Request::new_with_init(
+                &format!("https://do/fail/{}", task_id),
+                &RequestInit {
+                    method: Method::Post,
+                    body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
+                    ..Default::default()
+                },
+            )?;
+            let mut do_resp = stub.fetch_with_request(do_req).await?;
+            
+            if do_resp.status_code() == 200 {
+                let task: models::AgentTask = do_resp.json().await?;
+                // Sync to D1
+                let d1 = ctx.env.d1("DB")?;
+                db::sync_task_status(&d1, &tenant_ctx.tenant_id, &task).await?;
+                Response::from_json(&serde_json::json!({ "status": task.status }))
+            } else {
+                Response::error("task not found or not running", 404)
+            }
         })
         // ── Agents (M1) ───────────────────────────────────────
         .post_async("/v1/agents", |mut req, ctx| async move {
@@ -674,6 +902,169 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let agents = db::list_agents(&d1, &tenant_ctx.tenant_id).await?;
             Response::from_json(&serde_json::json!({ "agents": agents }))
         })
+        .post_async("/v1/telemetry", |mut req, ctx| async move {
+            let body: models::TelemetrySnapshot = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+
+            db::record_telemetry(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
+
+            Response::from_json(&models::TelemetryAck {
+                id,
+                accepted: true,
+            })
+        })
+        // ── Reasoning traces (Epic 3 / #111) ─────────────────
+        .post_async("/v1/reasoning-traces", |mut req, ctx| async move {
+            let mut body: models::IngestReasoningTrace = req.json().await?;
+            if body.idempotency_key.trim().is_empty() {
+                return Response::error("idempotency_key must be non-empty", 400);
+            }
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let d1 = ctx.env.d1("DB")?;
+
+            // Short-circuit on retry: a row already exists for this idempotency
+            // key. Returning early here means we never touch R2 on retries,
+            // which would otherwise orphan a duplicate blob under a fresh
+            // trace_id (D1 dedupes by key, R2 keys are id-derived).
+            if let Some(existing_id) = db::find_reasoning_trace_by_idempotency_key(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &body.idempotency_key,
+            )
+            .await?
+            {
+                return Response::from_json(&models::TraceAck {
+                    id: existing_id,
+                    accepted: true,
+                    deduplicated: true,
+                });
+            }
+
+            let bucket = ctx.env.bucket("ARTIFACTS")?;
+            let id = generate_id()?;
+            let r2_prefix = tenant_ctx.r2_prefix();
+
+            // Defensive PII redaction. The client SHOULD have redacted, but the
+            // sink must never persist fields the client flagged as tainted.
+            if let Some(v) = body.inputs.as_mut() {
+                models::redact_pii(v);
+            }
+            if let Some(v) = body.outputs.as_mut() {
+                models::redact_pii(v);
+            }
+
+            let (inputs_inline, inputs_r2_key) =
+                stash_payload(&bucket, &r2_prefix, &id, "inputs", body.inputs.as_ref()).await?;
+            let (outputs_inline, outputs_r2_key) =
+                stash_payload(&bucket, &r2_prefix, &id, "outputs", body.outputs.as_ref()).await?;
+
+            let inserted = db::insert_reasoning_trace(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &id,
+                &body,
+                db::ReasoningPayloadRefs {
+                    inputs_inline: inputs_inline.as_deref(),
+                    inputs_r2_key: inputs_r2_key.as_deref(),
+                    outputs_inline: outputs_inline.as_deref(),
+                    outputs_r2_key: outputs_r2_key.as_deref(),
+                },
+            )
+            .await?;
+
+            Response::from_json(&models::TraceAck {
+                id,
+                accepted: true,
+                deduplicated: !inserted,
+            })
+        })
+        .get_async("/v1/reasoning-traces", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url()?;
+            let params: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let job_id = match params.get("job_id") {
+                Some(id) => id.clone(),
+                None => return Response::error("missing job_id query param", 400),
+            };
+            let limit = params
+                .get("limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100u32)
+                .clamp(1, 500);
+            let after_step = params.get("after_step").and_then(|s| s.parse::<i64>().ok());
+            let d1 = ctx.env.d1("DB")?;
+            let page = db::list_reasoning_traces_for_job(
+                &d1,
+                &tenant_ctx.tenant_id,
+                &job_id,
+                after_step,
+                limit,
+            )
+            .await?;
+            let next_after_step = if page.has_more {
+                page.traces.last().map(|t| t.step_number as i64)
+            } else {
+                None
+            };
+            Response::from_json(&serde_json::json!({
+                "traces": page.traces,
+                "has_more": page.has_more,
+                "next_after_step": next_after_step,
+            }))
+        })
+        // Payload resolver — inline JSON returns the value verbatim; an
+        // archived payload streams the R2 object back. Either way callers
+        // dereference a single canonical URL, fulfilling the AC's "pointer
+        // URL" requirement without leaking R2 keys to the public internet.
+        .get_async(
+            "/v1/reasoning-traces/:id/payload/:field",
+            |req, ctx| async move {
+                let tenant_ctx = tenant::tenant_from_request(&req)?;
+                let trace_id = match ctx.param("id") {
+                    Some(v) => v.to_string(),
+                    None => return Response::error("missing trace id", 400),
+                };
+                let field = match ctx.param("field") {
+                    Some(v) => v.to_string(),
+                    None => return Response::error("missing field", 400),
+                };
+                if field != "inputs" && field != "outputs" {
+                    return Response::error("field must be 'inputs' or 'outputs'", 400);
+                }
+                let d1 = ctx.env.d1("DB")?;
+                let trace = match db::get_reasoning_trace(&d1, &tenant_ctx.tenant_id, &trace_id)
+                    .await?
+                {
+                    Some(t) => t,
+                    None => return Response::error("reasoning trace not found", 404),
+                };
+                let (inline, r2_key) = if field == "inputs" {
+                    (trace.inputs_inline, trace.inputs_r2_key)
+                } else {
+                    (trace.outputs_inline, trace.outputs_r2_key)
+                };
+                if let Some(v) = inline {
+                    return Response::from_json(&v);
+                }
+                if let Some(key) = r2_key {
+                    let bucket = ctx.env.bucket("ARTIFACTS")?;
+                    let bytes = match storage::get_blob(&bucket, &key).await? {
+                        Some(b) => b,
+                        None => return Response::error("payload archived but missing in R2", 502),
+                    };
+                    let mut resp = Response::from_bytes(bytes)?;
+                    resp.headers_mut().set("Content-Type", "application/json")?;
+                    return Ok(resp);
+                }
+                // Step had no payload (e.g. token-only Thought).
+                Response::from_json(&serde_json::Value::Null)
+            },
+        )
         // ── Checkpoints (M2) ──────────────────────────────────
         .post_async("/v1/checkpoints", |mut req, ctx| async move {
             let body: models::CreateCheckpoint = req.json().await?;
@@ -693,6 +1084,20 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let size = storage::put_blob(&bucket, &r2_key, state_bytes).await? as i64;
             db::create_checkpoint(&d1, &tenant_ctx.tenant_id, &id, &body, &r2_key, size).await?;
 
+            // 3. Update ThreadManager Durable Object (fast state)
+            let namespace = ctx.env.durable_object("THREAD_MANAGER")?;
+            let stub = namespace.id_from_name(&body.thread_id)?.get_stub()?;
+
+            let do_req = Request::new_with_init(
+                "https://do/checkpoint",
+                &RequestInit {
+                    method: Method::Post,
+                    body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
+                    ..Default::default()
+                },
+            )?;
+            stub.fetch_with_request(do_req).await?;
+
             Response::from_json(&models::CheckpointCreated {
                 id,
                 thread_id: body.thread_id,
@@ -704,9 +1109,35 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             |req, ctx| async move {
                 let tenant_ctx = tenant::tenant_from_request(&req)?;
                 let thread_id = ctx.param("thread_id").unwrap().to_string();
+
+                // 1. Try fast path via ThreadManager Durable Object
+                let namespace = ctx.env.durable_object("THREAD_MANAGER")?;
+                let stub = namespace.id_from_name(&thread_id)?.get_stub()?;
+                
+                let do_req = Request::new("https://do/latest", Method::Get)?;
+                let mut do_resp = stub.fetch_with_request(do_req).await?;
+
+                if do_resp.status_code() == 200 {
+                    let data: serde_json::Value = do_resp.json().await?;
+                    return Response::from_json(&data);
+                }
+
+                // 2. Fallback to D1/R2 slow path
                 let d1 = ctx.env.d1("DB")?;
                 match db::get_latest_checkpoint(&d1, &tenant_ctx.tenant_id, &thread_id).await? {
-                    Some(row) => Response::from_json(&row.into_checkpoint()),
+                    Some(row) => {
+                        let bucket = ctx.env.bucket("ARTIFACTS")?;
+                        match storage::get_blob(&bucket, &row.state_r2_key).await? {
+                            Some(blob) => {
+                                let state: serde_json::Value = serde_json::from_slice(&blob)?;
+                                Response::from_json(&serde_json::json!({
+                                    "checkpoint": row.into_checkpoint(),
+                                    "state": state
+                                }))
+                            }
+                            None => Response::error("checkpoint state not found in R2", 404),
+                        }
+                    }
                     None => Response::error("no checkpoint found", 404),
                 }
             },
@@ -1362,7 +1793,64 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             )
         })
         .run(req, env)
-        .await
+        .await;
+
+    if !is_public_path(&path) {
+        if let Some(sink) = latency_sink.as_ref() {
+            let status = response
+                .as_ref()
+                .ok()
+                .map(|r| r.status_code())
+                .unwrap_or(500);
+            emit_pilot_latency(
+                sink,
+                &path,
+                &method,
+                tenant_id_for_metric.as_deref().unwrap_or("unknown"),
+                &app_env,
+                js_sys::Date::now() - start_ms,
+                status,
+            );
+        }
+    }
+
+    response
+}
+
+/// Best-effort emit of one request-latency sample to the `PILOT_LATENCY`
+/// Analytics Engine dataset. Failures are deliberately swallowed: a missing
+/// dataset or transient sink error must not turn a successful request into
+/// a 500.
+///
+/// Path is currently emitted as-is. High-cardinality routes (`/v1/runs/:id`)
+/// inflate the dataset row count — templating the path is a follow-up.
+///
+/// Sample schema (kept in sync with `docs/ws10/METRICS_ENDPOINT.md`):
+/// * `index1` — `tenant_id` (sampling key)
+/// * `blob1`  — request path
+/// * `blob2`  — HTTP method
+/// * `blob3`  — `APP_ENV` (dev / staging / production)
+/// * `double1`— elapsed milliseconds
+/// * `double2`— response status code
+fn emit_pilot_latency(
+    sink: &AnalyticsEngineDataset,
+    path: &str,
+    method: &Method,
+    tenant_id: &str,
+    app_env: &str,
+    elapsed_ms: f64,
+    status_code: u16,
+) {
+    let method_str = method.to_string();
+    let dp = AnalyticsEngineDataPointBuilder::new()
+        .indexes([tenant_id])
+        .add_blob(path)
+        .add_blob(method_str.as_str())
+        .add_blob(app_env)
+        .add_double(elapsed_ms)
+        .add_double(status_code as f64)
+        .build();
+    let _ = sink.write_data_point(&dp);
 }
 
 /// Queue consumer: enriches events — causality edges, gold summaries, task deps.
@@ -1444,11 +1932,37 @@ pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Conte
     Ok(())
 }
 
-fn generate_id() -> Result<String> {
+pub(crate) fn generate_id() -> Result<String> {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf)
         .map_err(|err| Error::RustError(format!("failed to generate id: {err}")))?;
     Ok(hex::encode(buf))
+}
+
+/// Decide whether a reasoning-trace payload stays inline or gets offloaded
+/// to R2 (the GZRS analogue on Cloudflare). Returns `(inline_json, r2_key)`
+/// where at most one is `Some`.
+async fn stash_payload(
+    bucket: &Bucket,
+    r2_prefix: &str,
+    trace_id: &str,
+    field: &str,
+    payload: Option<&serde_json::Value>,
+) -> Result<(Option<String>, Option<String>)> {
+    let Some(value) = payload else {
+        return Ok((None, None));
+    };
+    match models::classify_payload(value, r2_prefix, trace_id, field) {
+        models::PayloadDisposition::Inline(v) => {
+            let s = serde_json::to_string(&v)
+                .map_err(|e| Error::RustError(format!("serialize inline payload: {e}")))?;
+            Ok((Some(s), None))
+        }
+        models::PayloadDisposition::Archive { key, bytes } => {
+            storage::put_blob(bucket, &key, bytes).await?;
+            Ok((None, Some(key)))
+        }
+    }
 }
 
 /// Build a JSON response with a `Server-Timing` header recording the elapsed time since `started`.

@@ -56,83 +56,48 @@ pub async fn create_task(
     Ok(())
 }
 
-pub async fn claim_next_task(
+pub async fn get_mcp_task_by_id(
     db: &D1Database,
     tenant_id: &str,
-    agent_id: &str,
-    capabilities: &[&str],
+    id: &str,
 ) -> Result<Option<models::AgentTask>> {
-    let now = now_iso();
-    let lease = lease_time(300);
-
-    // Build capability filter using parameterized placeholders (no string interpolation)
-    let result: Option<TaskIdRow> = if capabilities.is_empty() {
-        db.prepare(
-            "SELECT id FROM mcp_tasks WHERE tenant_id = ?1 AND status = 'pending' ORDER BY priority DESC, created_at ASC LIMIT 1",
-        )
-        .bind(&[JsValue::from_str(tenant_id)])?
-        .first(None)
-        .await?
-    } else {
-        let placeholders: Vec<String> = (2..=capabilities.len() + 1)
-            .map(|i| format!("?{}", i))
-            .collect();
-        let query = format!(
-            "SELECT id FROM mcp_tasks WHERE tenant_id = ?1 AND status = 'pending' AND task_type IN ({}) ORDER BY priority DESC, created_at ASC LIMIT 1",
-            placeholders.join(", ")
-        );
-        let mut bindings: Vec<JsValue> = vec![JsValue::from_str(tenant_id)];
-        bindings.extend(capabilities.iter().map(|c| JsValue::from_str(c)));
-        db.prepare(&query).bind(&bindings)?.first(None).await?
-    };
-    let task_id = match result {
-        Some(row) => row.id,
-        None => return Ok(None),
-    };
-
-    // Claim it atomically: only succeeds if still pending
-    let res: D1Result = db.prepare(
-        "UPDATE mcp_tasks SET status = 'running', agent_id = ?1, lease_expires_at = ?2 WHERE tenant_id = ?3 AND id = ?4 AND status = 'pending'",
-    )
-    .bind(&[
-        JsValue::from_str(agent_id),
-        JsValue::from_str(&lease),
-        JsValue::from_str(tenant_id),
-        JsValue::from_str(&task_id),
-    ])?
-    .run()
-    .await?;
-
-    let changed = res
-        .meta()?
-        .map(|m| m.changes.unwrap_or(0) > 0)
-        .unwrap_or(false);
-    if !changed {
-        return Ok(None);
-    }
-
-    // Update agent heartbeat
-    db.prepare("UPDATE agents SET last_heartbeat = ?1 WHERE tenant_id = ?2 AND id = ?3")
-        .bind(&[
-            JsValue::from_str(&now),
-            JsValue::from_str(tenant_id),
-            JsValue::from_str(agent_id),
-        ])?
-        .run()
-        .await?;
-
-    // Fetch full task
     let task: Option<TaskRow> = db
-        .prepare("SELECT * FROM mcp_tasks WHERE tenant_id = ?1 AND id = ?2 AND agent_id = ?3")
-        .bind(&[
-            JsValue::from_str(tenant_id),
-            JsValue::from_str(&task_id),
-            JsValue::from_str(agent_id),
-        ])?
+        .prepare("SELECT * FROM mcp_tasks WHERE tenant_id = ?1 AND id = ?2")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
         .first(None)
         .await?;
 
     Ok(task.map(|r| r.into_agent_task()))
+}
+
+pub async fn sync_task_status(
+    db: &D1Database,
+    tenant_id: &str,
+    task: &models::AgentTask,
+) -> Result<()> {
+    let result_json = task.result.as_ref().map(|v| serde_json::to_string(v).unwrap());
+
+    db.prepare(
+        "UPDATE mcp_tasks SET status = ?1, agent_id = ?2, result = ?3, retry_count = ?4, lease_expires_at = ?5, completed_at = ?6
+         WHERE tenant_id = ?7 AND id = ?8",
+    )
+    .bind(&[
+        JsValue::from_str(&task.status),
+        opt_str(&task.agent_id),
+        match &result_json {
+            Some(s) => JsValue::from_str(s),
+            None => JsValue::NULL,
+        },
+        JsValue::from(task.retry_count),
+        opt_str(&task.lease_expires_at),
+        opt_str(&task.completed_at),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&task.id),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
 }
 
 pub async fn heartbeat_task(
@@ -162,76 +127,35 @@ pub async fn heartbeat_task(
     Ok(changed)
 }
 
-pub async fn complete_task(
+pub async fn get_play_definition(
     db: &D1Database,
-    tenant_id: &str,
-    task_id: &str,
-    result_val: Option<&serde_json::Value>,
-) -> Result<bool> {
-    let now = now_iso();
-    let result_json = result_val.map(|v| serde_json::to_string(v).unwrap());
-    let res: D1Result = db
-        .prepare(
-            "UPDATE mcp_tasks SET status = 'completed', result = ?1, completed_at = ?2 WHERE tenant_id = ?3 AND id = ?4 AND status = 'running'",
-        )
-        .bind(&[
-            match &result_json {
-                Some(s) => JsValue::from_str(s),
-                None => JsValue::NULL,
-            },
-            JsValue::from_str(&now),
-            JsValue::from_str(tenant_id),
-            JsValue::from_str(task_id),
-        ])?
-        .run()
-        .await?;
+    name: &str,
+) -> Result<Option<models::PlayDefinition>> {
+    #[derive(serde::Deserialize)]
+    struct PlayRow {
+        name: String,
+        goal: String,
+        tasks_json: String,
+    }
 
-    let changed = res
-        .meta()?
-        .map(|m| m.changes.unwrap_or(0) > 0)
-        .unwrap_or(false);
-    Ok(changed)
-}
-
-pub async fn fail_task(
-    db: &D1Database,
-    tenant_id: &str,
-    task_id: &str,
-    error: &str,
-) -> Result<String> {
-    let now = now_iso();
-
-    // Check retry eligibility
-    let task: Option<RetryRow> = db
-        .prepare(
-            "SELECT retry_count, max_retries FROM mcp_tasks WHERE tenant_id = ?1 AND id = ?2 AND status = 'running'",
-        )
-        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(task_id)])?
+    let row: Option<PlayRow> = db
+        .prepare("SELECT name, goal, tasks_json FROM play_definitions WHERE name = ?1")
+        .bind(&[JsValue::from_str(name)])?
         .first(None)
         .await?;
 
-    let (new_status, new_retry) = match task {
-        Some(row) if row.retry_count < row.max_retries => ("pending", row.retry_count + 1),
-        _ => ("failed", 0),
-    };
-
-    let result_json = serde_json::json!({ "error": error }).to_string();
-
-    db.prepare(
-        "UPDATE mcp_tasks SET status = ?1, retry_count = CASE WHEN ?1 = 'pending' THEN ?2 ELSE retry_count END, result = ?3, agent_id = CASE WHEN ?1 = 'pending' THEN NULL ELSE agent_id END, lease_expires_at = NULL, completed_at = CASE WHEN ?1 = 'failed' THEN ?4 ELSE NULL END WHERE tenant_id = ?5 AND id = ?6",
-    )
-    .bind(&[
-        JsValue::from_str(new_status),
-        JsValue::from(new_retry),
-        JsValue::from_str(&result_json),
-        JsValue::from_str(&now),
-        JsValue::from_str(tenant_id),
-        JsValue::from_str(task_id),
-    ])?
-    .run()
-    .await?;
-
-    Ok(new_status.to_string())
+    match row {
+        Some(r) => {
+            let tasks: Vec<models::PlayTaskDefinition> = serde_json::from_str(&r.tasks_json)
+                .map_err(|e| Error::RustError(format!("failed to parse play tasks: {e}")))?;
+            Ok(Some(models::PlayDefinition {
+                name: r.name,
+                goal: r.goal,
+                tasks,
+            }))
+        }
+        None => Ok(None),
+    }
 }
 
 // ── Agents ──────────────────────────────────────────────────────
@@ -855,6 +779,185 @@ pub async fn record_tool_call(
     .run()
     .await?;
     Ok(())
+}
+
+pub async fn retrieve_memory_hybrid(
+    db: &D1Database,
+    tenant_id: &str,
+    req: &models::RetrieveMemoryRequest,
+    semantic_ids: &[String],
+) -> Result<models::RetrieveMemoryResponse> {
+    let start = js_sys::Date::now();
+    let now = now_iso();
+    let now_ms = js_sys::Date::parse(&now);
+    let query_id = random_hex_id()?;
+
+    let mut repos = vec![req.repo.clone()];
+    for r in &req.related_repos {
+        if !repos.iter().any(|x| x == r) {
+            repos.push(r.clone());
+        }
+    }
+
+    let mut bind: Vec<JsValue> = vec![];
+    let mut where_parts: Vec<String> = vec![];
+    let mut idx = 1usize;
+
+    where_parts.push(format!("tenant_id = ?{idx}"));
+    bind.push(JsValue::from_str(tenant_id));
+    idx += 1;
+
+    where_parts.push("status = 'active'".to_string());
+
+    let repo_clause = (0..repos.len())
+        .map(|_| {
+            let p = format!("?{idx}");
+            idx += 1;
+            p
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    where_parts.push(format!("repo IN ({repo_clause})"));
+    for repo in &repos {
+        bind.push(JsValue::from_str(repo));
+    }
+
+    if let Some(thread_id) = &req.thread_id {
+        where_parts.push(format!("thread_id = ?{idx}"));
+        bind.push(JsValue::from_str(thread_id));
+        idx += 1;
+    }
+    if let Some(run_id) = &req.run_id {
+        where_parts.push(format!("run_id = ?{idx}"));
+        bind.push(JsValue::from_str(run_id));
+        idx += 1;
+    }
+    if let Some(task_id) = &req.task_id {
+        where_parts.push(format!("task_id = ?{idx}"));
+        bind.push(JsValue::from_str(task_id));
+        idx += 1;
+    }
+
+    let qlike = format!("%{}%", req.query.to_lowercase());
+    
+    if !semantic_ids.is_empty() {
+        let mut id_placeholders = Vec::new();
+        for id in semantic_ids {
+            id_placeholders.push(format!("?{}", idx));
+            bind.push(JsValue::from_str(id));
+            idx += 1;
+        }
+        let id_clause = id_placeholders.join(", ");
+        
+        where_parts.push(format!(
+            "(id IN ({}) OR (lower(summary) LIKE ?{} OR lower(COALESCE(title, '')) LIKE ?{} OR lower(COALESCE(tags, '')) LIKE ?{}))",
+            id_clause, idx, idx + 1, idx + 2
+        ));
+    } else {
+        where_parts.push(format!(
+            "(lower(summary) LIKE ?{idx} OR lower(COALESCE(title, '')) LIKE ?{} OR lower(COALESCE(tags, '')) LIKE ?{})",
+            idx + 1,
+            idx + 2
+        ));
+    }
+    
+    bind.push(JsValue::from_str(&qlike));
+    bind.push(JsValue::from_str(&qlike));
+    bind.push(JsValue::from_str(&qlike));
+
+    let sql = format!(
+        "SELECT * FROM memory_index WHERE {} ORDER BY indexed_at DESC LIMIT 200",
+        where_parts.join(" AND ")
+    );
+
+    let result: D1Result = db.prepare(&sql).bind(&bind)?.all().await?;
+    let rows: Vec<MemoryIndexRow> = result.results()?;
+
+    let mut stale_filtered = 0usize;
+    let mut unsafe_filtered = 0usize;
+    let mut conflict_filtered = 0usize;
+
+    let latest_conflicts = latest_conflict_versions(&rows);
+
+    let mut candidates = vec![];
+    for row in rows {
+        let stale = is_stale(&row, &now);
+        let conflicted = is_conflicted(&row, &latest_conflicts);
+
+        if stale && !req.include_stale {
+            stale_filtered += 1;
+            continue;
+        }
+        if row.unsafe_reason.is_some() && !req.include_unsafe {
+            unsafe_filtered += 1;
+            continue;
+        }
+        if conflicted && !req.include_conflicted {
+            conflict_filtered += 1;
+            continue;
+        }
+
+        let mut score = score_candidate(&row, &req.query, now_ms);
+        
+        // Semantic boost: if ID was in semantic_ids, boost the score
+        if semantic_ids.contains(&row.id) {
+            score += 2.0; // High boost for vector match
+        }
+
+        let estimated_tokens = estimate_tokens(&row.title, &row.summary, &row.tags);
+        candidates.push(models::MemoryCandidate {
+            id: row.id,
+            repo: row.repo,
+            kind: row.kind,
+            run_id: row.run_id,
+            task_id: row.task_id,
+            thread_id: row.thread_id,
+            title: row.title,
+            summary: row.summary,
+            tags: parse_tags(&row.tags),
+            content_ref: row.content_ref,
+            success_rate: row.success_rate,
+            stale,
+            unsafe_reason: row.unsafe_reason,
+            conflicted,
+            estimated_tokens,
+            score,
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top_k = req.top_k.clamp(1, 50);
+    let selected = candidates.into_iter().take(top_k).collect::<Vec<_>>();
+
+    let elapsed = (js_sys::Date::now() - start).round() as i64;
+    log_retrieval_query(
+        db,
+        tenant_id,
+        &query_id,
+        req,
+        selected.len() as i64,
+        elapsed,
+        stale_filtered as i64,
+        unsafe_filtered as i64,
+        conflict_filtered as i64,
+    )
+    .await?;
+    touch_memory_items(db, tenant_id, &selected).await?;
+
+    Ok(models::RetrieveMemoryResponse {
+        query_id,
+        latency_ms: elapsed,
+        total_candidates: selected.len(), // This matches legacy retrieve_memory behavior
+        returned: selected.len(),
+        stale_filtered,
+        unsafe_filtered,
+        conflict_filtered,
+        items: selected,
+    })
 }
 
 pub async fn retrieve_memory(
@@ -1913,6 +2016,245 @@ pub async fn list_verification_evidence(
     result.results()
 }
 
+pub async fn record_telemetry(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::TelemetrySnapshot,
+) -> Result<()> {
+    let now = now_iso();
+    let payload_json = body.payload.as_ref().map(|v| serde_json::to_string(v).unwrap());
+
+    db.prepare(
+        "INSERT INTO telemetry_snapshots (
+            id, tenant_id, agent_name, agent_type, status,
+            duration_seconds, total_attempts, success_rate, namespace,
+            payload, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&body.agent_name),
+        JsValue::from_str(&body.agent_type),
+        JsValue::from_str(&body.status),
+        JsValue::from(body.duration_seconds),
+        JsValue::from(body.total_attempts),
+        JsValue::from(body.success_rate),
+        JsValue::from_str(&body.namespace),
+        match &payload_json {
+            Some(s) => JsValue::from_str(s),
+            None => JsValue::NULL,
+        },
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
+}
+
+// ── Reasoning traces (#111) ────────────────────────────────────
+
+/// Look up an existing reasoning_traces row id by its idempotency key. The
+/// handler calls this BEFORE writing payloads to R2 so a retry is detected
+/// without orphaning storage.
+pub async fn find_reasoning_trace_by_idempotency_key(
+    db: &D1Database,
+    tenant_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    struct IdRow {
+        id: String,
+    }
+    let row: Option<IdRow> = db
+        .prepare(
+            "SELECT id FROM reasoning_traces
+             WHERE tenant_id = ?1 AND idempotency_key = ?2 LIMIT 1",
+        )
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(idempotency_key),
+        ])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.id))
+}
+
+/// Resolved storage locations for the inputs/outputs of a reasoning step.
+/// Either the inline JSON or the R2 key is set for each side — never both.
+pub struct ReasoningPayloadRefs<'a> {
+    pub inputs_inline: Option<&'a str>,
+    pub inputs_r2_key: Option<&'a str>,
+    pub outputs_inline: Option<&'a str>,
+    pub outputs_r2_key: Option<&'a str>,
+}
+
+/// Insert a reasoning trace row. Idempotent on (tenant_id, idempotency_key):
+/// a duplicate insert returns `Ok(false)` so the caller can report
+/// `deduplicated: true` to the client without surfacing an error.
+pub async fn insert_reasoning_trace(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::IngestReasoningTrace,
+    payload: ReasoningPayloadRefs<'_>,
+) -> Result<bool> {
+    let now = now_iso();
+    let res: D1Result = db.prepare(
+        "INSERT INTO reasoning_traces (
+            id, tenant_id, schema_version,
+            agent_id, job_id, parent_span_id, step_number, step_type,
+            inputs_inline, inputs_r2_key, outputs_inline, outputs_r2_key,
+            tokens_input, tokens_output, tokens_cached,
+            started_at, completed_at, idempotency_key, created_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+         )
+         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(tenant_id),
+        JsValue::from(body.schema_version),
+        JsValue::from_str(&body.agent_id),
+        JsValue::from_str(&body.job_id),
+        opt_str(&body.parent_span_id),
+        JsValue::from(body.step_number),
+        JsValue::from_str(body.step_type.as_str()),
+        payload.inputs_inline.map(JsValue::from_str).unwrap_or(JsValue::NULL),
+        payload.inputs_r2_key.map(JsValue::from_str).unwrap_or(JsValue::NULL),
+        payload.outputs_inline.map(JsValue::from_str).unwrap_or(JsValue::NULL),
+        payload.outputs_r2_key.map(JsValue::from_str).unwrap_or(JsValue::NULL),
+        JsValue::from(body.tokens.input),
+        JsValue::from(body.tokens.output),
+        JsValue::from(body.tokens.cached),
+        JsValue::from_str(&body.started_at),
+        opt_str(&body.completed_at),
+        JsValue::from_str(&body.idempotency_key),
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+
+    let inserted = res
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+    Ok(inserted)
+}
+
+/// Page of reasoning traces for a single job. `after_step` is the cursor:
+/// callers paginate by feeding the last returned `step_number` back in.
+/// `has_more` is true when the DB held at least one more row beyond the
+/// returned page (computed by fetching `limit + 1` and trimming).
+pub struct ReasoningTracePage {
+    pub traces: Vec<models::ReasoningTrace>,
+    pub has_more: bool,
+}
+
+pub async fn list_reasoning_traces_for_job(
+    db: &D1Database,
+    tenant_id: &str,
+    job_id: &str,
+    after_step: Option<i64>,
+    limit: u32,
+) -> Result<ReasoningTracePage> {
+    // Fetch one extra row to detect whether more pages exist without a
+    // separate COUNT round-trip.
+    let fetch = (limit as i64) + 1;
+    let result: D1Result = db
+        .prepare(
+            "SELECT * FROM reasoning_traces
+             WHERE tenant_id = ?1 AND job_id = ?2 AND step_number > ?3
+             ORDER BY step_number ASC
+             LIMIT ?4",
+        )
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(job_id),
+            JsValue::from(after_step.unwrap_or(-1) as f64),
+            JsValue::from(fetch as f64),
+        ])?
+        .all()
+        .await?;
+    let mut rows: Vec<ReasoningTraceRow> = result.results()?;
+    let has_more = rows.len() > limit as usize;
+    if has_more {
+        rows.truncate(limit as usize);
+    }
+    Ok(ReasoningTracePage {
+        traces: rows.into_iter().map(|r| r.into_trace()).collect(),
+        has_more,
+    })
+}
+
+pub async fn get_reasoning_trace(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<models::ReasoningTrace>> {
+    let row: Option<ReasoningTraceRow> = db
+        .prepare("SELECT * FROM reasoning_traces WHERE tenant_id = ?1 AND id = ?2")
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.into_trace()))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReasoningTraceRow {
+    id: String,
+    schema_version: i64,
+    agent_id: String,
+    job_id: String,
+    parent_span_id: Option<String>,
+    step_number: i64,
+    step_type: String,
+    inputs_inline: Option<String>,
+    inputs_r2_key: Option<String>,
+    outputs_inline: Option<String>,
+    outputs_r2_key: Option<String>,
+    tokens_input: i64,
+    tokens_output: i64,
+    tokens_cached: i64,
+    started_at: String,
+    completed_at: Option<String>,
+    created_at: String,
+}
+
+impl ReasoningTraceRow {
+    fn into_trace(self) -> models::ReasoningTrace {
+        let step_type = models::StepType::from_storage_str(&self.step_type);
+        models::ReasoningTrace {
+            id: self.id,
+            schema_version: self.schema_version as u32,
+            agent_id: self.agent_id,
+            job_id: self.job_id,
+            parent_span_id: self.parent_span_id,
+            step_number: self.step_number as u32,
+            step_type,
+            inputs_inline: self
+                .inputs_inline
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            inputs_r2_key: self.inputs_r2_key,
+            outputs_inline: self
+                .outputs_inline
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            outputs_r2_key: self.outputs_r2_key,
+            tokens: models::TokenCost {
+                input: self.tokens_input as u32,
+                output: self.tokens_output as u32,
+                cached: self.tokens_cached as u32,
+            },
+            started_at: self.started_at,
+            completed_at: self.completed_at,
+            created_at: self.created_at,
+        }
+    }
+}
+
 pub async fn provision_tenant(
     db: &D1Database,
     body: &models::TenantProvisionRequest,
@@ -2100,11 +2442,13 @@ fn days_ago_expr(days: i64) -> String {
 
 // ── Internal row types ──────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 struct TaskIdRow {
     id: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 struct RetryRow {
     retry_count: i32,

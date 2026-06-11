@@ -1,0 +1,14 @@
+[package]
+name = "data-fabric-client"
+version = "0.1.0"
+edition = "2021"
+authors = ["Stevedores Org"]
+license = "Apache-2.0"
+description = "Rust client SDK for Stevedores Data Fabric"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.0", features = ["full"] }
