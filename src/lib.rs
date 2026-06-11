@@ -768,7 +768,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     ..Default::default()
                 },
             )?;
-            stub.fetch_with_request(do_req).await?;
+            let do_resp = stub.fetch_with_request(do_req).await?;
+
+            // Propagate any non-2xx response (notably 429 QUEUE_FULL backpressure
+            // from TaskLeaseManager when pending_tasks is at MAX_PENDING_TASKS)
+            // to the client. Without this passthrough, the DO's Retry-After +
+            // QUEUE_FULL envelope is silently swallowed and the client sees a
+            // generic success / 500, defeating the backpressure feature.
+            if let Some(forwarded) = forward_do_response(do_resp).await? {
+                return Ok(forwarded);
+            }
 
             Response::from_json(&models::TaskCreated {
                 id,
@@ -2072,6 +2081,86 @@ async fn ingest_events_bronze_silver(
     Ok(count)
 }
 
+/// Decision for how to handle a Durable Object response from the worker
+/// handler. Pure so the routing rule is unit-testable without a wasm runtime.
+#[derive(Debug, PartialEq, Eq)]
+enum DoForwardAction {
+    /// 2xx — handler should proceed with its normal success path.
+    Success,
+    /// Non-2xx — handler should mirror this status back to the client. For
+    /// 429 the DO's `retry-after` header is preserved (defaulting to
+    /// `DEFAULT_DO_RETRY_AFTER_SECS` when absent), so the backpressure
+    /// contract surfaces end-to-end.
+    Forward {
+        status: u16,
+        retry_after: Option<String>,
+    },
+}
+
+/// Default Retry-After value to apply when the DO returned 429 without a
+/// `retry-after` header. Matches the TaskLeaseManager `/enqueue` 30s value
+/// so a missing header doesn't downgrade the client-visible contract.
+const DEFAULT_DO_RETRY_AFTER_SECS: u32 = 30;
+
+/// Classify a DO response status + retry-after header into a forward action.
+/// Pure: takes primitives so it's testable without a JS runtime.
+fn classify_do_response(status: u16, retry_after_header: Option<&str>) -> DoForwardAction {
+    if (200..300).contains(&status) {
+        DoForwardAction::Success
+    } else {
+        let retry_after = if status == 429 {
+            Some(
+                retry_after_header
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| DEFAULT_DO_RETRY_AFTER_SECS.to_string()),
+            )
+        } else {
+            retry_after_header.map(|s| s.to_string())
+        };
+        DoForwardAction::Forward { status, retry_after }
+    }
+}
+
+/// Forward a Durable Object response back to the client when it carries a
+/// non-2xx status. Returns `Ok(None)` for 2xx so callers continue with their
+/// success path; returns `Ok(Some(resp))` with the status, retry-after, and
+/// body mirrored when the DO signaled backpressure or another error.
+///
+/// This exists because `stub.fetch_with_request(...).await?` swallows the DO
+/// response by default — including the 429 `QUEUE_FULL` envelope from
+/// TaskLeaseManager — so without explicit propagation the client sees a
+/// generic success (or, worse, a 500) and the backpressure feature is mute.
+async fn forward_do_response(mut do_resp: Response) -> Result<Option<Response>> {
+    let status = do_resp.status_code();
+    let retry_after = do_resp
+        .headers()
+        .get("retry-after")
+        .ok()
+        .flatten();
+    match classify_do_response(status, retry_after.as_deref()) {
+        DoForwardAction::Success => Ok(None),
+        DoForwardAction::Forward { status, retry_after } => {
+            let content_type = do_resp
+                .headers()
+                .get("content-type")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "application/json".to_string());
+            let body = do_resp.bytes().await.unwrap_or_default();
+
+            let headers = Headers::new();
+            headers.set("content-type", &content_type)?;
+            if let Some(value) = retry_after {
+                headers.set("retry-after", &value)?;
+            }
+            let resp = Response::from_bytes(body)?
+                .with_status(status)
+                .with_headers(headers);
+            Ok(Some(resp))
+        }
+    }
+}
+
 /// Build a 503 response for graceful degradation when the fabric is unavailable.
 /// Used by integration intake handlers to signal temporary unavailability
 /// so clients can retry rather than treating the failure as permanent.
@@ -2130,9 +2219,103 @@ fn build_trace_response_metadata(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_trace_response_metadata, parse_limit_query, parse_limit_query_with_valid_presence,
+        build_trace_response_metadata, classify_do_response, parse_limit_query,
+        parse_limit_query_with_valid_presence, DoForwardAction, DEFAULT_DO_RETRY_AFTER_SECS,
     };
     use worker::Url;
+
+    // ── classify_do_response (DO 429 / error forwarding) ────────
+
+    #[test]
+    fn classify_do_response_passes_2xx_as_success() {
+        // 2xx codes must not be forwarded — handler proceeds with its
+        // normal success path. This is the only "Success" branch.
+        for status in [200u16, 201, 202, 204, 299] {
+            assert_eq!(
+                classify_do_response(status, None),
+                DoForwardAction::Success,
+                "status {status} should be classified as Success",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_do_response_forwards_429_with_do_retry_after() {
+        // When the DO sets retry-after explicitly, that exact value is
+        // mirrored back to the client. This is the TaskLeaseManager
+        // backpressure contract surfaced end-to-end.
+        let action = classify_do_response(429, Some("30"));
+        assert_eq!(
+            action,
+            DoForwardAction::Forward {
+                status: 429,
+                retry_after: Some("30".to_string()),
+            },
+        );
+    }
+
+    #[test]
+    fn classify_do_response_429_without_header_defaults_retry_after() {
+        // Defensive: if a future DO omits retry-after on 429, the worker
+        // still surfaces a sensible default so clients don't hot-loop.
+        let action = classify_do_response(429, None);
+        assert_eq!(
+            action,
+            DoForwardAction::Forward {
+                status: 429,
+                retry_after: Some(DEFAULT_DO_RETRY_AFTER_SECS.to_string()),
+            },
+        );
+    }
+
+    #[test]
+    fn classify_do_response_forwards_other_4xx_without_synthesizing_retry_after() {
+        // Non-429 4xx errors pass through with whatever (if any)
+        // retry-after the DO sent — we don't fabricate one.
+        assert_eq!(
+            classify_do_response(404, None),
+            DoForwardAction::Forward {
+                status: 404,
+                retry_after: None,
+            },
+        );
+        assert_eq!(
+            classify_do_response(400, Some("5")),
+            DoForwardAction::Forward {
+                status: 400,
+                retry_after: Some("5".to_string()),
+            },
+        );
+    }
+
+    #[test]
+    fn classify_do_response_forwards_5xx() {
+        // 5xx from a DO is forwarded as-is so operators see the real
+        // failure mode instead of an opaque worker 500.
+        assert_eq!(
+            classify_do_response(500, None),
+            DoForwardAction::Forward {
+                status: 500,
+                retry_after: None,
+            },
+        );
+        assert_eq!(
+            classify_do_response(503, Some("60")),
+            DoForwardAction::Forward {
+                status: 503,
+                retry_after: Some("60".to_string()),
+            },
+        );
+    }
+
+    #[test]
+    fn classify_do_response_default_retry_after_matches_task_lease_manager() {
+        // Tripwire: the default must match the TaskLeaseManager
+        // ENQUEUE_RETRY_AFTER_SECS value (30) so a missing header
+        // doesn't downgrade the contract.
+        assert_eq!(DEFAULT_DO_RETRY_AFTER_SECS, 30);
+        assert_eq!(DEFAULT_DO_RETRY_AFTER_SECS, super::task_do::ENQUEUE_RETRY_AFTER_SECS);
+    }
 
     #[test]
     fn parse_limit_query_parses_valid_value() {
