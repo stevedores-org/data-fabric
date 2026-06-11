@@ -226,16 +226,47 @@ impl PlayManager {
             // the error; the next materialize call will retry this and
             // remaining tasks because `derive_to_launch` still includes
             // anything not yet in `active_tasks`/`completed_tasks`.
-            if let Err(e) = task_stub.fetch_with_request(do_req).await {
+            let mut resp = match task_stub.fetch_with_request(do_req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    worker::console_log!(
+                        "play_do: enqueue RPC failed for task {} of run {}: {}; \
+                         leaving active_tasks unchanged so a future materialize \
+                         call will retry",
+                        task_def.id,
+                        state.run_id,
+                        e,
+                    );
+                    return Err(e);
+                }
+            };
+
+            // crr2 CRITICAL finding (play_do.rs:199): `fetch_with_request`
+            // returns `Ok(_)` for ANY HTTP status, including 4xx / 5xx.
+            // Without this check, a transient TLM outage (500), a malformed
+            // payload (400), or quota exhaustion (429) was previously
+            // followed by marking the task active even though TLM never
+            // accepted it — regressing to the original stuck-active bug
+            // that motivated the per-task atomicity refactor. We now treat
+            // any non-2xx status as a failure: bail with an error so the
+            // caller can retry / surface the failure, and leave the task
+            // un-marked so the next materialize call re-derives it.
+            let status = resp.status_code();
+            if !is_enqueue_success(status) {
+                let body = resp.text().await.unwrap_or_default();
                 worker::console_log!(
-                    "play_do: enqueue RPC failed for task {} of run {}: {}; \
+                    "play_do: enqueue for task {} of run {} returned HTTP {}: {}; \
                      leaving active_tasks unchanged so a future materialize \
                      call will retry",
                     task_def.id,
                     state.run_id,
-                    e,
+                    status,
+                    body,
                 );
-                return Err(e);
+                return Err(Error::RustError(format!(
+                    "TLM enqueue for task {} returned {}: {}",
+                    task_def.id, status, body
+                )));
             }
 
             // RPC succeeded — now mark active and persist. We re-read
@@ -248,9 +279,24 @@ impl PlayManager {
                 .get("state")
                 .await?
                 .ok_or_else(|| Error::RustError("state not found".into()))?;
-            latest.active_tasks.insert(task_def.id.clone());
-            latest.state_version = latest.state_version.wrapping_add(1);
-            storage.put("state", &latest).await?;
+
+            // crr2 HIGH finding (play_do.rs:221): a concurrent
+            // `/task-completed` handler may have completed THIS task
+            // between our outbound RPC and the re-read above (e.g. a
+            // very fast agent that claimed, ran, and reported back while
+            // our input gate was still yielded). The re-read picks up
+            // that completion (task is now in `completed_tasks`), but
+            // an unconditional `active_tasks.insert` here resurrects it
+            // — the play would then have the same id in BOTH sets, and
+            // `derive_to_launch` would silently skip it forever, but a
+            // human reading state would see a contradictory record.
+            // Guard against this by only marking active when the task
+            // is not already completed. (No-op in the common case.)
+            if !latest.completed_tasks.contains(&task_def.id) {
+                latest.active_tasks.insert(task_def.id.clone());
+                latest.state_version = latest.state_version.wrapping_add(1);
+                storage.put("state", &latest).await?;
+            }
             state = latest;
         }
 
@@ -291,6 +337,64 @@ where
         }
     }
     (state, None)
+}
+
+/// Test-only enum modelling the outcome of a single per-task `/enqueue`
+/// RPC. Mirrors the production code's three failure shapes:
+///
+/// - `TransportErr`: the `fetch_with_request` future itself returned
+///   `Err(_)` (network blip, malformed DO binding, etc.).
+/// - `HttpStatus(non-2xx)`: `Ok(resp)` was returned but the body status
+///   code is not in 2xx. crr2 CRITICAL finding (play_do.rs:199): before
+///   the fix, the production loop treated this case as success.
+/// - `HttpStatus(2xx)`: success.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+enum EnqueueOutcome {
+    HttpStatus(u16),
+    TransportErr,
+}
+
+/// Test-only simulator that mirrors the post-fix production loop more
+/// faithfully than `simulate_per_task_materialize`: it propagates the
+/// HTTP-status check via `is_enqueue_success`, so non-2xx responses
+/// also count as failure (with the task left un-marked). Use this for
+/// the crr2 CRITICAL regression tests; the older `_active_on_rpc_*`
+/// tests keep using `simulate_per_task_materialize` to pin the
+/// previous invariant.
+#[cfg(test)]
+fn simulate_per_task_materialize_with_status<F>(
+    initial: PlayState,
+    to_launch: &[PlayTaskDefinition],
+    mut rpc: F,
+) -> (PlayState, Option<usize>)
+where
+    F: FnMut(&PlayTaskDefinition) -> EnqueueOutcome,
+{
+    let mut state = initial;
+    for (idx, task_def) in to_launch.iter().enumerate() {
+        match rpc(task_def) {
+            EnqueueOutcome::HttpStatus(s) if is_enqueue_success(s) => {
+                state.active_tasks.insert(task_def.id.clone());
+                state.state_version = state.state_version.wrapping_add(1);
+            }
+            _ => return (state, Some(idx)),
+        }
+    }
+    (state, None)
+}
+
+/// Pure helper: is the HTTP status returned by TaskLeaseManager's
+/// `/enqueue` route an accept? We treat the 2xx range as success and
+/// everything else as a failure that bubbles up so the caller can retry.
+///
+/// Extracted as a free function so the per-task atomicity tests can
+/// directly model the production status-code branching without spinning
+/// up a Workers runtime (see `simulate_per_task_materialize`'s
+/// `EnqueueOutcome` enum). Mirror of the check in
+/// `materialize_eligible_tasks` — keep these two in sync.
+pub(crate) fn is_enqueue_success(status: u16) -> bool {
+    (200..300).contains(&status)
 }
 
 /// Pure derivation of eligible-to-launch tasks from a PlayState snapshot.
@@ -586,6 +690,160 @@ mod tests {
             "no task marked active when first RPC fails — \
              pre-fix would have stranded all three"
         );
+    }
+
+    // ── crr2 CRITICAL finding: play_do.rs:199 — status check on enqueue ─
+    //
+    // Before the crr2 fix, the loop did:
+    //   let _resp = task_stub.fetch_with_request(do_req).await?;
+    //   // ... immediately marks task as active in state
+    // `fetch_with_request` returns Ok(_) for ANY HTTP status, so when
+    // TLM returned 500 (transient outage, bad payload, quota), the task
+    // got marked active even though TLM did NOT accept it. The next
+    // materialize call's `derive_to_launch` would skip the task (it's
+    // in active_tasks), and TLM never lease-expires what it never
+    // received — regressing to the original stuck-active bug.
+
+    #[test]
+    fn is_enqueue_success_accepts_2xx() {
+        assert!(is_enqueue_success(200));
+        assert!(is_enqueue_success(201));
+        assert!(is_enqueue_success(204));
+        assert!(is_enqueue_success(299));
+    }
+
+    #[test]
+    fn is_enqueue_success_rejects_non_2xx() {
+        // The whole point of the crr2 CRITICAL fix: every non-2xx
+        // status must NOT be treated as a successful enqueue.
+        assert!(!is_enqueue_success(199));
+        assert!(!is_enqueue_success(300));
+        assert!(!is_enqueue_success(400));
+        assert!(!is_enqueue_success(404));
+        assert!(!is_enqueue_success(429));
+        assert!(!is_enqueue_success(500));
+        assert!(!is_enqueue_success(503));
+    }
+
+    #[test]
+    fn per_task_materialize_does_not_mark_active_on_5xx() {
+        // crr2 CRITICAL regression test. Before the fix, a 500 from TLM
+        // landed the task in `active_tasks` because the loop only
+        // matched on `Err(_)`. After the fix, a 5xx makes the loop
+        // bail and the failed task stays un-marked so a future
+        // materialize re-derives it.
+        let state = make_state(vec![task("a", &[]), task("b", &[]), task("c", &[])]);
+        let to_launch = derive_to_launch(&state);
+        let (final_state, err_idx) =
+            simulate_per_task_materialize_with_status(state, &to_launch, |t| {
+                if t.id == "b" {
+                    EnqueueOutcome::HttpStatus(500)
+                } else {
+                    EnqueueOutcome::HttpStatus(200)
+                }
+            });
+        assert_eq!(err_idx, Some(1), "loop aborts at 5xx task");
+        let active: HashSet<_> = final_state.active_tasks.iter().cloned().collect();
+        assert_eq!(
+            active,
+            HashSet::from(["a".to_string()]),
+            "only the 2xx-ack'd task is marked active; 5xx must NOT mark active",
+        );
+        assert!(
+            !final_state.active_tasks.contains("b"),
+            "the 5xx task must remain un-marked so a future materialize retries it",
+        );
+        assert!(!final_state.active_tasks.contains("c"));
+    }
+
+    #[test]
+    fn per_task_materialize_does_not_mark_active_on_4xx() {
+        // Same shape as the 5xx test but for a 4xx (e.g. 400 malformed
+        // payload, 429 quota). All non-2xx statuses must be treated as
+        // a non-ack to avoid the stuck-active regression.
+        let state = make_state(vec![task("a", &[]), task("b", &[])]);
+        let to_launch = derive_to_launch(&state);
+        let (final_state, err_idx) =
+            simulate_per_task_materialize_with_status(state, &to_launch, |t| {
+                if t.id == "a" {
+                    EnqueueOutcome::HttpStatus(429)
+                } else {
+                    EnqueueOutcome::HttpStatus(200)
+                }
+            });
+        assert_eq!(err_idx, Some(0), "loop aborts at the 429 first task");
+        assert!(
+            final_state.active_tasks.is_empty(),
+            "429 on the first task leaves nothing active",
+        );
+    }
+
+    #[test]
+    fn per_task_materialize_treats_transport_err_as_failure() {
+        // Transport-level failure (the old `.await?` path) must still
+        // bail without marking the task active. This guards against
+        // a regression where someone tightens the status check but
+        // accidentally loosens the transport-error handling.
+        let state = make_state(vec![task("a", &[]), task("b", &[])]);
+        let to_launch = derive_to_launch(&state);
+        let (final_state, err_idx) =
+            simulate_per_task_materialize_with_status(state, &to_launch, |_| {
+                EnqueueOutcome::TransportErr
+            });
+        assert_eq!(err_idx, Some(0));
+        assert!(final_state.active_tasks.is_empty());
+    }
+
+    // ── crr2 HIGH finding: play_do.rs:221 — race with /task-completed ─
+    //
+    // After the per-task enqueue succeeds the loop re-reads state from
+    // storage to fold in concurrent `/task-completed` mutations that
+    // landed while our input gate was yielded on the outbound RPC's
+    // await. Before the crr2 fix the loop unconditionally did
+    // `latest.active_tasks.insert(task_def.id.clone())` — which, if a
+    // concurrent handler had already moved the task into
+    // `completed_tasks` (e.g. a very fast agent picked it up and
+    // reported back), would resurrect the task by putting it in BOTH
+    // sets. derive_to_launch then silently skips it forever (it's in
+    // active_tasks), but the durable record is internally
+    // contradictory. The post-fix code only inserts when the task is
+    // NOT already in completed_tasks.
+
+    /// Test-only mirror of the post-fix insert decision: only mark
+    /// active when the task is not already in completed_tasks. If this
+    /// and the production loop diverge in future edits, the test
+    /// becomes a tripwire.
+    fn should_mark_active(latest: &PlayState, task_id: &str) -> bool {
+        !latest.completed_tasks.contains(task_id)
+    }
+
+    #[test]
+    fn race_with_task_completed_does_not_resurrect_completed_task() {
+        // Simulate the race: we issued the enqueue for "a"; while we
+        // were awaiting, /task-completed for "a" ran (e.g. via a TLM
+        // notify-retry that beat our re-read by inches) and moved "a"
+        // into completed_tasks. The re-read picks that up. Without the
+        // fix we would re-insert into active_tasks; with the fix we
+        // leave it alone.
+        let mut latest = make_state(vec![task("a", &[]), task("b", &[])]);
+        latest.completed_tasks.insert("a".to_string());
+
+        assert!(
+            !should_mark_active(&latest, "a"),
+            "completed task must NOT be re-marked active by the post-RPC re-read",
+        );
+        assert!(
+            should_mark_active(&latest, "b"),
+            "uncompleted task is still safe to mark active",
+        );
+    }
+
+    #[test]
+    fn race_no_completion_marks_active_as_usual() {
+        // Sanity: the common case (no concurrent completion) still
+        // marks the task active.
+        let latest = make_state(vec![task("a", &[])]);
+        assert!(should_mark_active(&latest, "a"));
     }
 
     #[test]

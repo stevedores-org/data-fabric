@@ -288,6 +288,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "js-sys",
+ "percent-encoding",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
