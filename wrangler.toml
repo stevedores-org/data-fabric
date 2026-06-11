@@ -4,6 +4,15 @@ compatibility_date = "2026-02-22"
 account_id = "f1be33af27cf878e2e81cb29a0d886f7"
 workers_dev = true
 
+# Workers Observability — runtime logs, traces, and metrics. Without this
+# block, `console.*` output and unhandled exceptions are invisible in the
+# dashboard and via `wrangler tail`. Per-env duplicates below pick up the
+# same setting since wrangler envs do not inherit observability.
+# Lower head_sampling_rate (e.g. 0.1) if log volume becomes a cost concern.
+[observability]
+enabled = true
+head_sampling_rate = 1.0
+
 # ── Custom domain ────────────────────────────────────────────────
 [[routes]]
 pattern = "data-fabric.stevedores.org/*"
@@ -22,6 +31,32 @@ command = "bash scripts/build-worker.sh"
 [vars]
 APP_ENV = "dev"
 SERVICE_NAME = "data-fabric"
+
+[durable_objects]
+bindings = [
+  { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" },
+  { name = "PLAY_MANAGER", class_name = "PlayManager" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["TaskLeaseManager"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["ThreadManager"]
+
+[[migrations]]
+tag = "v3"
+new_classes = ["PlayManager"]
+
+[ai]
+binding = "AI"
+
+[[vectorize]]
+binding = "SEMANTIC_INDEX"
+index_name = "data-fabric-semantic-index"
 
 # ── D1: structured metadata, lineage, domain entities ───────────
 # Create DB: wrangler d1 create data-fabric
@@ -56,6 +91,23 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+# Messages that exceed max_retries land here instead of being dropped
+# silently. Provisioned out-of-band:
+#   bunx wrangler queues create data-fabric-events-dlq
+dead_letter_queue = "data-fabric-events-dlq"
+
+# ── Analytics Engine: API latency sink (WS10 pilot KPI #6) ──────
+# DEFERRED to a follow-up PR. Enabling AE at the account level alone is
+# not sufficient for CF Workers Builds to deploy with the binding —
+# diagnosis needs dashboard log access. The worker code in src/lib.rs
+# already calls env.analytics_engine("PILOT_LATENCY").ok() and treats
+# the missing binding as non-fatal, so KPI #6 (latency p50/p95/p99)
+# silently becomes a no-op until this binding is re-added. The other
+# five KPIs continue to flow via /v1/metrics/pilot (D1-backed). See
+# follow-up issue once filed.
+# [[analytics_engine_datasets]]
+# binding = "PILOT_LATENCY"
+# dataset = "data_fabric_pilot_latency"
 
 # ── Environments: MOM Integration (Phase 4 & 5) ──────────────────
 
@@ -67,6 +119,17 @@ binding = "DB"
 database_name = "data-fabric"
 database_id = "6afcdc53-3d1c-4e99-941c-76b5d1a6fda2"
 migrations_dir = "migrations"
+[env.development.durable_objects]
+bindings = [
+  { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" },
+  { name = "PLAY_MANAGER", class_name = "PlayManager" }
+]
+[env.development.ai]
+binding = "AI"
+[[env.development.vectorize]]
+binding = "SEMANTIC_INDEX"
+index_name = "data-fabric-semantic-index-dev"
 [[env.development.r2_buckets]]
 binding = "ARTIFACTS"
 bucket_name = "data-fabric-artifacts"
@@ -81,6 +144,14 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+dead_letter_queue = "data-fabric-events-dlq"
+[env.development.observability]
+enabled = true
+head_sampling_rate = 1.0
+# AE binding deferred — see top-level note above.
+# [[env.development.analytics_engine_datasets]]
+# binding = "PILOT_LATENCY"
+# dataset = "data_fabric_pilot_latency_dev"
 
 # Staging: Pre-production testing with stevedores.org
 [env.staging]
@@ -90,6 +161,17 @@ binding = "DB"
 database_name = "data-fabric"
 database_id = "6afcdc53-3d1c-4e99-941c-76b5d1a6fda2"
 migrations_dir = "migrations"
+[env.staging.durable_objects]
+bindings = [
+  { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" },
+  { name = "PLAY_MANAGER", class_name = "PlayManager" }
+]
+[env.staging.ai]
+binding = "AI"
+[[env.staging.vectorize]]
+binding = "SEMANTIC_INDEX"
+index_name = "data-fabric-semantic-index-staging"
 [[env.staging.r2_buckets]]
 binding = "ARTIFACTS"
 bucket_name = "data-fabric-artifacts"
@@ -104,6 +186,14 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+dead_letter_queue = "data-fabric-events-dlq"
+[env.staging.observability]
+enabled = true
+head_sampling_rate = 1.0
+# AE binding deferred — see top-level note above.
+# [[env.staging.analytics_engine_datasets]]
+# binding = "PILOT_LATENCY"
+# dataset = "data_fabric_pilot_latency_staging"
 
 # Production: Primary lornu.com with stevedores.org fallback
 [env.production]
@@ -113,6 +203,17 @@ binding = "DB"
 database_name = "data-fabric"
 database_id = "6afcdc53-3d1c-4e99-941c-76b5d1a6fda2"
 migrations_dir = "migrations"
+[env.production.durable_objects]
+bindings = [
+  { name = "TASK_LEASE_MANAGER", class_name = "TaskLeaseManager" },
+  { name = "THREAD_MANAGER", class_name = "ThreadManager" },
+  { name = "PLAY_MANAGER", class_name = "PlayManager" }
+]
+[env.production.ai]
+binding = "AI"
+[[env.production.vectorize]]
+binding = "SEMANTIC_INDEX"
+index_name = "data-fabric-semantic-index-prod"
 [[env.production.r2_buckets]]
 binding = "ARTIFACTS"
 bucket_name = "data-fabric-artifacts"
@@ -127,3 +228,11 @@ queue = "data-fabric-events"
 queue = "data-fabric-events"
 max_batch_size = 50
 max_batch_timeout = 5
+dead_letter_queue = "data-fabric-events-dlq"
+[env.production.observability]
+enabled = true
+head_sampling_rate = 1.0
+# AE binding deferred — see top-level note above.
+# [[env.production.analytics_engine_datasets]]
+# binding = "PILOT_LATENCY"
+# dataset = "data_fabric_pilot_latency"

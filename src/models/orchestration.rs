@@ -15,7 +15,7 @@ pub struct CreateAgentTask {
     pub max_retries: Option<i32>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentTask {
     pub id: String,
     pub job_id: String,
@@ -88,7 +88,7 @@ pub struct CreateCheckpoint {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Checkpoint {
     pub id: String,
     pub thread_id: String,
