@@ -12,9 +12,13 @@ mod reasoning;
 mod telemetry;
 mod plays;
 
+// Issue #148 / AIVCS slice 3 — human decision projection.
+mod aivcs_human_decision;
+
 pub use reasoning::*;
 pub use telemetry::*;
 pub use plays::*;
+pub use aivcs_human_decision::*;
 #[allow(dead_code)]
 mod relationships;
 mod requests;

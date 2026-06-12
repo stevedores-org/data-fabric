@@ -15,8 +15,7 @@ use worker::*;
 // statements the cross_tenant_sql_shape tests will fail.
 
 /// SELECT for `get_play_definition` — scoped by tenant_id then name.
-const SQL_GET_PLAY_DEFINITION: &str =
-    "SELECT name, goal, tasks_json FROM play_definitions \
+const SQL_GET_PLAY_DEFINITION: &str = "SELECT name, goal, tasks_json FROM play_definitions \
      WHERE tenant_id = ?1 AND name = ?2";
 
 /// INSERT for `create_policy_escalation` — tenant_id is the first column.
@@ -29,8 +28,7 @@ const SQL_UPSERT_RATE_LIMIT_COUNTER: &str =
     "INSERT INTO policy_rate_limit_counters (\n            tenant_id, id, actor, action_class, window_start_epoch, window_seconds, count, updated_at\n         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)\n         ON CONFLICT(id) DO UPDATE SET\n            count = count + 1,\n            updated_at = excluded.updated_at";
 
 /// SELECT for the rate-limit count, also tenant-scoped.
-const SQL_SELECT_RATE_LIMIT_COUNT: &str =
-    "SELECT count FROM policy_rate_limit_counters \
+const SQL_SELECT_RATE_LIMIT_COUNT: &str = "SELECT count FROM policy_rate_limit_counters \
      WHERE tenant_id = ?1 AND id = ?2";
 
 // ── AIVCS: change_set SQL constants (issue #148, slice 1) ──────────
@@ -123,6 +121,34 @@ const SQL_LIST_FILE_ANCHORS_FOR_THREAD: &str =
     "SELECT id, thread_id, file_path, start_line, end_line, side \
      FROM file_anchor WHERE tenant_id = ?1 AND thread_id = ?2 \
      ORDER BY file_path ASC, start_line ASC, id ASC LIMIT ?3";
+/// Issue #148 / AIVCS slice 3 — INSERT into the `human_decision` projection.
+///
+/// `tenant_id` is the first column (and bound to ?1) so cross-tenant
+/// writes can't slip past the WS8 isolation tests. The projection
+/// carries seven typed columns plus `tenant_id` and `id`; the
+/// `created_at` column is populated by SQLite's column default rather
+/// than by a bound parameter so retries from the same wall-clock pin
+/// to a single value.
+const SQL_INSERT_HUMAN_DECISION: &str =
+    "INSERT INTO human_decision (tenant_id, id, run_id, review_id, actor, decision_type, reason, policy_decision_id, resulting_event_id)\n         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+
+/// SELECT for `list_human_decisions_by_run` — tenant-scoped, ordered by
+/// `created_at` ascending so the UI can render the human-decision
+/// timeline per run without a second sort pass.
+const SQL_LIST_HUMAN_DECISIONS_BY_RUN: &str =
+    "SELECT id, run_id, review_id, actor, decision_type, reason, policy_decision_id, resulting_event_id, created_at \
+     FROM human_decision \
+     WHERE tenant_id = ?1 AND run_id = ?2 \
+     ORDER BY created_at ASC, id ASC";
+
+/// SELECT for `list_human_decisions_by_review` — tenant-scoped, ordered
+/// by `created_at` ascending. Mirrors the by-run query shape so the BFF
+/// can share a row decoder.
+const SQL_LIST_HUMAN_DECISIONS_BY_REVIEW: &str =
+    "SELECT id, run_id, review_id, actor, decision_type, reason, policy_decision_id, resulting_event_id, created_at \
+     FROM human_decision \
+     WHERE tenant_id = ?1 AND review_id = ?2 \
+     ORDER BY created_at ASC, id ASC";
 
 pub fn now_iso() -> String {
     js_sys::Date::new_0().to_iso_string().as_string().unwrap()
@@ -195,7 +221,10 @@ pub async fn sync_task_status(
     tenant_id: &str,
     task: &models::AgentTask,
 ) -> Result<()> {
-    let result_json = task.result.as_ref().map(|v| serde_json::to_string(v).unwrap());
+    let result_json = task
+        .result
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap());
 
     db.prepare(
         "UPDATE mcp_tasks SET status = ?1, agent_id = ?2, result = ?3, retry_count = ?4, lease_expires_at = ?5, completed_at = ?6
@@ -329,8 +358,7 @@ pub async fn list_agents(
 ) -> Result<(Vec<models::Agent>, Option<crate::pagination::AgentsCursor>)> {
     let fetch_limit = limit.saturating_add(1);
 
-    let mut clauses: Vec<String> =
-        vec!["tenant_id = ?".into(), "status = 'active'".into()];
+    let mut clauses: Vec<String> = vec!["tenant_id = ?".into(), "status = 'active'".into()];
     let mut bindings: Vec<JsValue> = vec![JsValue::from_str(tenant_id)];
 
     if let Some(c) = cursor {
@@ -1014,7 +1042,7 @@ pub async fn retrieve_memory_hybrid(
     }
 
     let qlike = format!("%{}%", req.query.to_lowercase());
-    
+
     if !semantic_ids.is_empty() {
         let mut id_placeholders = Vec::new();
         for id in semantic_ids {
@@ -1023,7 +1051,7 @@ pub async fn retrieve_memory_hybrid(
             idx += 1;
         }
         let id_clause = id_placeholders.join(", ");
-        
+
         where_parts.push(format!(
             "(id IN ({}) OR (lower(summary) LIKE ?{} OR lower(COALESCE(title, '')) LIKE ?{} OR lower(COALESCE(tags, '')) LIKE ?{}))",
             id_clause, idx, idx + 1, idx + 2
@@ -1035,7 +1063,7 @@ pub async fn retrieve_memory_hybrid(
             idx + 2
         ));
     }
-    
+
     bind.push(JsValue::from_str(&qlike));
     bind.push(JsValue::from_str(&qlike));
     bind.push(JsValue::from_str(&qlike));
@@ -1073,7 +1101,7 @@ pub async fn retrieve_memory_hybrid(
         }
 
         let mut score = score_candidate(&row, &req.query, now_ms);
-        
+
         // Semantic boost: if ID was in semantic_ids, boost the score
         if semantic_ids.contains(&row.id) {
             score += 2.0; // High boost for vector match
@@ -1540,22 +1568,22 @@ pub async fn create_policy_escalation(
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
         .unwrap_or_else(|| "{}".into());
     db.prepare(SQL_INSERT_POLICY_ESCALATION)
-    .bind(&[
-        JsValue::from_str(tenant_id),
-        JsValue::from_str(escalation_id),
-        JsValue::from_str(decision_id),
-        JsValue::from_str(action),
-        JsValue::from_str(actor),
-        match resource {
-            Some(r) => JsValue::from_str(r),
-            None => JsValue::NULL,
-        },
-        JsValue::from_str(&format!("{:?}", risk).to_ascii_lowercase()),
-        JsValue::from_str(&payload),
-        JsValue::from_str(&now),
-    ])?
-    .run()
-    .await?;
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(escalation_id),
+            JsValue::from_str(decision_id),
+            JsValue::from_str(action),
+            JsValue::from_str(actor),
+            match resource {
+                Some(r) => JsValue::from_str(r),
+                None => JsValue::NULL,
+            },
+            JsValue::from_str(&format!("{:?}", risk).to_ascii_lowercase()),
+            JsValue::from_str(&payload),
+            JsValue::from_str(&now),
+        ])?
+        .run()
+        .await?;
     Ok(())
 }
 
@@ -1830,7 +1858,10 @@ pub async fn list_policy_rules(
     tenant_id: &str,
     limit: u32,
     cursor: Option<&crate::pagination::PolicyRulesCursor>,
-) -> Result<(Vec<PolicyRuleRow>, Option<crate::pagination::PolicyRulesCursor>)> {
+) -> Result<(
+    Vec<PolicyRuleRow>,
+    Option<crate::pagination::PolicyRulesCursor>,
+)> {
     let fetch_limit = limit.saturating_add(1);
 
     let mut clauses: Vec<String> = vec!["tenant_id = ?".into()];
@@ -2254,7 +2285,10 @@ pub async fn record_telemetry(
     body: &models::TelemetrySnapshot,
 ) -> Result<()> {
     let now = now_iso();
-    let payload_json = body.payload.as_ref().map(|v| serde_json::to_string(v).unwrap());
+    let payload_json = body
+        .payload
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap());
 
     db.prepare(
         "INSERT INTO telemetry_snapshots (
@@ -2333,8 +2367,9 @@ pub async fn insert_reasoning_trace(
     payload: ReasoningPayloadRefs<'_>,
 ) -> Result<bool> {
     let now = now_iso();
-    let res: D1Result = db.prepare(
-        "INSERT INTO reasoning_traces (
+    let res: D1Result = db
+        .prepare(
+            "INSERT INTO reasoning_traces (
             id, tenant_id, schema_version,
             agent_id, job_id, parent_span_id, step_number, step_type,
             inputs_inline, inputs_r2_key, outputs_inline, outputs_r2_key,
@@ -2344,30 +2379,42 @@ pub async fn insert_reasoning_trace(
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
          )
          ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
-    )
-    .bind(&[
-        JsValue::from_str(id),
-        JsValue::from_str(tenant_id),
-        JsValue::from(body.schema_version),
-        JsValue::from_str(&body.agent_id),
-        JsValue::from_str(&body.job_id),
-        opt_str(&body.parent_span_id),
-        JsValue::from(body.step_number),
-        JsValue::from_str(body.step_type.as_str()),
-        payload.inputs_inline.map(JsValue::from_str).unwrap_or(JsValue::NULL),
-        payload.inputs_r2_key.map(JsValue::from_str).unwrap_or(JsValue::NULL),
-        payload.outputs_inline.map(JsValue::from_str).unwrap_or(JsValue::NULL),
-        payload.outputs_r2_key.map(JsValue::from_str).unwrap_or(JsValue::NULL),
-        JsValue::from(body.tokens.input),
-        JsValue::from(body.tokens.output),
-        JsValue::from(body.tokens.cached),
-        JsValue::from_str(&body.started_at),
-        opt_str(&body.completed_at),
-        JsValue::from_str(&body.idempotency_key),
-        JsValue::from_str(&now),
-    ])?
-    .run()
-    .await?;
+        )
+        .bind(&[
+            JsValue::from_str(id),
+            JsValue::from_str(tenant_id),
+            JsValue::from(body.schema_version),
+            JsValue::from_str(&body.agent_id),
+            JsValue::from_str(&body.job_id),
+            opt_str(&body.parent_span_id),
+            JsValue::from(body.step_number),
+            JsValue::from_str(body.step_type.as_str()),
+            payload
+                .inputs_inline
+                .map(JsValue::from_str)
+                .unwrap_or(JsValue::NULL),
+            payload
+                .inputs_r2_key
+                .map(JsValue::from_str)
+                .unwrap_or(JsValue::NULL),
+            payload
+                .outputs_inline
+                .map(JsValue::from_str)
+                .unwrap_or(JsValue::NULL),
+            payload
+                .outputs_r2_key
+                .map(JsValue::from_str)
+                .unwrap_or(JsValue::NULL),
+            JsValue::from(body.tokens.input),
+            JsValue::from(body.tokens.output),
+            JsValue::from(body.tokens.cached),
+            JsValue::from_str(&body.started_at),
+            opt_str(&body.completed_at),
+            JsValue::from_str(&body.idempotency_key),
+            JsValue::from_str(&now),
+        ])?
+        .run()
+        .await?;
 
     let inserted = res
         .meta()?
@@ -2566,21 +2613,22 @@ pub async fn check_and_increment_rate_limit(
     // its own per-(actor, action_class, window) slot. Before this change
     // two tenants sharing an actor name (e.g. "agent-1") collided into a
     // single counter and one tenant could exhaust the other's quota.
-    let counter_id = rate_limit_counter_id(tenant_id, actor, action_class, window_start, window_seconds);
+    let counter_id =
+        rate_limit_counter_id(tenant_id, actor, action_class, window_start, window_seconds);
     let now_iso = now_iso();
 
     db.prepare(SQL_UPSERT_RATE_LIMIT_COUNTER)
-    .bind(&[
-        JsValue::from_str(tenant_id),
-        JsValue::from_str(&counter_id),
-        JsValue::from_str(actor),
-        JsValue::from_str(action_class),
-        JsValue::from(window_start),
-        JsValue::from(window_seconds),
-        JsValue::from_str(&now_iso),
-    ])?
-    .run()
-    .await?;
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&counter_id),
+            JsValue::from_str(actor),
+            JsValue::from_str(action_class),
+            JsValue::from(window_start),
+            JsValue::from(window_seconds),
+            JsValue::from_str(&now_iso),
+        ])?
+        .run()
+        .await?;
 
     // SELECT is also tenant-scoped as defense-in-depth: even though the
     // counter_id already includes tenant_id, the WHERE clause makes the
@@ -2751,7 +2799,10 @@ pub async fn list_review_threads_for_review(
         .all()
         .await?;
     let rows: Vec<ReviewThreadRow> = result.results()?;
-    Ok(rows.into_iter().filter_map(|r| r.into_review_thread()).collect())
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.into_review_thread())
+        .collect())
 }
 
 #[allow(dead_code)]
@@ -2816,7 +2867,10 @@ pub async fn list_review_comments_for_thread(
         .all()
         .await?;
     let rows: Vec<ReviewCommentRow> = result.results()?;
-    Ok(rows.into_iter().filter_map(|r| r.into_review_comment()).collect())
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.into_review_comment())
+        .collect())
 }
 
 #[allow(dead_code)]
@@ -2891,7 +2945,10 @@ pub async fn list_file_anchors_for_thread(
         .all()
         .await?;
     let rows: Vec<FileAnchorRow> = result.results()?;
-    Ok(rows.into_iter().filter_map(|r| r.into_file_anchor()).collect())
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.into_file_anchor())
+        .collect())
 }
 
 // ── Internal row types ──────────────────────────────────────────
@@ -4129,9 +4186,12 @@ struct ChangeSetRow {
 #[allow(dead_code)] // HTTP route consumer lands in a later AIVCS slice.
 impl ChangeSetRow {
     fn into_change_set(self) -> models::ChangeSet {
-        let status = std::str::FromStr::from_str(&self.status)
-            .unwrap_or(models::ChangeSetStatus::Proposed);
-        let risk_level = self.risk_level.as_deref().and_then(risk_level_from_storage_str);
+        let status =
+            std::str::FromStr::from_str(&self.status).unwrap_or(models::ChangeSetStatus::Proposed);
+        let risk_level = self
+            .risk_level
+            .as_deref()
+            .and_then(risk_level_from_storage_str);
         models::ChangeSet {
             id: self.id,
             repo: self.repo,
@@ -4232,6 +4292,122 @@ pub async fn list_change_sets_by_repo(
         .await?;
     let rows: Vec<ChangeSetRow> = result.results()?;
     Ok(rows.into_iter().map(|r| r.into_change_set()).collect())
+}
+
+// ── Issue #148 / AIVCS slice 3 — human_decision projection ──────────
+//
+// Projection of human approve / request_changes / pause / resume / merge
+// decisions over runs and reviews. Events remain the source of truth in
+// `events_bronze`; this projection gives the UI / BFF an indexed shape
+// to list decisions per run or per review without scanning the event
+// log. Slice 3 is projection-only — no HTTP route yet.
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct HumanDecisionRow {
+    id: String,
+    run_id: Option<String>,
+    review_id: Option<String>,
+    actor: String,
+    decision_type: String,
+    reason: Option<String>,
+    policy_decision_id: Option<String>,
+    resulting_event_id: Option<String>,
+    created_at: String,
+}
+
+impl HumanDecisionRow {
+    #[allow(dead_code)]
+    fn into_decision(self) -> Option<models::HumanDecision> {
+        let decision_type = self
+            .decision_type
+            .parse::<models::HumanDecisionType>()
+            .ok()?;
+        Some(models::HumanDecision {
+            id: self.id,
+            run_id: self.run_id,
+            review_id: self.review_id,
+            actor: self.actor,
+            decision_type,
+            reason: self.reason,
+            policy_decision_id: self.policy_decision_id,
+            resulting_event_id: self.resulting_event_id,
+            created_at: self.created_at,
+        })
+    }
+}
+
+/// Insert one row into the `human_decision` projection. The caller mints
+/// `id` (typically a UUID) and is responsible for writing the bronze
+/// event whose id is passed back in `body.resulting_event_id`.
+///
+/// Tenant scoping: `tenant_id` is bound to ?1; see
+/// `SQL_INSERT_HUMAN_DECISION`.
+#[allow(dead_code)]
+pub async fn create_human_decision(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::CreateHumanDecision,
+) -> Result<()> {
+    db.prepare(SQL_INSERT_HUMAN_DECISION)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(id),
+            opt_str(&body.run_id),
+            opt_str(&body.review_id),
+            JsValue::from_str(&body.actor),
+            JsValue::from_str(body.decision_type.as_str()),
+            opt_str(&body.reason),
+            opt_str(&body.policy_decision_id),
+            opt_str(&body.resulting_event_id),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// List `human_decision` rows for one run, in `created_at` order. The
+/// projection is small (one row per human action on a run), so this
+/// returns the full set rather than paginating; pagination can be added
+/// in a follow-up slice if a single run accumulates enough decisions to
+/// warrant it.
+#[allow(dead_code)]
+pub async fn list_human_decisions_by_run(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+) -> Result<Vec<models::HumanDecision>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_HUMAN_DECISIONS_BY_RUN)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
+        .all()
+        .await?;
+    let rows: Vec<HumanDecisionRow> = result.results()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(HumanDecisionRow::into_decision)
+        .collect())
+}
+
+/// List `human_decision` rows for one review, in `created_at` order. See
+/// `list_human_decisions_by_run` for pagination notes.
+#[allow(dead_code)]
+pub async fn list_human_decisions_by_review(
+    db: &D1Database,
+    tenant_id: &str,
+    review_id: &str,
+) -> Result<Vec<models::HumanDecision>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_HUMAN_DECISIONS_BY_REVIEW)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(review_id)])?
+        .all()
+        .await?;
+    let rows: Vec<HumanDecisionRow> = result.results()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(HumanDecisionRow::into_decision)
+        .collect())
 }
 
 #[cfg(test)]
@@ -4803,5 +4979,144 @@ mod tests {
             "review_thread status update must target review_thread; got: {}",
             SQL_UPDATE_REVIEW_THREAD_STATUS,
         );
+    }
+    // ── Issue #148 / AIVCS slice 3 — human_decision SQL shape ───
+    //
+    // Companion to the WS8 cross-tenant tests above. The projection
+    // tables don't run against a live D1 from `cargo test` (wasm-only
+    // at runtime), so we lock in the SQL text: tenant_id must be ?1 on
+    // every read and every write, and the INSERT column list must
+    // carry all 7 typed columns plus tenant_id + id. If a future edit
+    // drops a column or moves tenant_id out of the leading position
+    // these tests fail at PR-review time rather than as a silent
+    // cross-tenant leak.
+
+    #[test]
+    fn cross_tenant_sql_insert_human_decision_binds_tenant_id_first() {
+        let sql = SQL_INSERT_HUMAN_DECISION;
+        assert!(
+            sql.contains("INTO human_decision"),
+            "create_human_decision SQL must target human_decision; got: {sql}",
+        );
+        let col_list_start = sql.find("human_decision (").expect("expected column list");
+        let col_list_tail = &sql[col_list_start..];
+        // tenant_id must be the first column of the INSERT column list.
+        assert!(
+            col_list_tail.starts_with("human_decision (tenant_id,"),
+            "tenant_id must be the first column of the INSERT list; got: {col_list_tail}",
+        );
+        // VALUES must bind tenant_id as ?1 and id as ?2.
+        let values_start = sql.find("VALUES (").expect("expected VALUES clause");
+        let values_tail = &sql[values_start..];
+        assert!(
+            values_tail.starts_with("VALUES (?1, ?2,"),
+            "tenant_id and id must be the leading bound parameters; got: {values_tail}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_sql_insert_human_decision_has_all_seven_typed_columns_plus_tenant_id() {
+        // Slice spec: the projection carries 7 typed columns (run_id,
+        // review_id, actor, decision_type, reason, policy_decision_id,
+        // resulting_event_id) plus tenant_id + id. created_at is filled
+        // by the DEFAULT, not bound. Pin the exact column list so a
+        // future migration that adds a column must also bump this test.
+        let sql = SQL_INSERT_HUMAN_DECISION;
+        for expected in [
+            "tenant_id",
+            "id",
+            "run_id",
+            "review_id",
+            "actor",
+            "decision_type",
+            "reason",
+            "policy_decision_id",
+            "resulting_event_id",
+        ] {
+            assert!(
+                sql.contains(expected),
+                "INSERT column list missing {expected}; got: {sql}",
+            );
+        }
+        // Exactly 9 bound parameters (?1..?9): tenant_id, id, plus the
+        // 7 typed columns. created_at is filled by the column DEFAULT.
+        for placeholder in ["?1", "?2", "?3", "?4", "?5", "?6", "?7", "?8", "?9"] {
+            assert!(
+                sql.contains(placeholder),
+                "INSERT must bind {placeholder}; got: {sql}",
+            );
+        }
+        assert!(
+            !sql.contains("?10"),
+            "INSERT must bind exactly 9 parameters (no created_at bind, that's a DEFAULT); got: {sql}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_sql_list_human_decisions_by_run_filters_on_tenant_id() {
+        // SELECT must include `tenant_id = ?1` in the WHERE clause so a
+        // tenant B request can't list tenant A's decisions for a
+        // colliding run_id.
+        let sql = SQL_LIST_HUMAN_DECISIONS_BY_RUN;
+        assert!(
+            sql.contains("FROM human_decision"),
+            "list_human_decisions_by_run SQL must read from human_decision; got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE tenant_id = ?1 AND run_id = ?2"),
+            "list_human_decisions_by_run SQL must filter by (tenant_id=?1, run_id=?2); got: {sql}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_sql_list_human_decisions_by_review_filters_on_tenant_id() {
+        let sql = SQL_LIST_HUMAN_DECISIONS_BY_REVIEW;
+        assert!(
+            sql.contains("FROM human_decision"),
+            "list_human_decisions_by_review SQL must read from human_decision; got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE tenant_id = ?1 AND review_id = ?2"),
+            "list_human_decisions_by_review SQL must filter by (tenant_id=?1, review_id=?2); got: {sql}",
+        );
+    }
+
+    #[test]
+    fn human_decision_row_decode_uses_decision_type_from_str() {
+        let row = HumanDecisionRow {
+            id: "hd-1".into(),
+            run_id: Some("run-1".into()),
+            review_id: None,
+            actor: "human:jane".into(),
+            decision_type: "request_changes".into(),
+            reason: Some("nits".into()),
+            policy_decision_id: None,
+            resulting_event_id: Some("ev-1".into()),
+            created_at: "2026-06-11T00:00:00.000Z".into(),
+        };
+        let decoded = row.into_decision().expect("valid decision_type");
+        assert_eq!(
+            decoded.decision_type,
+            models::HumanDecisionType::RequestChanges
+        );
+        assert_eq!(decoded.id, "hd-1");
+        assert_eq!(decoded.actor, "human:jane");
+        assert_eq!(decoded.resulting_event_id.as_deref(), Some("ev-1"));
+    }
+
+    #[test]
+    fn human_decision_row_decode_skips_unknown_decision_type() {
+        let row = HumanDecisionRow {
+            id: "hd-bad".into(),
+            run_id: Some("run-1".into()),
+            review_id: None,
+            actor: "human:jane".into(),
+            decision_type: "not_a_real_decision".into(),
+            reason: None,
+            policy_decision_id: None,
+            resulting_event_id: None,
+            created_at: "2026-06-11T00:00:00.000Z".into(),
+        };
+        assert!(row.into_decision().is_none());
     }
 }
