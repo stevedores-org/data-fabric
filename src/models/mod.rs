@@ -37,6 +37,13 @@ pub mod aivcs;
 #[allow(dead_code)]
 pub mod aivcs_review;
 
+// AIVCS event taxonomy constants (issue #148, slice 5).
+// Namespaced — no glob re-export — callers reference as `models::aivcs_events::*`.
+// Constants are pre-declared for downstream slices; suppress dead_code until
+// callers are wired up.
+#[allow(dead_code)]
+pub mod aivcs_events;
+
 pub use entities::*;
 pub use memory::*;
 pub use orchestration::*;
