@@ -15,6 +15,7 @@ mod tenant;
 #[allow(dead_code)]
 mod tenant_security;
 mod thread_do;
+pub mod trace_sink;
 mod vector_index;
 mod verification;
 
@@ -897,6 +898,36 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             db::record_telemetry(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
 
             Response::from_json(&models::TelemetryAck { id, accepted: true })
+        })
+        .post_async("/v1/reasoning-traces", |mut req, ctx| async move {
+            let body: models::CreateReasoningTrace = req.json().await?;
+            if let Err(err) = body.validate() {
+                return Response::error(err, 400);
+            }
+            let schema_version = body.schema_version;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let d1 = ctx.env.d1("DB")?;
+            let bucket = ctx.env.bucket("ARTIFACTS").ok();
+            let sink = trace_sink::DataFabricTraceSink::new(&d1, bucket.as_ref());
+
+            match trace_sink::TraceSink::emit(&sink, &tenant_ctx.tenant_id, body).await {
+                Ok(ack) => Response::from_json(&ack),
+                Err(err) => {
+                    worker::console_log!(
+                        "WARN: reasoning trace stream failed non-fatally: {err:?}"
+                    );
+                    let body = serde_json::json!({
+                        "accepted": false,
+                        "duplicate": false,
+                        "schema_version": schema_version,
+                        "detail": "reasoning trace streaming temporarily unavailable",
+                        "retry_after_seconds": 5,
+                    });
+                    let mut resp = Response::from_json(&body)?;
+                    let _ = resp.headers_mut().set("Retry-After", "5");
+                    Ok(resp.with_status(202))
+                }
+            }
         })
         // ── Checkpoints (M2) ──────────────────────────────────
         .post_async("/v1/checkpoints", |mut req, ctx| async move {

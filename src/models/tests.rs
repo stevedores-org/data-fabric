@@ -1459,3 +1459,72 @@ fn trace_response_bounded_by_limit() {
     assert!(json["truncated"].as_bool().unwrap());
     assert_eq!(json["events"].as_array().unwrap().len(), 100);
 }
+
+// ── Reasoning trace telemetry ──────────────────────────────────
+
+#[test]
+fn reasoning_trace_defaults_schema_and_token_cost() {
+    let input = r#"{
+        "agent_id":"agent-1",
+        "job_id":"job-1",
+        "step_number":3,
+        "step_type":"tool_call",
+        "started_at":"2026-06-12T00:00:00Z",
+        "completed_at":"2026-06-12T00:00:01Z"
+    }"#;
+
+    let parsed: CreateReasoningTrace = serde_json::from_str(input).unwrap();
+    assert_eq!(parsed.schema_version, REASONING_TRACE_SCHEMA_VERSION);
+    assert_eq!(parsed.token_cost, TokenCost::default());
+    assert!(parsed.validate().is_ok());
+}
+
+#[test]
+fn reasoning_trace_round_trip_with_payloads() {
+    let trace = CreateReasoningTrace {
+        schema_version: REASONING_TRACE_SCHEMA_VERSION,
+        idempotency_key: Some("job-1:3".into()),
+        agent_id: "agent-1".into(),
+        job_id: "job-1".into(),
+        parent_span_id: Some("span-parent".into()),
+        step_number: 3,
+        step_type: "thought".into(),
+        inputs: Some(serde_json::json!({"prompt":"inspect"})),
+        outputs: Some(serde_json::json!({"decision":"continue"})),
+        token_cost: TokenCost {
+            input: 10,
+            output: 7,
+            cached: 2,
+        },
+        started_at: "2026-06-12T00:00:00Z".into(),
+        completed_at: "2026-06-12T00:00:01Z".into(),
+        metadata: Some(serde_json::json!({"source":"adk"})),
+    };
+
+    let json = serde_json::to_string(&trace).unwrap();
+    let parsed: CreateReasoningTrace = serde_json::from_str(&json).unwrap();
+    assert_eq!(trace, parsed);
+    assert_eq!(parsed.token_cost.input, 10);
+    assert_eq!(parsed.parent_span_id.as_deref(), Some("span-parent"));
+}
+
+#[test]
+fn reasoning_trace_validation_rejects_missing_required_values() {
+    let trace = CreateReasoningTrace {
+        schema_version: REASONING_TRACE_SCHEMA_VERSION,
+        idempotency_key: None,
+        agent_id: "".into(),
+        job_id: "job-1".into(),
+        parent_span_id: None,
+        step_number: 0,
+        step_type: "thought".into(),
+        inputs: None,
+        outputs: None,
+        token_cost: TokenCost::default(),
+        started_at: "2026-06-12T00:00:00Z".into(),
+        completed_at: "2026-06-12T00:00:01Z".into(),
+        metadata: None,
+    };
+
+    assert_eq!(trace.validate().unwrap_err(), "agent_id is required");
+}

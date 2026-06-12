@@ -2019,6 +2019,111 @@ pub async fn list_verification_evidence(
     result.results()
 }
 
+pub async fn get_reasoning_trace_id_by_key(
+    db: &D1Database,
+    tenant_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<String>> {
+    #[derive(Debug, serde::Deserialize)]
+    struct TraceIdRow {
+        id: String,
+    }
+
+    let row: Option<TraceIdRow> = db
+        .prepare(
+            "SELECT id FROM reasoning_traces WHERE tenant_id = ?1 AND idempotency_key = ?2 LIMIT 1",
+        )
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(idempotency_key),
+        ])?
+        .first(None)
+        .await?;
+
+    Ok(row.map(|r| r.id))
+}
+
+pub async fn insert_reasoning_trace(
+    db: &D1Database,
+    tenant_id: &str,
+    record: &models::ReasoningTraceRecord,
+) -> Result<bool> {
+    let now = now_iso();
+    let inputs_json = record
+        .inputs
+        .inline
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap());
+    let outputs_json = record
+        .outputs
+        .inline
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap());
+    let metadata_json = record
+        .metadata
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap());
+
+    let res: D1Result = db
+        .prepare(
+            "INSERT INTO reasoning_traces (
+            tenant_id, id, schema_version, idempotency_key, agent_id, job_id,
+            parent_span_id, step_number, step_type, inputs, inputs_archive_url,
+            inputs_size_bytes, outputs, outputs_archive_url, outputs_size_bytes,
+            token_input, token_output, token_cached, started_at, completed_at,
+            metadata, received_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6,
+            ?7, ?8, ?9, ?10, ?11,
+            ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18, ?19, ?20,
+            ?21, ?22
+         )
+         ON CONFLICT(tenant_id, idempotency_key) DO NOTHING",
+        )
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&record.id),
+            JsValue::from(record.schema_version),
+            JsValue::from_str(&record.idempotency_key),
+            JsValue::from_str(&record.agent_id),
+            JsValue::from_str(&record.job_id),
+            opt_str(&record.parent_span_id),
+            JsValue::from(record.step_number),
+            JsValue::from_str(&record.step_type),
+            match &inputs_json {
+                Some(s) => JsValue::from_str(s),
+                None => JsValue::NULL,
+            },
+            opt_str(&record.inputs.archive_url),
+            JsValue::from(record.inputs.size_bytes as f64),
+            match &outputs_json {
+                Some(s) => JsValue::from_str(s),
+                None => JsValue::NULL,
+            },
+            opt_str(&record.outputs.archive_url),
+            JsValue::from(record.outputs.size_bytes as f64),
+            JsValue::from(record.token_cost.input),
+            JsValue::from(record.token_cost.output),
+            JsValue::from(record.token_cost.cached),
+            JsValue::from_str(&record.started_at),
+            JsValue::from_str(&record.completed_at),
+            match &metadata_json {
+                Some(s) => JsValue::from_str(s),
+                None => JsValue::NULL,
+            },
+            JsValue::from_str(&now),
+        ])?
+        .run()
+        .await?;
+
+    let inserted = res
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+    Ok(inserted)
+}
+
 pub async fn record_telemetry(
     db: &D1Database,
     tenant_id: &str,
