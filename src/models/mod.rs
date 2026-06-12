@@ -22,12 +22,16 @@ mod requests;
 // WS5 memory / retrieval.
 mod memory;
 
+// AIVCS — slice 1: native `change_set` projection (issue #148).
+pub mod aivcs;
+
 pub use entities::*;
 pub use memory::*;
 pub use orchestration::*;
 #[allow(unused_imports)]
 pub use relationships::*;
 pub use requests::*;
+pub use aivcs::{ChangeSet, ChangeSetStatus, CreateChangeSet};
 
 #[cfg(test)]
 mod tests;

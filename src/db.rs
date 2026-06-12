@@ -33,6 +33,33 @@ const SQL_SELECT_RATE_LIMIT_COUNT: &str =
     "SELECT count FROM policy_rate_limit_counters \
      WHERE tenant_id = ?1 AND id = ?2";
 
+// ── AIVCS: change_set SQL constants (issue #148, slice 1) ──────────
+//
+// The `change_set` table is the projection AIVCS uses above the diff
+// artifact (R2). All three statements below bind `tenant_id` as `?1`
+// so cross-tenant reads/writes are impossible — the
+// `cross_tenant_sql_change_set_*` tests in `mod tests` pin this.
+
+/// INSERT into `change_set`. tenant_id is the first column and ?1.
+pub const SQL_INSERT_CHANGE_SET: &str =
+    "INSERT INTO change_set (tenant_id, id, repo, base_ref, head_ref, author_agent_id, status, risk_level, confidence, run_id, diff_artifact_key, summary_artifact_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+
+/// SELECT a single `change_set` row by (tenant_id, id).
+pub const SQL_GET_CHANGE_SET: &str =
+    "SELECT id, repo, base_ref, head_ref, author_agent_id, status, risk_level, confidence, run_id, diff_artifact_key, summary_artifact_key, created_at \
+     FROM change_set \
+     WHERE tenant_id = ?1 AND id = ?2";
+
+/// SELECT recent `change_set` rows for a repo. ORDER BY created_at DESC,
+/// LIMIT is bound as `?3` so callers can page (cursor-based pagination
+/// lands with the HTTP route in a later slice).
+pub const SQL_LIST_CHANGE_SETS_BY_REPO: &str =
+    "SELECT id, repo, base_ref, head_ref, author_agent_id, status, risk_level, confidence, run_id, diff_artifact_key, summary_artifact_key, created_at \
+     FROM change_set \
+     WHERE tenant_id = ?1 AND repo = ?2 \
+     ORDER BY created_at DESC \
+     LIMIT ?3";
+
 pub fn now_iso() -> String {
     js_sys::Date::new_0().to_iso_string().as_string().unwrap()
 }
@@ -3686,6 +3713,152 @@ impl IntegrationRow {
     }
 }
 
+// ── AIVCS: change_set DB layer (issue #148, slice 1) ───────────────
+//
+// Projection above the diff artifact — see `migrations/0015_aivcs_change_set.sql`
+// and `models/aivcs.rs`. HTTP routes land in a later slice; this file only
+// owns the SQL + (tenant_id, ...) parameter wiring.
+
+/// Storage-string form of a [`RiskLevel`]. `RiskLevel` is `#[serde(rename_all =
+/// "snake_case")]`, so serializing yields a quoted JSON string (`"\"low\""`);
+/// strip the quotes to get the bare token we persist in the `risk_level` column.
+fn risk_level_storage_str(risk: RiskLevel) -> String {
+    // Serializing a Copy enum to JSON cannot fail — unwrap surfaces any
+    // future serde-attribute regression instead of silently writing "".
+    let s = serde_json::to_string(&risk).expect("RiskLevel always serializes");
+    s.trim_matches('"').to_string()
+}
+
+/// Reverse of [`risk_level_storage_str`].
+fn risk_level_from_storage_str(s: &str) -> Option<RiskLevel> {
+    serde_json::from_str(&format!("\"{s}\"")).ok()
+}
+
+#[allow(dead_code)] // HTTP route consumer lands in a later AIVCS slice.
+#[derive(Debug, serde::Deserialize)]
+struct ChangeSetRow {
+    id: String,
+    repo: String,
+    base_ref: String,
+    head_ref: String,
+    author_agent_id: Option<String>,
+    status: String,
+    risk_level: Option<String>,
+    confidence: Option<f64>,
+    run_id: Option<String>,
+    diff_artifact_key: Option<String>,
+    summary_artifact_key: Option<String>,
+    created_at: String,
+}
+
+#[allow(dead_code)] // HTTP route consumer lands in a later AIVCS slice.
+impl ChangeSetRow {
+    fn into_change_set(self) -> models::ChangeSet {
+        let status = std::str::FromStr::from_str(&self.status)
+            .unwrap_or(models::ChangeSetStatus::Proposed);
+        let risk_level = self.risk_level.as_deref().and_then(risk_level_from_storage_str);
+        models::ChangeSet {
+            id: self.id,
+            repo: self.repo,
+            base_ref: self.base_ref,
+            head_ref: self.head_ref,
+            author_agent_id: self.author_agent_id,
+            status,
+            risk_level,
+            confidence: self.confidence,
+            run_id: self.run_id,
+            diff_artifact_key: self.diff_artifact_key,
+            summary_artifact_key: self.summary_artifact_key,
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// Insert a new `change_set` row. If `cs.id` is None, a random hex id is
+/// minted (consistent with how other entities in this file generate ids).
+#[allow(dead_code)] // HTTP route consumer lands in a later AIVCS slice.
+pub async fn create_change_set(
+    d1: &D1Database,
+    tenant_id: &str,
+    cs: &models::CreateChangeSet,
+) -> Result<models::ChangeSet> {
+    let id = match cs.id.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => random_hex_id()?,
+    };
+    let status = cs.status.unwrap_or(models::ChangeSetStatus::Proposed);
+    let status_str = status.as_str();
+    let risk_level_str = cs.risk_level.map(risk_level_storage_str);
+    let now = now_iso();
+
+    d1.prepare(SQL_INSERT_CHANGE_SET)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&id),
+            JsValue::from_str(&cs.repo),
+            JsValue::from_str(&cs.base_ref),
+            JsValue::from_str(&cs.head_ref),
+            opt_str(&cs.author_agent_id),
+            JsValue::from_str(status_str),
+            opt_str(&risk_level_str),
+            cs.confidence.map(JsValue::from).unwrap_or(JsValue::NULL),
+            opt_str(&cs.run_id),
+            opt_str(&cs.diff_artifact_key),
+            opt_str(&cs.summary_artifact_key),
+        ])?
+        .run()
+        .await?;
+
+    Ok(models::ChangeSet {
+        id,
+        repo: cs.repo.clone(),
+        base_ref: cs.base_ref.clone(),
+        head_ref: cs.head_ref.clone(),
+        author_agent_id: cs.author_agent_id.clone(),
+        status,
+        risk_level: cs.risk_level,
+        confidence: cs.confidence,
+        run_id: cs.run_id.clone(),
+        diff_artifact_key: cs.diff_artifact_key.clone(),
+        summary_artifact_key: cs.summary_artifact_key.clone(),
+        created_at: now,
+    })
+}
+
+#[allow(dead_code)] // HTTP route consumer lands in a later AIVCS slice.
+pub async fn get_change_set(
+    d1: &D1Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<models::ChangeSet>> {
+    let row: Option<ChangeSetRow> = d1
+        .prepare(SQL_GET_CHANGE_SET)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.into_change_set()))
+}
+
+#[allow(dead_code)] // HTTP route consumer lands in a later AIVCS slice.
+pub async fn list_change_sets_by_repo(
+    d1: &D1Database,
+    tenant_id: &str,
+    repo: &str,
+    limit: u32,
+) -> Result<Vec<models::ChangeSet>> {
+    let result: D1Result = d1
+        .prepare(SQL_LIST_CHANGE_SETS_BY_REPO)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(repo),
+            JsValue::from(limit as f64),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<ChangeSetRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_change_set()).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3966,6 +4139,93 @@ mod tests {
         let a = rate_limit_counter_id("tenant-alpha", "shared-actor", "write", 0, 60);
         let b = rate_limit_counter_id("tenant-beta", "shared-actor", "write", 0, 60);
         assert_ne!(a, b);
+    }
+
+    // ── AIVCS: change_set cross-tenant SQL shape (issue #148, slice 1) ─
+
+    #[test]
+    fn cross_tenant_sql_insert_change_set_writes_tenant_id_at_position_1() {
+        // The INSERT must bind `tenant_id` to ?1 and list it as the first
+        // column. Without that, an agent writing under tenant A could be
+        // surfaced to tenant B by the get/list helpers. The exact column-
+        // list-and-VALUES shape is asserted because this is the
+        // authoritative SQL that runs against D1.
+        let sql = SQL_INSERT_CHANGE_SET;
+        assert!(
+            sql.contains("INTO change_set"),
+            "insert SQL must target change_set; got: {sql}",
+        );
+        let col_list_start = sql.find("change_set (").expect("expected column list");
+        let col_list_tail = &sql[col_list_start..];
+        assert!(
+            col_list_tail.starts_with("change_set (tenant_id, id,"),
+            "tenant_id must be the first column of the INSERT list; got: {col_list_tail}",
+        );
+        assert!(
+            sql.contains("VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+            "insert SQL must bind tenant_id as ?1 and 12 total params; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_sql_get_change_set_filters_on_tenant_id_first() {
+        // The SELECT must include `tenant_id = ?1` in the WHERE clause,
+        // and tenant_id must be the FIRST predicate so an EXPLAIN cannot
+        // accidentally pick an index that ignores the tenant dimension.
+        let sql = SQL_GET_CHANGE_SET;
+        assert!(
+            sql.contains("FROM change_set"),
+            "get SQL must target change_set; got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE tenant_id = ?1 AND id = ?2"),
+            "get SQL must filter by tenant_id (?1) then id (?2); got: {sql}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_sql_list_change_sets_by_repo_filters_on_tenant_id_first() {
+        let sql = SQL_LIST_CHANGE_SETS_BY_REPO;
+        assert!(
+            sql.contains("FROM change_set"),
+            "list SQL must target change_set; got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE tenant_id = ?1 AND repo = ?2"),
+            "list SQL must filter by tenant_id (?1) then repo (?2); got: {sql}",
+        );
+        assert!(
+            sql.contains("ORDER BY created_at DESC"),
+            "list SQL must return newest-first; got: {sql}",
+        );
+        assert!(
+            sql.contains("LIMIT ?3"),
+            "list SQL must bind limit as ?3; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn change_set_risk_level_round_trips_through_storage_str() {
+        // The risk_level column stores the snake_case token (low | medium |
+        // high | critical). Both directions must round-trip so reads after
+        // a write produce an equal RiskLevel.
+        let levels = [
+            RiskLevel::Low,
+            RiskLevel::Medium,
+            RiskLevel::High,
+            RiskLevel::Critical,
+        ];
+        for r in levels {
+            let s = risk_level_storage_str(r);
+            assert!(
+                !s.contains('"'),
+                "stored risk_level must be a bare token, not quoted JSON; got: {s}",
+            );
+            let back = risk_level_from_storage_str(&s).expect("known risk_level must parse");
+            assert_eq!(back, r);
+        }
+        assert_eq!(risk_level_storage_str(RiskLevel::Low), "low");
+        assert!(risk_level_from_storage_str("not-a-risk").is_none());
     }
 
     #[test]
