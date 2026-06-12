@@ -356,6 +356,82 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => errors::error_response("RUN_NOT_FOUND", "run not found", 404),
             }
         })
+        // ── AIVCS issue #148 slice 4: explicit run pause/resume ─────
+        //
+        // These are scoped to runs only — task-level pause/resume is a
+        // follow-up slice. We chose explicit `/pause` / `/resume`
+        // endpoints (not overloads of `/cancel` or `/fail`) so the audit
+        // trail in events_bronze records the operator's intent
+        // unambiguously.
+        .post_async("/v1/runs/:run_id/pause", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            // Auth: builder or admin. Viewer is already caught by the
+            // global middleware (it rejects all non-read methods), but
+            // we pin the role check here too so the contract is local
+            // to the handler.
+            if !matches!(
+                tenant_ctx.role,
+                tenant::TenantRole::Builder | tenant::TenantRole::Admin
+            ) {
+                return errors::error_response(
+                    "FORBIDDEN",
+                    "pause requires builder or admin role",
+                    403,
+                );
+            }
+            let run_id = ctx.param("run_id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            let actor = tenant_ctx.actor();
+            match db::pause_run(&d1, &tenant_ctx.tenant_id, &run_id, &actor).await? {
+                db::PauseOutcome::Paused(update) | db::PauseOutcome::AlreadyPaused(update) => {
+                    // Both paths return 200. AlreadyPaused is idempotent
+                    // per the issue #148 spec; the response envelope is
+                    // the same shape either way.
+                    Response::from_json(&update)
+                }
+                db::PauseOutcome::Terminal { current_status } => {
+                    errors::error_response_with_details(
+                        "RUN_IN_TERMINAL_STATE",
+                        "cannot pause a run that has already reached a terminal state",
+                        serde_json::json!({ "current_status": current_status }),
+                        409,
+                    )
+                }
+                db::PauseOutcome::NotFound => {
+                    errors::error_response("RUN_NOT_FOUND", "run not found", 404)
+                }
+            }
+        })
+        .post_async("/v1/runs/:run_id/resume", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            if !matches!(
+                tenant_ctx.role,
+                tenant::TenantRole::Builder | tenant::TenantRole::Admin
+            ) {
+                return errors::error_response(
+                    "FORBIDDEN",
+                    "resume requires builder or admin role",
+                    403,
+                );
+            }
+            let run_id = ctx.param("run_id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            let actor = tenant_ctx.actor();
+            match db::resume_run(&d1, &tenant_ctx.tenant_id, &run_id, &actor).await? {
+                db::ResumeOutcome::Resumed(update) => Response::from_json(&update),
+                db::ResumeOutcome::NotPaused { current_status } => {
+                    errors::error_response_with_details(
+                        "RUN_NOT_PAUSED",
+                        "run is not in paused state",
+                        serde_json::json!({ "current_status": current_status }),
+                        409,
+                    )
+                }
+                db::ResumeOutcome::NotFound => {
+                    errors::error_response("RUN_NOT_FOUND", "run not found", 404)
+                }
+            }
+        })
         // ── WS10 pilot baseline metrics (issue #105) ────────
         .get_async("/v1/metrics/pilot", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;

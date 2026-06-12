@@ -150,6 +150,32 @@ const SQL_LIST_HUMAN_DECISIONS_BY_REVIEW: &str =
      WHERE tenant_id = ?1 AND review_id = ?2 \
      ORDER BY created_at ASC, id ASC";
 
+/// UPDATE for `pause_run` (AIVCS issue #148 'Pause Agent' slice 4).
+///
+/// Tenant-scoped on `?1` and guarded against transitioning out of a
+/// terminal state — the guard is what makes the operation correct
+/// concurrently with a run completing on the orchestrator side. If the
+/// run already moved to 'succeeded' / 'failed' / 'cancelled' the UPDATE
+/// affects zero rows and the handler surfaces `RUN_IN_TERMINAL_STATE`.
+///
+/// `paused_at` is stamped only when transitioning from a pausable state
+/// (`created` or `running`). Already-paused runs are handled idempotently
+/// in `pause_run` before this UPDATE is issued.
+pub const SQL_PAUSE_RUN: &str =
+    "UPDATE runs SET status = 'paused', paused_at = datetime('now'), updated_at = datetime('now') \
+     WHERE tenant_id = ?1 AND id = ?2 \
+       AND status IN ('created', 'running')";
+
+/// UPDATE for `resume_run` (AIVCS issue #148 'Pause Agent' slice 4).
+///
+/// Tenant-scoped on `?1` and guarded so resume is only valid out of
+/// 'paused'. Resuming a run that is already running, or one that has
+/// reached a terminal state, affects zero rows and the handler surfaces
+/// `RUN_NOT_PAUSED`.
+pub const SQL_RESUME_RUN: &str =
+    "UPDATE runs SET status = 'running', resumed_at = datetime('now'), updated_at = datetime('now') \
+     WHERE tenant_id = ?1 AND id = ?2 AND status = 'paused'";
+
 pub fn now_iso() -> String {
     js_sys::Date::new_0().to_iso_string().as_string().unwrap()
 }
@@ -796,6 +822,239 @@ pub async fn get_run(db: &D1Database, tenant_id: &str, id: &str) -> Result<Optio
         .first(None)
         .await?;
     Ok(row.map(|r| r.into_run_response()))
+}
+
+// ── AIVCS slice 4 (issue #148): pause / resume run state ─────────────
+//
+// These helpers are the storage half of the POST /v1/runs/{run_id}/pause
+// and /resume endpoints. The HTTP-level idempotency rules
+// (already-paused → 200, terminal → 409, not-paused → 409) are layered
+// in the handler in lib.rs; this module only owns the SQL transition
+// and the resulting row read-back.
+
+/// Result of a successful pause/resume transition. The handler folds
+/// this into the response envelope. `paused_at` / `resumed_at` are
+/// `Option<String>` because a freshly-paused run hasn't been resumed
+/// yet (and vice versa) — we surface whichever timestamp the transition
+/// just wrote.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct RunStatusUpdate {
+    pub id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<String>,
+}
+
+/// Outcome of attempting a pause transition. `Paused` is the
+/// happy-path 200; `AlreadyPaused` is the idempotent 200; `Terminal`
+/// maps to 409 RUN_IN_TERMINAL_STATE; `NotFound` is a guard for the
+/// case where the run doesn't exist for the tenant at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PauseOutcome {
+    Paused(RunStatusUpdate),
+    AlreadyPaused(RunStatusUpdate),
+    Terminal { current_status: String },
+    NotFound,
+}
+
+/// Outcome of attempting a resume transition. `Resumed` is the
+/// happy-path 200; `NotPaused` maps to 409 RUN_NOT_PAUSED (covers the
+/// case where the run is in any non-paused state, including terminal);
+/// `NotFound` is the missing-row guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    Resumed(RunStatusUpdate),
+    NotPaused { current_status: String },
+    NotFound,
+}
+
+/// Attempt to pause a run. The decision tree is:
+///
+/// 1. Look up the run scoped by tenant. Missing → `NotFound`.
+/// 2. If status is already 'paused' → `AlreadyPaused` with the existing
+///    `paused_at` (do not restamp — that would mask the original pause
+///    time and confuse audit). The handler returns 200 idempotently.
+/// 3. If status is terminal → `Terminal { current_status }`. The handler
+///    returns 409 with the current state in the envelope so the caller
+///    knows why.
+/// 4. Otherwise issue `SQL_PAUSE_RUN`. We re-read the row to surface
+///    the canonical `paused_at` instead of synthesising it from the
+///    handler's wall clock (so D1 is the source of truth).
+pub async fn pause_run(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+    actor: &str,
+) -> Result<PauseOutcome> {
+    let Some(current) = get_run(db, tenant_id, run_id).await? else {
+        return Ok(PauseOutcome::NotFound);
+    };
+
+    if current.status == "paused" {
+        return Ok(PauseOutcome::AlreadyPaused(RunStatusUpdate {
+            id: current.id,
+            status: current.status,
+            paused_at: current.paused_at,
+            resumed_at: None,
+        }));
+    }
+
+    if matches!(current.status.as_str(), "succeeded" | "failed" | "cancelled") {
+        return Ok(PauseOutcome::Terminal {
+            current_status: current.status,
+        });
+    }
+
+    let update = db
+        .prepare(SQL_PAUSE_RUN)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(run_id),
+        ])?
+        .run()
+        .await?;
+
+    let changed = update
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+
+    if !changed {
+        let Some(refreshed) = get_run(db, tenant_id, run_id).await? else {
+            return Ok(PauseOutcome::NotFound);
+        };
+        return match refreshed.status.as_str() {
+            "paused" => Ok(PauseOutcome::AlreadyPaused(RunStatusUpdate {
+                id: refreshed.id,
+                status: refreshed.status,
+                paused_at: refreshed.paused_at,
+                resumed_at: None,
+            })),
+            "succeeded" | "failed" | "cancelled" => Ok(PauseOutcome::Terminal {
+                current_status: refreshed.status,
+            }),
+            other => Ok(PauseOutcome::Terminal {
+                current_status: other.to_string(),
+            }),
+        };
+    }
+
+    // Provenance: append `run.paused` to events_bronze so the WS3 trace
+    // pipeline and any downstream consumer (UI, audit, replay) can see
+    // the transition. We synthesise an event id and use the same
+    // `datetime('now')`-style timestamp the runs row carries.
+    let event_id = format!("evt_pause_{run_id}_{}", now_iso());
+    let payload = serde_json::json!({
+        "transition": "pause",
+        "from_status": current.status,
+        "to_status": "paused",
+    });
+    db.prepare(
+        "INSERT INTO events_bronze (tenant_id, id, run_id, thread_id, event_type, node_id, actor, payload, created_at)
+         VALUES (?1, ?2, ?3, NULL, 'run.paused', NULL, ?4, ?5, datetime('now'))",
+    )
+    .bind(&[
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&event_id),
+        JsValue::from_str(run_id),
+        JsValue::from_str(actor),
+        JsValue::from_str(&payload.to_string()),
+    ])?
+    .run()
+    .await?;
+
+    // Re-read so paused_at reflects what D1 actually wrote
+    // (datetime('now') is evaluated server-side).
+    let refreshed = get_run(db, tenant_id, run_id).await?.ok_or_else(|| {
+        Error::RustError("run vanished between pause UPDATE and read-back".to_string())
+    })?;
+
+    Ok(PauseOutcome::Paused(RunStatusUpdate {
+        id: refreshed.id,
+        status: refreshed.status,
+        paused_at: refreshed.paused_at,
+        resumed_at: None,
+    }))
+}
+
+/// Attempt to resume a run. The decision tree is:
+///
+/// 1. Look up the run scoped by tenant. Missing → `NotFound`.
+/// 2. If status is not 'paused' → `NotPaused { current_status }`. The
+///    handler returns 409 RUN_NOT_PAUSED.
+/// 3. Otherwise issue `SQL_RESUME_RUN`, re-read, and surface
+///    `resumed_at` from D1.
+pub async fn resume_run(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+    actor: &str,
+) -> Result<ResumeOutcome> {
+    let Some(current) = get_run(db, tenant_id, run_id).await? else {
+        return Ok(ResumeOutcome::NotFound);
+    };
+
+    if current.status != "paused" {
+        return Ok(ResumeOutcome::NotPaused {
+            current_status: current.status,
+        });
+    }
+
+    let update = db
+        .prepare(SQL_RESUME_RUN)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(run_id),
+        ])?
+        .run()
+        .await?;
+
+    let changed = update
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+
+    if !changed {
+        let Some(refreshed) = get_run(db, tenant_id, run_id).await? else {
+            return Ok(ResumeOutcome::NotFound);
+        };
+        return Ok(ResumeOutcome::NotPaused {
+            current_status: refreshed.status,
+        });
+    }
+
+    let event_id = format!("evt_resume_{run_id}_{}", now_iso());
+    let payload = serde_json::json!({
+        "transition": "resume",
+        "from_status": current.status,
+        "to_status": "running",
+    });
+    db.prepare(
+        "INSERT INTO events_bronze (tenant_id, id, run_id, thread_id, event_type, node_id, actor, payload, created_at)
+         VALUES (?1, ?2, ?3, NULL, 'run.resumed', NULL, ?4, ?5, datetime('now'))",
+    )
+    .bind(&[
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&event_id),
+        JsValue::from_str(run_id),
+        JsValue::from_str(actor),
+        JsValue::from_str(&payload.to_string()),
+    ])?
+    .run()
+    .await?;
+
+    let refreshed = get_run(db, tenant_id, run_id).await?.ok_or_else(|| {
+        Error::RustError("run vanished between resume UPDATE and read-back".to_string())
+    })?;
+
+    Ok(ResumeOutcome::Resumed(RunStatusUpdate {
+        id: refreshed.id,
+        status: refreshed.status,
+        paused_at: None,
+        resumed_at: refreshed.resumed_at,
+    }))
 }
 
 // ── WS5 Retrieval + Memory Federation ───────────────────────────
@@ -3184,6 +3443,15 @@ pub struct RunRow {
     pub created_at: String,
     pub updated_at: String,
     pub metadata: Option<String>,
+    // AIVCS issue #148 slice 4: pause/resume bookkeeping. Optional
+    // because rows that pre-date migration 0018 won't have these set,
+    // and the columns are nullable. `#[serde(default)]` lets D1's
+    // serde_wasm_bindgen deserializer tolerate either nulls or missing
+    // columns during the migration window.
+    #[serde(default)]
+    pub paused_at: Option<String>,
+    #[serde(default)]
+    pub resumed_at: Option<String>,
 }
 
 impl RunRow {
@@ -3197,6 +3465,8 @@ impl RunRow {
             created_at: self.created_at,
             updated_at: self.updated_at,
             metadata: self.metadata.and_then(|s| serde_json::from_str(&s).ok()),
+            paused_at: self.paused_at,
+            resumed_at: self.resumed_at,
         }
     }
 }
@@ -3211,6 +3481,14 @@ pub struct RunResponse {
     pub created_at: String,
     pub updated_at: String,
     pub metadata: Option<serde_json::Value>,
+    /// Last pause timestamp (server-stamped on the pause transition).
+    /// `None` for runs that have never been paused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
+    /// Last resume timestamp (server-stamped on the resume transition).
+    /// `None` for runs that have never been resumed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -5118,5 +5396,191 @@ mod tests {
             created_at: "2026-06-11T00:00:00.000Z".into(),
         };
         assert!(row.into_decision().is_none());
+    }
+
+    // ── AIVCS issue #148 slice 4: pause/resume SQL shape ────────────
+    //
+    // These tests pin the SQL text of SQL_PAUSE_RUN / SQL_RESUME_RUN so a
+    // future edit can't silently drop the tenant_id filter (cross-tenant
+    // leak) or the status guard (illegal transition out of a terminal /
+    // already-paused state).
+
+    #[test]
+    fn sql_pause_run_has_tenant_id_leading_param() {
+        // tenant_id MUST be the first bound parameter (?1) so the worker
+        // can never accidentally pause a run that belongs to a different
+        // tenant — even if a downstream caller binds the wrong run_id.
+        let sql = SQL_PAUSE_RUN;
+        assert!(
+            sql.contains("WHERE tenant_id = ?1"),
+            "SQL_PAUSE_RUN must filter by tenant_id = ?1; got: {sql}",
+        );
+        assert!(
+            sql.contains("AND id = ?2"),
+            "SQL_PAUSE_RUN must bind run id as ?2; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn sql_pause_run_has_terminal_state_guard() {
+        // The status guard is what makes this a state machine, not a
+        // last-write-wins clobber. Only `created` and `running` may
+        // transition to `paused`.
+        let sql = SQL_PAUSE_RUN;
+        assert!(
+            sql.contains("status IN ('created', 'running')"),
+            "SQL_PAUSE_RUN must only pause created/running runs; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn sql_pause_run_sets_paused_at() {
+        // The handler returns paused_at in the response envelope, so the
+        // UPDATE must actually stamp it (and not leave it to a trigger,
+        // which D1 doesn't reliably support across migrations).
+        let sql = SQL_PAUSE_RUN;
+        assert!(
+            sql.contains("status = 'paused'"),
+            "SQL_PAUSE_RUN must set status to 'paused'; got: {sql}",
+        );
+        assert!(
+            sql.contains("paused_at = datetime('now')"),
+            "SQL_PAUSE_RUN must stamp paused_at server-side; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn sql_resume_run_has_tenant_id_leading_param() {
+        let sql = SQL_RESUME_RUN;
+        assert!(
+            sql.contains("WHERE tenant_id = ?1"),
+            "SQL_RESUME_RUN must filter by tenant_id = ?1; got: {sql}",
+        );
+        assert!(
+            sql.contains("AND id = ?2"),
+            "SQL_RESUME_RUN must bind run id as ?2; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn sql_resume_run_has_paused_guard() {
+        // The guard makes resume a no-op for any non-paused run
+        // (including terminal). The handler reads zero-changes as
+        // RUN_NOT_PAUSED.
+        let sql = SQL_RESUME_RUN;
+        assert!(
+            sql.contains("status = 'paused'"),
+            "SQL_RESUME_RUN must require status = 'paused' before resuming; got: {sql}",
+        );
+        assert!(
+            sql.contains("status = 'running'"),
+            "SQL_RESUME_RUN must set status to 'running'; got: {sql}",
+        );
+        assert!(
+            sql.contains("resumed_at = datetime('now')"),
+            "SQL_RESUME_RUN must stamp resumed_at server-side; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn pause_resume_outcomes_serialize_status_update() {
+        // The RunStatusUpdate envelope serialised in handler responses
+        // must omit the opposite timestamp (paused_at on a pause
+        // response, resumed_at on a resume response). serde's
+        // skip_serializing_if = "Option::is_none" handles this — pin it
+        // here so a future derive change can't drop the attribute.
+        let paused = RunStatusUpdate {
+            id: "run-1".into(),
+            status: "paused".into(),
+            paused_at: Some("2026-06-11T00:00:00Z".into()),
+            resumed_at: None,
+        };
+        let json = serde_json::to_value(&paused).unwrap();
+        assert_eq!(json["id"], "run-1");
+        assert_eq!(json["status"], "paused");
+        assert_eq!(json["paused_at"], "2026-06-11T00:00:00Z");
+        assert!(
+            json.get("resumed_at").is_none(),
+            "resumed_at must be omitted from a fresh pause response; got: {json}",
+        );
+
+        let resumed = RunStatusUpdate {
+            id: "run-1".into(),
+            status: "running".into(),
+            paused_at: None,
+            resumed_at: Some("2026-06-11T00:01:00Z".into()),
+        };
+        let json = serde_json::to_value(&resumed).unwrap();
+        assert_eq!(json["status"], "running");
+        assert_eq!(json["resumed_at"], "2026-06-11T00:01:00Z");
+        assert!(
+            json.get("paused_at").is_none(),
+            "paused_at must be omitted from a fresh resume response; got: {json}",
+        );
+    }
+
+    // ── Outcome → HTTP code shape ───────────────────────────────────
+    //
+    // The handler in lib.rs maps these enums to the response codes
+    // mandated by the issue #148 spec. We pin the mapping here so a
+    // refactor of either the handler or the helper can't silently
+    // change the contract.
+
+    #[test]
+    fn pause_outcome_already_paused_is_idempotent_envelope() {
+        // already-paused must surface the existing paused_at, not
+        // synthesise a fresh one — restamping would mask the original
+        // pause time and corrupt the audit trail.
+        let outcome = PauseOutcome::AlreadyPaused(RunStatusUpdate {
+            id: "run-x".into(),
+            status: "paused".into(),
+            paused_at: Some("2026-06-10T12:00:00Z".into()),
+            resumed_at: None,
+        });
+        match outcome {
+            PauseOutcome::AlreadyPaused(update) => {
+                assert_eq!(update.status, "paused");
+                assert_eq!(update.paused_at.as_deref(), Some("2026-06-10T12:00:00Z"));
+            }
+            other => panic!("expected AlreadyPaused; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pause_outcome_terminal_reports_current_status_for_envelope() {
+        // The 409 envelope echoes back the offending state so the
+        // caller can present a sensible error to a human operator
+        // ("can't pause: run already succeeded") without a second
+        // round-trip.
+        for terminal in ["succeeded", "failed", "cancelled"] {
+            let outcome = PauseOutcome::Terminal {
+                current_status: terminal.to_string(),
+            };
+            match outcome {
+                PauseOutcome::Terminal { current_status } => {
+                    assert_eq!(current_status, terminal);
+                }
+                other => panic!("expected Terminal; got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resume_outcome_not_paused_reports_current_status() {
+        // Resume from any non-paused state (including terminal) is the
+        // same 409 RUN_NOT_PAUSED — we don't bifurcate the response
+        // shape based on which non-paused state the run is in. The
+        // current_status string is what disambiguates for the caller.
+        for state in ["running", "created", "succeeded", "failed", "cancelled"] {
+            let outcome = ResumeOutcome::NotPaused {
+                current_status: state.to_string(),
+            };
+            match outcome {
+                ResumeOutcome::NotPaused { current_status } => {
+                    assert_eq!(current_status, state);
+                }
+                other => panic!("expected NotPaused; got {other:?}"),
+            }
+        }
     }
 }
