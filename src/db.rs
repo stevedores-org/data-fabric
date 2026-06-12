@@ -907,13 +907,39 @@ pub async fn pause_run(
         });
     }
 
-    db.prepare(SQL_PAUSE_RUN)
+    let update = db
+        .prepare(SQL_PAUSE_RUN)
         .bind(&[
             JsValue::from_str(tenant_id),
             JsValue::from_str(run_id),
         ])?
         .run()
         .await?;
+
+    let changed = update
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+
+    if !changed {
+        let Some(refreshed) = get_run(db, tenant_id, run_id).await? else {
+            return Ok(PauseOutcome::NotFound);
+        };
+        return match refreshed.status.as_str() {
+            "paused" => Ok(PauseOutcome::AlreadyPaused(RunStatusUpdate {
+                id: refreshed.id,
+                status: refreshed.status,
+                paused_at: refreshed.paused_at,
+                resumed_at: None,
+            })),
+            "succeeded" | "failed" | "cancelled" => Ok(PauseOutcome::Terminal {
+                current_status: refreshed.status,
+            }),
+            other => Ok(PauseOutcome::Terminal {
+                current_status: other.to_string(),
+            }),
+        };
+    }
 
     // Provenance: append `run.paused` to events_bronze so the WS3 trace
     // pipeline and any downstream consumer (UI, audit, replay) can see
@@ -976,13 +1002,28 @@ pub async fn resume_run(
         });
     }
 
-    db.prepare(SQL_RESUME_RUN)
+    let update = db
+        .prepare(SQL_RESUME_RUN)
         .bind(&[
             JsValue::from_str(tenant_id),
             JsValue::from_str(run_id),
         ])?
         .run()
         .await?;
+
+    let changed = update
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+
+    if !changed {
+        let Some(refreshed) = get_run(db, tenant_id, run_id).await? else {
+            return Ok(ResumeOutcome::NotFound);
+        };
+        return Ok(ResumeOutcome::NotPaused {
+            current_status: refreshed.status,
+        });
+    }
 
     let event_id = format!("evt_resume_{run_id}_{}", now_iso());
     let payload = serde_json::json!({
