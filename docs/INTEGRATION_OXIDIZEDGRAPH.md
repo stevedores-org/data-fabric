@@ -105,7 +105,7 @@ impl FabricPersister {
     /// Record a node execution event
     pub async fn record_event(
         &self,
-        node_type: &str,
+        actor: &str,
         event_type: &str,
         payload: serde_json::Value,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -113,15 +113,15 @@ impl FabricPersister {
 
         let event = json!({
             "event_type": event_type,
-            "node_type": node_type,
             "run_id": self.run_id,
-            "tenant_id": self.tenant_id,
+            "actor": actor,
             "payload": payload,
         });
 
         self.client
             .post(&url)
             .header("X-Tenant-ID", &self.tenant_id)
+            .header("X-Tenant-Role", "admin")
             .header("Content-Type", "application/json")
             .json(&event)
             .send()
@@ -177,7 +177,7 @@ mod tests {
 
         // This will fail until data-fabric is running
         let result = persister
-            .record_event("governance", "node_executed", payload)
+            .record_event("governance-node", "node_executed", payload)
             .await;
 
         println!("Result: {:?}", result);
@@ -486,6 +486,7 @@ just dev-worker
 ```http
 POST /v1/events
 X-Tenant-ID: <tenant>
+X-Tenant-Role: admin
 
 {
   "run_id": "run_xxx",

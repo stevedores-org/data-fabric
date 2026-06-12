@@ -236,6 +236,7 @@ X-Tenant-Role: admin|member
 ```http
 POST /v1/events
 X-Tenant-ID: <tenant-id>
+X-Tenant-Role: admin
 
 {
   "run_id": "run_xxx",
