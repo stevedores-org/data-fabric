@@ -113,7 +113,10 @@ impl DurableObject for ThreadManager {
                 let body: CreateCheckpoint = req.json().await?;
                 let storage = self.state.storage();
 
-                let id = crate::generate_id().unwrap_or_else(|_| "err".to_string());
+                let id = req
+                    .headers()
+                    .get("x-checkpoint-id")?
+                    .ok_or_else(|| Error::RustError("missing x-checkpoint-id header".into()))?;
                 let now = js_sys::Date::now() as u64;
                 let created_at = js_sys::Date::new(&serde_wasm_bindgen::to_value(&now).unwrap())
                     .to_iso_string()

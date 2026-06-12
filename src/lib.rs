@@ -708,11 +708,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 definition: &def,
             };
 
+            let headers = Headers::new();
+            headers.set("x-tenant-id", &tenant_ctx.tenant_id)?;
+            headers.set("x-run-id", &run_id)?;
+
             let do_req = Request::new_with_init(
                 "https://do/launch",
                 &RequestInit {
                     method: Method::Post,
                     body: Some(serde_wasm_bindgen::to_value(&envelope).map_err(|e| Error::RustError(e.to_string()))?),
+                    headers,
                     ..Default::default()
                 }
             )?;
@@ -1456,11 +1461,18 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let namespace = ctx.env.durable_object("THREAD_MANAGER")?;
             let stub = namespace.id_from_name(&do_name)?.get_stub()?;
 
+            let headers = {
+                let h = Headers::new();
+                h.set("x-checkpoint-id", &id)?;
+                h
+            };
+
             let do_req = Request::new_with_init(
                 "https://do/checkpoint",
                 &RequestInit {
                     method: Method::Post,
                     body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
+                    headers,
                     ..Default::default()
                 },
             )?;

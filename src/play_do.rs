@@ -60,7 +60,10 @@ impl DurableObject for PlayManager {
                     return Response::error("tenant_id required in launch envelope", 400);
                 }
 
-                let run_id = crate::generate_id().unwrap_or_else(|_| "err".to_string());
+                let run_id = req
+                    .headers()
+                    .get("x-run-id")?
+                    .ok_or_else(|| Error::RustError("missing x-run-id header".into()))?;
 
                 let state = PlayState {
                     definition: def.clone(),
