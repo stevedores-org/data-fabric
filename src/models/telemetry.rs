@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use super::reasoning::TokenCost;
 
 pub const REASONING_TRACE_SCHEMA_VERSION: u32 = 1;
 
@@ -20,16 +21,6 @@ pub struct TelemetrySnapshot {
 pub struct TelemetryAck {
     pub id: String,
     pub accepted: bool,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct TokenCost {
-    #[serde(default)]
-    pub input: u32,
-    #[serde(default)]
-    pub output: u32,
-    #[serde(default)]
-    pub cached: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
