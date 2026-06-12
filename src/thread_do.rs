@@ -31,7 +31,10 @@ impl DurableObject for ThreadManager {
                 let body: CreateCheckpoint = req.json().await?;
                 let storage = self.state.storage();
 
-                let id = crate::generate_id().unwrap_or_else(|_| "err".to_string());
+                let id = req
+                    .headers()
+                    .get("x-checkpoint-id")?
+                    .ok_or_else(|| Error::RustError("missing x-checkpoint-id header".into()))?;
                 let created_at = js_sys::Date::new_0()
                     .to_iso_string()
                     .as_string()
@@ -63,7 +66,9 @@ impl DurableObject for ThreadManager {
                     .unwrap_or_default();
                 history.push_front(checkpoint.clone());
                 if history.len() > 50 {
-                    history.pop_back();
+                    if let Some(old_cp) = history.pop_back() {
+                        let _ = storage.delete(&format!("state:{}", old_cp.id)).await;
+                    }
                 }
                 storage.put("history", history).await?;
 

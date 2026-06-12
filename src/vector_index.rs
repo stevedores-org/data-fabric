@@ -1,15 +1,20 @@
 use serde_json::json;
+use wasm_bindgen::{JsCast, JsValue};
 use worker::*;
 
 pub struct SemanticIndex {
     ai: Ai,
-    index: Fetcher,
+    index: JsValue,
 }
 
 impl SemanticIndex {
     pub fn new(env: &Env) -> Result<Self> {
         let ai = env.ai("AI")?;
-        let index = env.service("SEMANTIC_INDEX")?;
+        let index = js_sys::Reflect::get(env, &JsValue::from_str("SEMANTIC_INDEX"))
+            .map_err(|e| Error::RustError(format!("failed to get SEMANTIC_INDEX: {:?}", e)))?;
+        if index.is_undefined() {
+            return Err(Error::RustError("SEMANTIC_INDEX binding is undefined".into()));
+        }
         Ok(Self { ai, index })
     }
 
@@ -38,49 +43,61 @@ impl SemanticIndex {
         metadata: serde_json::Value,
     ) -> Result<()> {
         let body = json!({
-            "vectors": [{
-                "id": id,
-                "values": vector,
-                "metadata": metadata
-            }]
+            "id": id,
+            "values": vector,
+            "metadata": metadata
         });
 
-        let req = Request::new_with_init(
-            "http://vectorize/insert",
-            &RequestInit {
-                method: Method::Post,
-                body: Some(
-                    serde_wasm_bindgen::to_value(&body)
-                        .map_err(|e| Error::RustError(e.to_string()))?,
-                ),
-                ..Default::default()
-            },
-        )?;
+        // In JS, insert takes an array of vectors: index.insert([ { id, values, metadata } ])
+        let vectors = js_sys::Array::new();
+        vectors.push(&serde_wasm_bindgen::to_value(&body)
+            .map_err(|e| Error::RustError(e.to_string()))?);
 
-        self.index.fetch_request(req).await?;
+        let insert_fn = js_sys::Reflect::get(&self.index, &JsValue::from_str("insert"))
+            .map_err(|e| Error::RustError(format!("failed to get insert method: {:?}", e)))?;
+        let insert_fn: js_sys::Function = insert_fn.dyn_into()
+            .map_err(|_| Error::RustError("insert is not a function".into()))?;
+
+        let promise = insert_fn.call1(&self.index, &vectors)
+            .map_err(|e| Error::RustError(format!("failed to call insert: {:?}", e)))?;
+        let promise: js_sys::Promise = promise.dyn_into()
+            .map_err(|_| Error::RustError("insert did not return a promise".into()))?;
+
+        wasm_bindgen_futures::JsFuture::from(promise).await
+            .map_err(|e| Error::RustError(format!("insert promise failed: {:?}", e)))?;
+
         Ok(())
     }
 
     pub async fn query(&self, vector: Vec<f32>, top_k: usize) -> Result<serde_json::Value> {
-        let body = json!({
-            "vector": vector,
+        // Convert vector to JsValue (which will be a JS array of numbers)
+        let js_vector = serde_wasm_bindgen::to_value(&vector)
+            .map_err(|e| Error::RustError(e.to_string()))?;
+
+        // Convert options to JsValue
+        let options = json!({
             "topK": top_k,
             "returnMetadata": "all"
         });
+        let js_options = serde_wasm_bindgen::to_value(&options)
+            .map_err(|e| Error::RustError(e.to_string()))?;
 
-        let req = Request::new_with_init(
-            "http://vectorize/query",
-            &RequestInit {
-                method: Method::Post,
-                body: Some(
-                    serde_wasm_bindgen::to_value(&body)
-                        .map_err(|e| Error::RustError(e.to_string()))?,
-                ),
-                ..Default::default()
-            },
-        )?;
+        let query_fn = js_sys::Reflect::get(&self.index, &JsValue::from_str("query"))
+            .map_err(|e| Error::RustError(format!("failed to get query method: {:?}", e)))?;
+        let query_fn: js_sys::Function = query_fn.dyn_into()
+            .map_err(|_| Error::RustError("query is not a function".into()))?;
 
-        let mut resp = self.index.fetch_request(req).await?;
-        resp.json().await
+        let promise = query_fn.call2(&self.index, &js_vector, &js_options)
+            .map_err(|e| Error::RustError(format!("failed to call query: {:?}", e)))?;
+        let promise: js_sys::Promise = promise.dyn_into()
+            .map_err(|_| Error::RustError("query did not return a promise".into()))?;
+
+        let result_js = wasm_bindgen_futures::JsFuture::from(promise).await
+            .map_err(|e| Error::RustError(format!("query promise failed: {:?}", e)))?;
+
+        let result: serde_json::Value = serde_wasm_bindgen::from_value(result_js)
+            .map_err(|e| Error::RustError(e.to_string()))?;
+
+        Ok(result)
     }
 }

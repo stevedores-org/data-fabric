@@ -36,7 +36,10 @@ impl DurableObject for PlayManager {
                     .ok_or_else(|| Error::RustError("missing x-tenant-id header".into()))?;
                 let storage = self.state.storage();
 
-                let run_id = crate::generate_id().unwrap_or_else(|_| "err".to_string());
+                let run_id = req
+                    .headers()
+                    .get("x-run-id")?
+                    .ok_or_else(|| Error::RustError("missing x-run-id header".into()))?;
 
                 let state = PlayState {
                     definition: def.clone(),
@@ -115,6 +118,14 @@ impl PlayManager {
             .await?
             .ok_or_else(|| Error::RustError("state not found".into()))?;
 
+        // 1. Mark eligible tasks as active immediately in the state
+        for task_def in &to_launch {
+            current_state.active_tasks.insert(task_def.id.clone());
+        }
+        // 2. Persist updated active tasks state before any await points (yields)
+        storage.put("state", &current_state).await?;
+
+        // 3. Perform the async enqueuing operations
         for task_def in to_launch {
             let task = AgentTask {
                 id: format!("{}-{}", state.run_id, task_def.id),
@@ -127,7 +138,7 @@ impl PlayManager {
                 agent_id: None,
                 graph_ref: None,
                 play_id: Some(state.definition.name.clone()),
-                parent_task_id: None, // Could map to first dependency
+                parent_task_id: None,
                 retry_count: 0,
                 max_retries: 3,
                 lease_expires_at: None,
@@ -148,11 +159,7 @@ impl PlayManager {
                 },
             )?;
             task_stub.fetch_with_request(do_req).await?;
-
-            current_state.active_tasks.insert(task_def.id.clone());
         }
-
-        storage.put("state", &current_state).await?;
         Ok(())
     }
 }
