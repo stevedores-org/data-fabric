@@ -60,6 +60,70 @@ pub const SQL_LIST_CHANGE_SETS_BY_REPO: &str =
      ORDER BY created_at DESC \
      LIMIT ?3";
 
+// ── AIVCS review projections (issue #148 slice 2) ──────────────
+//
+// All four projection tables introduced in migration 0016 carry
+// `tenant_id` as the leading PRIMARY KEY component. The SQL
+// statements below MUST bind `tenant_id` as ?1 on every read and
+// every write; the cross-tenant tests at the bottom of this file
+// assert that shape.
+//
+// The constants and CRUD helpers below are not yet referenced from
+// `lib.rs` — slice 2 is projection-only. They are exercised by the
+// cross-tenant SQL-shape tests at the bottom of this file and will
+// be consumed by the slice-3+ HTTP routes and the projection
+// follower. `#[allow(dead_code)]` keeps the wasm `-D warnings`
+// build green until those slices land.
+
+#[allow(dead_code)]
+const SQL_INSERT_REVIEW_THREAD: &str =
+    "INSERT INTO review_thread (tenant_id, id, review_id, change_set_id, status, created_at, resolved_at)\n     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+
+#[allow(dead_code)]
+const SQL_GET_REVIEW_THREAD: &str =
+    "SELECT id, review_id, change_set_id, status, created_at, resolved_at \
+     FROM review_thread WHERE tenant_id = ?1 AND id = ?2";
+
+#[allow(dead_code)]
+const SQL_LIST_REVIEW_THREADS_FOR_REVIEW: &str =
+    "SELECT id, review_id, change_set_id, status, created_at, resolved_at \
+     FROM review_thread WHERE tenant_id = ?1 AND review_id = ?2 \
+     ORDER BY created_at ASC LIMIT ?3";
+
+#[allow(dead_code)]
+const SQL_UPDATE_REVIEW_THREAD_STATUS: &str =
+    "UPDATE review_thread SET status = ?3, resolved_at = ?4 \
+     WHERE tenant_id = ?1 AND id = ?2";
+
+#[allow(dead_code)]
+const SQL_INSERT_REVIEW_COMMENT: &str =
+    "INSERT INTO review_comment (tenant_id, id, thread_id, actor, body, parent_comment_id, created_at)\n     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+
+#[allow(dead_code)]
+const SQL_LIST_REVIEW_COMMENTS_FOR_THREAD: &str =
+    "SELECT id, thread_id, actor, body, parent_comment_id, created_at \
+     FROM review_comment WHERE tenant_id = ?1 AND thread_id = ?2 \
+     ORDER BY created_at ASC, id ASC LIMIT ?3";
+
+#[allow(dead_code)]
+const SQL_INSERT_REVIEW_THREAD_RESOLUTION: &str =
+    "INSERT INTO review_thread_resolution (tenant_id, thread_id, resolved_by, resolution, note, resolved_at)\n     VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
+#[allow(dead_code)]
+const SQL_GET_REVIEW_THREAD_RESOLUTION: &str =
+    "SELECT thread_id, resolved_by, resolution, note, resolved_at \
+     FROM review_thread_resolution WHERE tenant_id = ?1 AND thread_id = ?2";
+
+#[allow(dead_code)]
+const SQL_INSERT_FILE_ANCHOR: &str =
+    "INSERT INTO file_anchor (tenant_id, id, thread_id, file_path, start_line, end_line, side)\n     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+
+#[allow(dead_code)]
+const SQL_LIST_FILE_ANCHORS_FOR_THREAD: &str =
+    "SELECT id, thread_id, file_path, start_line, end_line, side \
+     FROM file_anchor WHERE tenant_id = ?1 AND thread_id = ?2 \
+     ORDER BY file_path ASC, start_line ASC, id ASC LIMIT ?3";
+
 pub fn now_iso() -> String {
     js_sys::Date::new_0().to_iso_string().as_string().unwrap()
 }
@@ -2624,6 +2688,212 @@ fn days_ago_expr(days: i64) -> String {
     format!("-{} days", days.max(1))
 }
 
+// ── AIVCS review projections (issue #148 slice 2) ──────────────
+//
+// CRUD helpers for the four review-projection tables introduced by
+// migration 0016. Every helper takes `tenant_id` as the leading
+// argument and binds it as ?1; the SQL constants used here are
+// asserted to keep that shape by the `cross_tenant_sql_aivcs_*` tests.
+//
+// No HTTP routes are wired in this slice; the helpers exist so the
+// follower process and (later) BFF can write/read the projection
+// without re-typing SQL.
+
+#[allow(dead_code)]
+pub async fn insert_review_thread(
+    db: &D1Database,
+    tenant_id: &str,
+    thread: &models::aivcs_review::ReviewThread,
+) -> Result<()> {
+    db.prepare(SQL_INSERT_REVIEW_THREAD)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&thread.id),
+            JsValue::from_str(&thread.review_id),
+            opt_str(&thread.change_set_id),
+            JsValue::from_str(thread.status.as_sql()),
+            JsValue::from_str(&thread.created_at),
+            opt_str(&thread.resolved_at),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn get_review_thread(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<models::aivcs_review::ReviewThread>> {
+    let row: Option<ReviewThreadRow> = db
+        .prepare(SQL_GET_REVIEW_THREAD)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
+        .first(None)
+        .await?;
+    Ok(row.and_then(|r| r.into_review_thread()))
+}
+
+#[allow(dead_code)]
+pub async fn list_review_threads_for_review(
+    db: &D1Database,
+    tenant_id: &str,
+    review_id: &str,
+    limit: u32,
+) -> Result<Vec<models::aivcs_review::ReviewThread>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_REVIEW_THREADS_FOR_REVIEW)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(review_id),
+            JsValue::from(limit),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<ReviewThreadRow> = result.results()?;
+    Ok(rows.into_iter().filter_map(|r| r.into_review_thread()).collect())
+}
+
+#[allow(dead_code)]
+pub async fn update_review_thread_status(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    status: models::aivcs_review::ReviewThreadStatus,
+    resolved_at: Option<&str>,
+) -> Result<()> {
+    let resolved_at_js = match resolved_at {
+        Some(s) => JsValue::from_str(s),
+        None => JsValue::NULL,
+    };
+    db.prepare(SQL_UPDATE_REVIEW_THREAD_STATUS)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(id),
+            JsValue::from_str(status.as_sql()),
+            resolved_at_js,
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn insert_review_comment(
+    db: &D1Database,
+    tenant_id: &str,
+    comment: &models::aivcs_review::ReviewComment,
+) -> Result<()> {
+    db.prepare(SQL_INSERT_REVIEW_COMMENT)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&comment.id),
+            JsValue::from_str(&comment.thread_id),
+            JsValue::from_str(&comment.actor.to_sql_actor()),
+            JsValue::from_str(&comment.body),
+            opt_str(&comment.parent_comment_id),
+            JsValue::from_str(&comment.created_at),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn list_review_comments_for_thread(
+    db: &D1Database,
+    tenant_id: &str,
+    thread_id: &str,
+    limit: u32,
+) -> Result<Vec<models::aivcs_review::ReviewComment>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_REVIEW_COMMENTS_FOR_THREAD)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(thread_id),
+            JsValue::from(limit),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<ReviewCommentRow> = result.results()?;
+    Ok(rows.into_iter().filter_map(|r| r.into_review_comment()).collect())
+}
+
+#[allow(dead_code)]
+pub async fn insert_review_thread_resolution(
+    db: &D1Database,
+    tenant_id: &str,
+    resolution: &models::aivcs_review::ReviewThreadResolution,
+) -> Result<()> {
+    db.prepare(SQL_INSERT_REVIEW_THREAD_RESOLUTION)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&resolution.thread_id),
+            JsValue::from_str(&resolution.resolved_by),
+            JsValue::from_str(resolution.resolution.as_sql()),
+            opt_str(&resolution.note),
+            JsValue::from_str(&resolution.resolved_at),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn get_review_thread_resolution(
+    db: &D1Database,
+    tenant_id: &str,
+    thread_id: &str,
+) -> Result<Option<models::aivcs_review::ReviewThreadResolution>> {
+    let row: Option<ReviewThreadResolutionRow> = db
+        .prepare(SQL_GET_REVIEW_THREAD_RESOLUTION)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(thread_id)])?
+        .first(None)
+        .await?;
+    Ok(row.and_then(|r| r.into_resolution()))
+}
+
+#[allow(dead_code)]
+pub async fn insert_file_anchor(
+    db: &D1Database,
+    tenant_id: &str,
+    anchor: &models::aivcs_review::FileAnchor,
+) -> Result<()> {
+    db.prepare(SQL_INSERT_FILE_ANCHOR)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&anchor.id),
+            JsValue::from_str(&anchor.thread_id),
+            JsValue::from_str(&anchor.file_path),
+            JsValue::from_f64(anchor.start_line() as f64),
+            JsValue::from_f64(anchor.end_line() as f64),
+            JsValue::from_str(anchor.side.as_sql()),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn list_file_anchors_for_thread(
+    db: &D1Database,
+    tenant_id: &str,
+    thread_id: &str,
+    limit: u32,
+) -> Result<Vec<models::aivcs_review::FileAnchor>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_FILE_ANCHORS_FOR_THREAD)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(thread_id),
+            JsValue::from(limit),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<FileAnchorRow> = result.results()?;
+    Ok(rows.into_iter().filter_map(|r| r.into_file_anchor()).collect())
+}
+
 // ── Internal row types ──────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -2926,6 +3196,111 @@ pub struct Ws2TaskResponse {
     pub created_at: String,
     pub updated_at: String,
     pub metadata: Option<serde_json::Value>,
+}
+
+// ── AIVCS review-projection row types (issue #148 slice 2) ─────
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct ReviewThreadRow {
+    id: String,
+    review_id: String,
+    change_set_id: Option<String>,
+    status: String,
+    created_at: String,
+    resolved_at: Option<String>,
+}
+
+#[allow(dead_code)]
+impl ReviewThreadRow {
+    fn into_review_thread(self) -> Option<models::aivcs_review::ReviewThread> {
+        let status = models::aivcs_review::ReviewThreadStatus::from_sql(&self.status)?;
+        Some(models::aivcs_review::ReviewThread {
+            id: self.id,
+            review_id: self.review_id,
+            change_set_id: self.change_set_id,
+            status,
+            created_at: self.created_at,
+            resolved_at: self.resolved_at,
+        })
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct ReviewCommentRow {
+    id: String,
+    thread_id: String,
+    actor: String,
+    body: String,
+    parent_comment_id: Option<String>,
+    created_at: String,
+}
+
+#[allow(dead_code)]
+impl ReviewCommentRow {
+    fn into_review_comment(self) -> Option<models::aivcs_review::ReviewComment> {
+        let actor = models::aivcs_review::CommentActor::from_sql_actor(&self.actor)?;
+        Some(models::aivcs_review::ReviewComment {
+            id: self.id,
+            thread_id: self.thread_id,
+            actor,
+            body: self.body,
+            parent_comment_id: self.parent_comment_id,
+            created_at: self.created_at,
+        })
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct ReviewThreadResolutionRow {
+    thread_id: String,
+    resolved_by: String,
+    resolution: String,
+    note: Option<String>,
+    resolved_at: String,
+}
+
+#[allow(dead_code)]
+impl ReviewThreadResolutionRow {
+    fn into_resolution(self) -> Option<models::aivcs_review::ReviewThreadResolution> {
+        let resolution = models::aivcs_review::Resolution::from_sql(&self.resolution)?;
+        Some(models::aivcs_review::ReviewThreadResolution {
+            thread_id: self.thread_id,
+            resolved_by: self.resolved_by,
+            resolution,
+            note: self.note,
+            resolved_at: self.resolved_at,
+        })
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct FileAnchorRow {
+    id: String,
+    thread_id: String,
+    file_path: String,
+    start_line: i64,
+    end_line: i64,
+    side: String,
+}
+
+#[allow(dead_code)]
+impl FileAnchorRow {
+    fn into_file_anchor(self) -> Option<models::aivcs_review::FileAnchor> {
+        let side = models::aivcs_review::AnchorSide::from_sql(&self.side)?;
+        models::aivcs_review::FileAnchor::from_row(
+            self.id,
+            self.thread_id,
+            self.file_path,
+            self.start_line,
+            self.end_line,
+            side,
+        )
+        .ok()
+    }
 }
 
 // ── Provenance Links (WS3: causality chain) ─────────────────────
@@ -4346,5 +4721,87 @@ mod tests {
         // on (created_at, id).
         assert_eq!(cursor.priority, 100);
         assert_eq!(cursor.id, "r2");
+    }
+
+    // ── Cross-tenant SQL shape: AIVCS review projections (#148) ─
+
+    /// Every read against the AIVCS review-projection tables must
+    /// filter by `tenant_id = ?1`. Without this, threads, comments,
+    /// resolutions, or file anchors written under tenant A would be
+    /// visible to tenant B — a cross-tenant data leak through what
+    /// looks like a benign read model.
+    #[test]
+    fn cross_tenant_sql_aivcs_review_thread_select_filters_on_tenant_id() {
+        for (label, sql) in [
+            ("SQL_GET_REVIEW_THREAD", SQL_GET_REVIEW_THREAD),
+            (
+                "SQL_LIST_REVIEW_THREADS_FOR_REVIEW",
+                SQL_LIST_REVIEW_THREADS_FOR_REVIEW,
+            ),
+            (
+                "SQL_LIST_REVIEW_COMMENTS_FOR_THREAD",
+                SQL_LIST_REVIEW_COMMENTS_FOR_THREAD,
+            ),
+            (
+                "SQL_GET_REVIEW_THREAD_RESOLUTION",
+                SQL_GET_REVIEW_THREAD_RESOLUTION,
+            ),
+            (
+                "SQL_LIST_FILE_ANCHORS_FOR_THREAD",
+                SQL_LIST_FILE_ANCHORS_FOR_THREAD,
+            ),
+        ] {
+            assert!(
+                sql.contains("WHERE tenant_id = ?1"),
+                "{label} must filter by tenant_id as ?1; got: {sql}",
+            );
+        }
+    }
+
+    /// Every write into the AIVCS review-projection tables must bind
+    /// `tenant_id` as the leading column (so it lands as ?1) — this
+    /// matches the convention used by every other multi-tenant table
+    /// in the schema.
+    #[test]
+    fn cross_tenant_sql_aivcs_review_inserts_lead_with_tenant_id() {
+        for (table_name, sql) in [
+            ("review_thread", SQL_INSERT_REVIEW_THREAD),
+            ("review_comment", SQL_INSERT_REVIEW_COMMENT),
+            (
+                "review_thread_resolution",
+                SQL_INSERT_REVIEW_THREAD_RESOLUTION,
+            ),
+            ("file_anchor", SQL_INSERT_FILE_ANCHOR),
+        ] {
+            let needle = format!("{table_name} (");
+            let start = sql
+                .find(&needle)
+                .unwrap_or_else(|| panic!("expected INSERT into {table_name}; got: {sql}"));
+            let tail = &sql[start..];
+            assert!(
+                tail.starts_with(&format!("{table_name} (tenant_id,")),
+                "tenant_id must be the first column of the INSERT list for {table_name}; got: {tail}",
+            );
+            assert!(
+                sql.contains("(?1, ?2"),
+                "INSERT for {table_name} must bind tenant_id as ?1; got: {sql}",
+            );
+        }
+    }
+
+    /// The UPDATE for review-thread status must also be tenant-scoped
+    /// — otherwise tenant A could mark tenant B's thread resolved.
+    #[test]
+    fn cross_tenant_sql_aivcs_review_thread_update_scopes_to_tenant() {
+        assert!(
+            SQL_UPDATE_REVIEW_THREAD_STATUS.contains("WHERE tenant_id = ?1 AND id = ?2"),
+            "review_thread status update must filter by tenant_id and id; got: {}",
+            SQL_UPDATE_REVIEW_THREAD_STATUS,
+        );
+        assert!(
+            SQL_UPDATE_REVIEW_THREAD_STATUS.contains("UPDATE review_thread"),
+            "review_thread status update must target review_thread; got: {}",
+            SQL_UPDATE_REVIEW_THREAD_STATUS,
+        );
     }
 }
