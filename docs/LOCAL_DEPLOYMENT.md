@@ -234,27 +234,32 @@ X-Tenant-Role: admin|member
 #### Ingest Event
 
 ```http
-POST /fabric/ingest
+POST /v1/events
 X-Tenant-ID: <tenant-id>
+X-Tenant-Role: admin
 
 {
-  "event_type": "tool_called|tool_returned|task_started",
   "run_id": "run_xxx",
-  "payload": { ... }
+  "event_type": "tool_called|tool_returned|task_started",
+  "actor": "<actor>",
+  "entity_kind": "task",          // optional
+  "entity_id": "task_xxx",        // optional
+  "payload": { ... }              // optional
 }
 ```
 
-#### Query Context
+#### Query Context (per-run trace)
 
 ```http
-POST /fabric/query
+GET /v1/traces/:run_id?limit=100
 X-Tenant-ID: <tenant-id>
-
-{
-  "query_type": "memory|lineage|artifact",
-  "filters": { "run_id": "run_xxx" }
-}
 ```
+
+Related queries:
+
+- `GET /v1/traces/:run_id/lineage` — full lineage view
+- `GET /v1/runs/:run_id/summary` — gold-layer run summary
+- `POST /v1/memory/retrieve` — semantic + filtered memory retrieval (use this for memory queries)
 
 ---
 

@@ -1314,12 +1314,16 @@ fn agent_task_with_memory_context_none() {
         created_at: "2026-01-01T00:00:00Z".into(),
         completed_at: None,
         memory_context: None,
+        tenant_id: None,
     };
     let json = serde_json::to_string(&task).unwrap();
     let parsed: AgentTask = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.memory_context, None);
     // Verify memory_context is not in JSON when None
     assert!(!json.contains("memory_context"));
+    // tenant_id is also None for this legacy-shape test; verify it round-trips
+    assert_eq!(parsed.tenant_id, None);
+    assert!(!json.contains("tenant_id"));
 }
 
 #[test]
@@ -1345,6 +1349,7 @@ fn agent_task_with_memory_context_some() {
         memory_context: Some(
             "## Memory: Past Experience\n- Fixed similar build issue with cargo cache".into(),
         ),
+        tenant_id: None,
     };
     let json = serde_json::to_string(&task).unwrap();
     let parsed: AgentTask = serde_json::from_str(&json).unwrap();
@@ -1379,6 +1384,7 @@ fn agent_task_memory_context_round_trip() {
         memory_context: Some(
             "## Memory Context\nPrevious analysis on similar codebase. Use AST traversal.".into(),
         ),
+        tenant_id: None,
     };
     let json = serde_json::to_string(&task).unwrap();
     let parsed: AgentTask = serde_json::from_str(&json).unwrap();
@@ -1460,71 +1466,286 @@ fn trace_response_bounded_by_limit() {
     assert_eq!(json["events"].as_array().unwrap().len(), 100);
 }
 
-// ── Reasoning trace telemetry ──────────────────────────────────
+// ── Reasoning trace (#111) ──────────────────────────────────────
 
 #[test]
-fn reasoning_trace_defaults_schema_and_token_cost() {
-    let input = r#"{
-        "agent_id":"agent-1",
-        "job_id":"job-1",
-        "step_number":3,
-        "step_type":"tool_call",
-        "started_at":"2026-06-12T00:00:00Z",
-        "completed_at":"2026-06-12T00:00:01Z"
-    }"#;
-
-    let parsed: CreateReasoningTrace = serde_json::from_str(input).unwrap();
-    assert_eq!(parsed.schema_version, REASONING_TRACE_SCHEMA_VERSION);
-    assert_eq!(parsed.token_cost, TokenCost::default());
-    assert!(parsed.validate().is_ok());
-}
-
-#[test]
-fn reasoning_trace_round_trip_with_payloads() {
-    let trace = CreateReasoningTrace {
-        schema_version: REASONING_TRACE_SCHEMA_VERSION,
-        idempotency_key: Some("job-1:3".into()),
-        agent_id: "agent-1".into(),
+fn ingest_reasoning_trace_round_trip() {
+    let t = IngestReasoningTrace {
+        schema_version: TRACE_SCHEMA_VERSION,
+        agent_id: "agent-a".into(),
         job_id: "job-1".into(),
-        parent_span_id: Some("span-parent".into()),
+        parent_span_id: Some("span-root".into()),
         step_number: 3,
-        step_type: "thought".into(),
-        inputs: Some(serde_json::json!({"prompt":"inspect"})),
-        outputs: Some(serde_json::json!({"decision":"continue"})),
-        token_cost: TokenCost {
-            input: 10,
-            output: 7,
-            cached: 2,
+        step_type: StepType::ToolCall,
+        inputs: Some(serde_json::json!({"tool": "search", "q": "rust"})),
+        outputs: Some(serde_json::json!({"hits": 7})),
+        tokens: TokenCost {
+            input: 120,
+            output: 45,
+            cached: 10,
         },
-        started_at: "2026-06-12T00:00:00Z".into(),
-        completed_at: "2026-06-12T00:00:01Z".into(),
-        metadata: Some(serde_json::json!({"source":"adk"})),
+        started_at: "2026-06-10T00:00:00Z".into(),
+        completed_at: Some("2026-06-10T00:00:01Z".into()),
+        idempotency_key: "job-1:3".into(),
     };
-
-    let json = serde_json::to_string(&trace).unwrap();
-    let parsed: CreateReasoningTrace = serde_json::from_str(&json).unwrap();
-    assert_eq!(trace, parsed);
-    assert_eq!(parsed.token_cost.input, 10);
-    assert_eq!(parsed.parent_span_id.as_deref(), Some("span-parent"));
+    let json = serde_json::to_string(&t).unwrap();
+    let parsed: IngestReasoningTrace = serde_json::from_str(&json).unwrap();
+    assert_eq!(t, parsed);
 }
 
 #[test]
-fn reasoning_trace_validation_rejects_missing_required_values() {
-    let trace = CreateReasoningTrace {
-        schema_version: REASONING_TRACE_SCHEMA_VERSION,
-        idempotency_key: None,
-        agent_id: "".into(),
-        job_id: "job-1".into(),
-        parent_span_id: None,
-        step_number: 0,
-        step_type: "thought".into(),
-        inputs: None,
-        outputs: None,
-        token_cost: TokenCost::default(),
-        started_at: "2026-06-12T00:00:00Z".into(),
-        completed_at: "2026-06-12T00:00:01Z".into(),
-        metadata: None,
-    };
+fn ingest_reasoning_trace_defaults_schema_version() {
+    // Older clients may omit schema_version; sink fills the current one.
+    let minimal = serde_json::json!({
+        "agent_id": "a",
+        "job_id": "j",
+        "step_number": 0,
+        "step_type": "thought",
+        "started_at": "2026-06-10T00:00:00Z",
+        "idempotency_key": "j:0",
+    });
+    let parsed: IngestReasoningTrace = serde_json::from_value(minimal).unwrap();
+    assert_eq!(parsed.schema_version, TRACE_SCHEMA_VERSION);
+    assert_eq!(parsed.tokens, TokenCost::default());
+    assert!(parsed.inputs.is_none() && parsed.outputs.is_none());
+}
 
-    assert_eq!(trace.validate().unwrap_err(), "agent_id is required");
+#[test]
+fn step_type_snake_case_serialisation() {
+    for (st, expected) in [
+        (StepType::ToolCall, "tool_call"),
+        (StepType::Thought, "thought"),
+        (StepType::Commit, "commit"),
+        (StepType::Observation, "observation"),
+        (StepType::Error, "error"),
+        (StepType::Other, "other"),
+    ] {
+        let json = serde_json::to_string(&st).unwrap();
+        assert_eq!(json, format!("\"{}\"", expected));
+        assert_eq!(st.as_str(), expected);
+    }
+}
+
+#[test]
+fn classify_payload_inline_when_small() {
+    let small = serde_json::json!({"q": "hi"});
+    match classify_payload(&small, "tenants/t1/", "trace-1", "inputs") {
+        PayloadDisposition::Inline(v) => assert_eq!(v, small),
+        PayloadDisposition::Archive { .. } => panic!("small payload should stay inline"),
+    }
+}
+
+#[test]
+fn classify_payload_archives_when_over_limit() {
+    let big = serde_json::json!({"blob": "x".repeat(INLINE_LIMIT_BYTES + 1)});
+    match classify_payload(&big, "tenants/t1/", "trace-9", "outputs") {
+        PayloadDisposition::Archive { key, bytes } => {
+            assert_eq!(key, "tenants/t1/reasoning_traces/trace-9/outputs.json");
+            assert!(bytes.len() > INLINE_LIMIT_BYTES);
+        }
+        PayloadDisposition::Inline(_) => panic!("payload over limit must archive"),
+    }
+}
+
+#[test]
+fn redact_pii_replaces_flagged_keys() {
+    let mut v = serde_json::json!({
+        "user_email": "alice@example.com",
+        "request_id": "req-1",
+        "__pii__": ["user_email"],
+    });
+    redact_pii(&mut v);
+    assert_eq!(v["user_email"], "<redacted>");
+    assert_eq!(v["request_id"], "req-1");
+    // Marker must be stripped — keeping it leaks which fields were sensitive.
+    assert!(v.get("__pii__").is_none());
+}
+
+#[test]
+fn redact_pii_recurses_into_nested_objects() {
+    let mut v = serde_json::json!({
+        "outer": "keep",
+        "child": {
+            "name": "Alice",
+            "id": 42,
+            "__pii__": ["name"],
+        },
+    });
+    redact_pii(&mut v);
+    assert_eq!(v["outer"], "keep");
+    assert_eq!(v["child"]["name"], "<redacted>");
+    assert_eq!(v["child"]["id"], 42);
+    assert!(v["child"].get("__pii__").is_none());
+}
+
+#[test]
+fn trace_ack_serializes_deduplicated_flag() {
+    let ack = TraceAck {
+        id: "abc".into(),
+        accepted: true,
+        deduplicated: true,
+    };
+    let json = serde_json::to_value(&ack).unwrap();
+    assert_eq!(json["deduplicated"], true);
+    assert_eq!(json["accepted"], true);
+}
+
+#[test]
+fn step_type_from_storage_str_round_trips_every_variant() {
+    for st in [
+        StepType::ToolCall,
+        StepType::Thought,
+        StepType::Commit,
+        StepType::Observation,
+        StepType::Error,
+        StepType::Other,
+    ] {
+        assert_eq!(StepType::from_storage_str(st.as_str()), st);
+    }
+}
+
+#[test]
+fn step_type_from_storage_str_falls_back_on_unknown() {
+    // Future schema versions might add variants this binary hasn't seen.
+    // The DB CHECK constraint blocks the typo path; this guards the
+    // forward-compat path.
+    assert_eq!(StepType::from_storage_str("future_variant"), StepType::Other);
+    assert_eq!(StepType::from_storage_str(""), StepType::Other);
+}
+
+// ── OpenAPI contract reconciliation (PR: fix/openapi-spec-reconciliation) ─────
+//
+// The following tests pin the documented response shapes for the three
+// endpoints whose OpenAPI schemas were reconciled with the handlers. They
+// are the canonical guard against silent drift between handler output and
+// the published OpenAPI spec.
+
+/// `/v1/policies/check` returns 9 fields total: 4 always-present and 5
+/// optional ones populated by the policy engine. The OpenAPI schema must
+/// document all 9. This test fixes the typed shape so a follow-up rename
+/// will trip CI before the OpenAPI doc drifts.
+#[test]
+fn policy_check_response_serializes_all_nine_documented_fields() {
+    let resp = PolicyCheckResponse {
+        id: "pd-1".into(),
+        action: "deploy".into(),
+        decision: "allow".into(),
+        reason: "matched rule allow-deploys".into(),
+        risk_level: Some("write".into()),
+        policy_version: Some("v3".into()),
+        matched_rule: Some("rule-deploys".into()),
+        escalation_id: Some("esc-1".into()),
+        rate_limited: Some(false),
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+
+    // Every documented field must serialize, with the documented JSON type.
+    assert!(json["id"].is_string(), "id must be string");
+    assert!(json["action"].is_string(), "action must be string");
+    assert!(json["decision"].is_string(), "decision must be string");
+    assert!(json["reason"].is_string(), "reason must be string");
+    assert!(json["risk_level"].is_string(), "risk_level must be string");
+    assert!(
+        json["policy_version"].is_string(),
+        "policy_version must be string"
+    );
+    assert!(
+        json["matched_rule"].is_string(),
+        "matched_rule must be string"
+    );
+    assert!(
+        json["escalation_id"].is_string(),
+        "escalation_id must be string"
+    );
+    assert!(
+        json["rate_limited"].is_boolean(),
+        "rate_limited must be boolean"
+    );
+
+    // Field count: ensure no undocumented fields slipped in.
+    let object = json.as_object().expect("response must be a JSON object");
+    assert_eq!(
+        object.len(),
+        9,
+        "PolicyCheckResponse must serialize to exactly 9 documented fields, got: {:?}",
+        object.keys().collect::<Vec<_>>()
+    );
+}
+
+/// When the optional fields are `None`, only the 4 required fields serialize
+/// (because of `#[serde(skip_serializing_if = "Option::is_none")]`). The
+/// OpenAPI schema reflects this by marking the 5 extra fields as optional.
+#[test]
+fn policy_check_response_minimal_serializes_only_required_fields() {
+    let resp = PolicyCheckResponse {
+        id: "pd-2".into(),
+        action: "read_secret".into(),
+        decision: "deny".into(),
+        reason: "no rule matched".into(),
+        risk_level: None,
+        policy_version: None,
+        matched_rule: None,
+        escalation_id: None,
+        rate_limited: None,
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    let object = json.as_object().expect("response must be a JSON object");
+    assert_eq!(
+        object.len(),
+        4,
+        "minimal PolicyCheckResponse must serialize exactly the 4 required fields, got: {:?}",
+        object.keys().collect::<Vec<_>>()
+    );
+    for required in ["id", "action", "decision", "reason"] {
+        assert!(
+            object.contains_key(required),
+            "required field {required} missing"
+        );
+    }
+}
+
+/// `/v1/checkpoints` POST returns `{id, thread_id, state_r2_key}` — clients
+/// need `state_r2_key` to recover state from R2. The OpenAPI schema was
+/// previously misdocumented as `{id, status}`.
+#[test]
+fn checkpoint_created_serializes_all_three_documented_fields() {
+    let cc = CheckpointCreated {
+        id: "cp-1".into(),
+        thread_id: "thread-abc".into(),
+        state_r2_key: "tenant-x/checkpoints/thread-abc/cp-1".into(),
+    };
+    let json = serde_json::to_value(&cc).unwrap();
+    let object = json.as_object().expect("response must be a JSON object");
+    assert_eq!(
+        object.len(),
+        3,
+        "CheckpointCreated must serialize exactly 3 documented fields, got: {:?}",
+        object.keys().collect::<Vec<_>>()
+    );
+    assert!(json["id"].is_string(), "id must be string");
+    assert!(json["thread_id"].is_string(), "thread_id must be string");
+    assert!(
+        json["state_r2_key"].is_string(),
+        "state_r2_key must be string"
+    );
+    // The legacy schema documented a `status` field that the handler never
+    // emitted; assert its absence so re-adding it requires updating the spec.
+    assert!(
+        !object.contains_key("status"),
+        "CheckpointCreated must not include a `status` field (legacy schema drift)"
+    );
+}
+
+/// Round-trip guard: clients deserializing the documented shape must be
+/// able to reconstruct an equal struct. Protects against accidental rename.
+#[test]
+fn checkpoint_created_round_trips_documented_shape() {
+    let original = CheckpointCreated {
+        id: "cp-rt".into(),
+        thread_id: "thread-rt".into(),
+        state_r2_key: "tenant-rt/checkpoints/thread-rt/cp-rt".into(),
+    };
+    let json = serde_json::to_string(&original).unwrap();
+    let parsed: CheckpointCreated = serde_json::from_str(&json).unwrap();
+    assert_eq!(original, parsed);
 }

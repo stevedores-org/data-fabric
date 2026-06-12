@@ -23,6 +23,23 @@ impl TenantContext {
     pub fn r2_prefix(&self) -> String {
         format!("tenants/{}/", self.tenant_id)
     }
+
+    /// Synthetic actor identity used when an audit event is written from a
+    /// tenant-scoped handler that doesn't have a richer principal claim on
+    /// hand (e.g. the AIVCS pause/resume endpoints in issue #148 slice 4).
+    ///
+    /// Shape: `tenant:<tenant_id>:<role>`. Stable enough for the events
+    /// pipeline to distinguish operator actions from agent actions; if a
+    /// real principal identity becomes available later, we'd swap this out
+    /// for that. Lower-cased role keeps the string canonical.
+    pub fn actor(&self) -> String {
+        let role = match self.role {
+            TenantRole::Viewer => "viewer",
+            TenantRole::Builder => "builder",
+            TenantRole::Admin => "admin",
+        };
+        format!("tenant:{}:{}", self.tenant_id, role)
+    }
 }
 
 pub fn tenant_from_request(req: &Request) -> Result<TenantContext> {

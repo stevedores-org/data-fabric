@@ -105,23 +105,23 @@ impl FabricPersister {
     /// Record a node execution event
     pub async fn record_event(
         &self,
-        node_type: &str,
+        actor: &str,
         event_type: &str,
         payload: serde_json::Value,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let url = format!("{}/fabric/ingest", self.fabric_url);
+        let url = format!("{}/v1/events", self.fabric_url);
 
         let event = json!({
             "event_type": event_type,
-            "node_type": node_type,
             "run_id": self.run_id,
-            "tenant_id": self.tenant_id,
+            "actor": actor,
             "payload": payload,
         });
 
         self.client
             .post(&url)
             .header("X-Tenant-ID", &self.tenant_id)
+            .header("X-Tenant-Role", "admin")
             .header("Content-Type", "application/json")
             .json(&event)
             .send()
@@ -130,24 +130,23 @@ impl FabricPersister {
         Ok(())
     }
 
-    /// Retrieve context for decision-making
+    /// Retrieve context for decision-making.
+    ///
+    /// Uses the per-run trace view `GET /v1/traces/:run_id`. For
+    /// memory-style retrieval use `POST /v1/memory/retrieve`; for full
+    /// lineage use `GET /v1/traces/:run_id/lineage`. `query_type` and
+    /// `filters` are retained on the client signature for backward
+    /// compatibility but are not sent on the wire by this endpoint.
     pub async fn query_context(
         &self,
-        query_type: &str,
-        filters: serde_json::Value,
+        _query_type: &str,
+        _filters: serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        let url = format!("{}/fabric/query", self.fabric_url);
-
-        let query = json!({
-            "query_type": query_type,
-            "filters": filters,
-        });
+        let url = format!("{}/v1/traces/{}", self.fabric_url, self.run_id);
 
         let response = self.client
-            .post(&url)
+            .get(&url)
             .header("X-Tenant-ID", &self.tenant_id)
-            .header("Content-Type", "application/json")
-            .json(&query)
             .send()
             .await?
             .json()
@@ -178,7 +177,7 @@ mod tests {
 
         // This will fail until data-fabric is running
         let result = persister
-            .record_event("governance", "node_executed", payload)
+            .record_event("governance-node", "node_executed", payload)
             .await;
 
         println!("Result: {:?}", result);
@@ -438,13 +437,13 @@ data-fabric requires tenant headers:
 
 ```rust
 // ❌ Wrong - will get 401
-client.post("http://localhost:8787/fabric/ingest")
+client.post("http://localhost:8787/v1/events")
     .json(&event)
     .send()
     .await?
 
 // ✅ Correct
-client.post("http://localhost:8787/fabric/ingest")
+client.post("http://localhost:8787/v1/events")
     .header("X-Tenant-ID", "test-tenant")
     .header("X-Tenant-Role", "admin")
     .json(&event)
@@ -485,27 +484,32 @@ just dev-worker
 ### Record Event
 
 ```http
-POST /fabric/ingest
+POST /v1/events
 X-Tenant-ID: <tenant>
+X-Tenant-Role: admin
 
 {
-  "event_type": "node_executed|tool_called|task_completed",
   "run_id": "run_xxx",
-  "payload": { ... }
+  "event_type": "node_executed|tool_called|task_completed",
+  "actor": "governance-node",
+  "entity_kind": "task",          // optional
+  "entity_id": "task_xxx",        // optional
+  "payload": { ... }              // optional
 }
 ```
 
-### Query Context
+### Query Context (per-run trace / provenance)
 
 ```http
-POST /fabric/query
+GET /v1/traces/:run_id?limit=100
 X-Tenant-ID: <tenant>
-
-{
-  "query_type": "memory|lineage|compliance",
-  "filters": { "run_id": "run_xxx", "role": "architect" }
-}
 ```
+
+Related queries:
+
+- `GET /v1/traces/:run_id/lineage` — full lineage view for a run
+- `GET /v1/runs/:run_id/summary` — gold-layer run summary
+- `POST /v1/memory/retrieve` — semantic + filtered memory retrieval
 
 ### Health Check
 

@@ -89,6 +89,7 @@ pub async fn evaluate_policy(
 
     let exceeded = db::check_and_increment_rate_limit(
         d1,
+        tenant_id,
         &req.actor,
         &action_class,
         effective_rate.window_seconds,
@@ -132,6 +133,7 @@ pub async fn evaluate_policy(
         let eid = random_hex_id()?;
         db::create_policy_escalation(
             d1,
+            tenant_id,
             &eid,
             &decision_id,
             &req.action,
