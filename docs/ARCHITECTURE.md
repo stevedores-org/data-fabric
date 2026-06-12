@@ -16,9 +16,11 @@ Increase velocity for orchestrated autonomous AI agent builders through:
 
 ### 1. Edge API (Cloudflare Workers, Rust)
 - `/health`
-- `/fabric/ingest`
-- `/fabric/query`
-- `/fabric/plays/{play}/launch`
+- `/v1/events` (single-event ingest)
+- `/v1/runs/:run_id/tasks` (run-scoped task ingest)
+- `/v1/traces/:run_id` (per-run trace / provenance query)
+- `/v1/runs/:run_id/summary` (gold-layer run summary)
+- `/v1/plays/:name/launch`
 - `/mcp/task/next`
 - `/mcp/response`
 
