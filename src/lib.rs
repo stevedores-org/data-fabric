@@ -2038,6 +2038,83 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
             }
 
+            // Extract change_set_id for ci_check_run projection
+            let cs_id_opt = {
+                let change_set_opt = evt.metadata.as_ref()
+                    .and_then(|m| m.get("aivcs"))
+                    .and_then(|a| a.get("change_set").or_else(|| a.get("pull_request")));
+                
+                let explicit_id = change_set_opt
+                    .and_then(|cs| cs.get("id"))
+                    .and_then(|v| v.as_str().map(|s| s.to_string()));
+                
+                let source_id = explicit_id.clone()
+                    .or_else(|| {
+                        change_set_opt
+                            .and_then(|cs| cs.get("number").or_else(|| cs.get("pull_request_id")))
+                            .and_then(|v| match v {
+                                serde_json::Value::String(s) => Some(s.clone()),
+                                serde_json::Value::Number(n) => Some(n.to_string()),
+                                _ => None,
+                            })
+                    });
+
+                source_id.map(|src_id| {
+                    if explicit_id.is_none() && src_id.chars().all(|c| c.is_ascii_digit()) {
+                        format!("{}#{}", evt.repo, src_id)
+                    } else {
+                        src_id
+                    }
+                })
+            };
+
+            if let Some(ref cs_id) = cs_id_opt {
+                let status = match evt.event_type {
+                    integrations::aivcs::PipelineEventType::PipelineStart
+                    | integrations::aivcs::PipelineEventType::StageStart
+                    | integrations::aivcs::PipelineEventType::DeployStart => "in_progress",
+                    _ => "completed",
+                };
+
+                let conclusion = evt.metadata.as_ref()
+                    .and_then(|m| m.get("conclusion").or_else(|| m.get("state")))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        if status == "completed" {
+                            Some("success".to_string())
+                        } else {
+                            None
+                        }
+                    });
+
+                let url = evt.metadata.as_ref()
+                    .and_then(|m| m.get("url").or_else(|| m.get("html_url")))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                let name = evt.metadata.as_ref()
+                    .and_then(|m| m.get("name").or_else(|| m.get("stage")))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "pipeline".to_string());
+
+                let check_run_id = format!("{}:{}", evt.pipeline_id, name);
+
+                if let Err(e) = db::upsert_ci_check_run(
+                    &d1,
+                    &tenant_ctx.tenant_id,
+                    &check_run_id,
+                    cs_id,
+                    &name,
+                    status,
+                    &conclusion,
+                    &url,
+                ).await {
+                    worker::console_log!("ERROR: aivcs upsert_ci_check_run failed: {e:?}");
+                }
+            }
+
             if let Err(e) = db::touch_integration(&d1, &tenant_ctx.tenant_id, "aivcs", None).await {
                 worker::console_log!("WARN: touch_integration(aivcs) failed: {e:?}");
             }
@@ -2257,14 +2334,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
             let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
-            let change_set_id = params.get("change_set_id").map(|s| s.as_ref());
+            let change_set_id = params.get("change_set_id")
+                .or_else(|| params.get("pr_id"))
+                .map(|s| s.as_ref());
             let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
             let d1 = ctx.env.d1("DB")?;
             if let Some(cs_id) = change_set_id {
                 let list = db::list_ci_check_runs_for_change_set(&d1, &tenant_ctx.tenant_id, cs_id, limit).await?;
                 Response::from_json(&serde_json::json!({ "ci_check_runs": list }))
             } else {
-                Response::error("missing required query parameter: change_set_id", 400)
+                Response::error("missing required query parameter: change_set_id or pr_id", 400)
             }
         })
 
