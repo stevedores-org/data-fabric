@@ -91,6 +91,7 @@ impl RepositoryConfig {
         }
     }
 
+    #[must_use]
     pub fn with_logical_name(mut self, name: impl Into<String>) -> Self {
         self.logical_name = Some(name.into());
         self

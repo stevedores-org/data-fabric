@@ -12,7 +12,7 @@
 //!    patterns for binding resolution and liveness probes.
 //! 4. [`with_retry`] / [`RetryPolicy`] — exponential backoff with bounded
 //!    jitter for the transient failure modes specific to Cloudflare D1 and
-//!    R2 (busy, locked, timeout, internal_error).
+//!    R2 (busy, locked, timeout, `internal_error`).
 //!
 //! ## Scope (what this PR does NOT do)
 //!
