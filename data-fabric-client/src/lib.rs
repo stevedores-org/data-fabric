@@ -205,6 +205,11 @@ impl Client {
         self.send_request::<(), Run>(Method::GET, &path, None).await
     }
 
+    pub async fn get_pull_request(&self, id: &str) -> Result<AivcsPullRequest> {
+        let path = format!("/v1/pull-requests/{}", encode_path_segment(id));
+        self.send_request::<(), AivcsPullRequest>(Method::GET, &path, None).await
+    }
+
     // ── WS2 Tasks ──────────────────────────────────────────────────────────
     
     pub async fn create_task(&self, run_id: &str, task: &CreateTask) -> Result<Created> {

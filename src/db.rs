@@ -750,7 +750,122 @@ pub async fn create_run(
     ])?
     .run()
     .await?;
+    if let Some(projection) = aivcs_projection_from_run(tenant_id, id, body, &now) {
+        upsert_aivcs_pull_request(db, &projection).await?;
+    }
     Ok(())
+}
+
+async fn upsert_aivcs_pull_request(db: &D1Database, pr: &AivcsPullRequestUpsert) -> Result<()> {
+    db.prepare(
+        "INSERT INTO gold_aivcs_review_queue (
+            tenant_id, id, repo, run_id, title, status, source_branch, target_branch,
+            author, summary, change_set, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(tenant_id, id) DO UPDATE SET
+            repo = excluded.repo,
+            run_id = excluded.run_id,
+            title = excluded.title,
+            status = excluded.status,
+            source_branch = excluded.source_branch,
+            target_branch = excluded.target_branch,
+            author = excluded.author,
+            summary = excluded.summary,
+            change_set = excluded.change_set,
+            updated_at = excluded.updated_at",
+    )
+    .bind(&[
+        JsValue::from_str(&pr.tenant_id),
+        JsValue::from_str(&pr.id),
+        JsValue::from_str(&pr.repo),
+        JsValue::from_str(&pr.run_id),
+        JsValue::from_str(&pr.title),
+        JsValue::from_str(&pr.status),
+        opt_string(&pr.source_branch),
+        opt_string(&pr.target_branch),
+        opt_string(&pr.author),
+        opt_string(&pr.summary),
+        JsValue::from_str(&pr.change_set),
+        JsValue::from_str(&pr.created_at),
+        JsValue::from_str(&pr.updated_at),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn get_aivcs_pull_request(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<AivcsPullRequestResponse>> {
+    let row: Option<AivcsPullRequestRow> = db
+        .prepare(
+            "SELECT id, repo, run_id, title, status, source_branch, target_branch,
+                    author, summary, change_set, created_at, updated_at
+             FROM gold_aivcs_review_queue
+             WHERE tenant_id = ?1 AND id = ?2",
+        )
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.into_response()))
+}
+
+fn opt_string(s: &Option<String>) -> JsValue {
+    match s {
+        Some(s) => JsValue::from_str(s),
+        None => JsValue::NULL,
+    }
+}
+
+fn aivcs_projection_from_run(
+    tenant_id: &str,
+    run_id: &str,
+    body: &models::CreateRun,
+    now: &str,
+) -> Option<AivcsPullRequestUpsert> {
+    let change_set = body.metadata.as_ref()?.get("aivcs")?.get("change_set")?;
+    let explicit_id = json_string(change_set, &["id"]);
+    let source_id = explicit_id
+        .clone()
+        .or_else(|| json_string(change_set, &["number", "pull_request_id"]))?;
+    let id = if explicit_id.is_some() {
+        source_id.clone()
+    } else {
+        format!("{}#{}", body.repo, source_id)
+    };
+    let title = json_string(change_set, &["title"]).unwrap_or_else(|| source_id.clone());
+    let status = json_string(change_set, &["status", "state"]).unwrap_or_else(|| "open".into());
+    let created_at = json_string(change_set, &["created_at"]).unwrap_or_else(|| now.into());
+    let updated_at = json_string(change_set, &["updated_at"]).unwrap_or_else(|| now.into());
+    let change_set_json = serde_json::to_string(change_set).ok()?;
+
+    Some(AivcsPullRequestUpsert {
+        tenant_id: tenant_id.into(),
+        id,
+        repo: body.repo.clone(),
+        run_id: run_id.into(),
+        title,
+        status,
+        source_branch: json_string(change_set, &["source_branch", "head_ref", "head"]),
+        target_branch: json_string(change_set, &["target_branch", "base_ref", "base"]),
+        author: json_string(change_set, &["author", "actor"]),
+        summary: json_string(change_set, &["summary", "description"]),
+        change_set: change_set_json,
+        created_at,
+        updated_at,
+    })
+}
+
+fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(|v| match v {
+            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
 }
 
 /// List runs for `tenant_id` ordered by `(created_at DESC, id DESC)`.
@@ -3491,6 +3606,74 @@ pub struct RunResponse {
     pub resumed_at: Option<String>,
 }
 
+#[derive(Debug, PartialEq)]
+struct AivcsPullRequestUpsert {
+    tenant_id: String,
+    id: String,
+    repo: String,
+    run_id: String,
+    title: String,
+    status: String,
+    source_branch: Option<String>,
+    target_branch: Option<String>,
+    author: Option<String>,
+    summary: Option<String>,
+    change_set: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AivcsPullRequestRow {
+    pub id: String,
+    pub repo: String,
+    pub run_id: String,
+    pub title: String,
+    pub status: String,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub author: Option<String>,
+    pub summary: Option<String>,
+    pub change_set: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl AivcsPullRequestRow {
+    pub fn into_response(self) -> AivcsPullRequestResponse {
+        AivcsPullRequestResponse {
+            id: self.id,
+            repo: self.repo,
+            run_id: self.run_id,
+            title: self.title,
+            status: self.status,
+            source_branch: self.source_branch,
+            target_branch: self.target_branch,
+            author: self.author,
+            summary: self.summary,
+            change_set: serde_json::from_str(&self.change_set).unwrap_or(serde_json::Value::Null),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AivcsPullRequestResponse {
+    pub id: String,
+    pub repo: String,
+    pub run_id: String,
+    pub title: String,
+    pub status: String,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub author: Option<String>,
+    pub summary: Option<String>,
+    pub change_set: serde_json::Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct Ws2TaskRow {
     pub id: String,
@@ -5069,6 +5252,95 @@ mod tests {
         };
 
         assert!(build_entity_refs(&evt).is_none());
+    }
+
+    #[test]
+    fn aivcs_projection_from_run_extracts_change_set() {
+        let body = models::CreateRun {
+            repo: "stevedores-org/aivcs-api".into(),
+            trigger: Some("pull_request".into()),
+            actor: Some("codex".into()),
+            metadata: Some(serde_json::json!({
+                "aivcs": {
+                    "change_set": {
+                        "id": "11",
+                        "title": "Fix merge conflicts",
+                        "status": "ready_for_review",
+                        "source_branch": "codex/fmc-pr11",
+                        "target_branch": "main",
+                        "author": "codex",
+                        "summary": "Resolved PR conflicts",
+                        "labels": ["aivcs"]
+                    }
+                }
+            })),
+        };
+
+        let projection =
+            aivcs_projection_from_run("tenant-a", "run-1", &body, "2026-06-12T00:00:00.000Z")
+                .expect("projection");
+
+        assert_eq!(projection.tenant_id, "tenant-a");
+        assert_eq!(projection.id, "11");
+        assert_eq!(projection.repo, "stevedores-org/aivcs-api");
+        assert_eq!(projection.run_id, "run-1");
+        assert_eq!(projection.title, "Fix merge conflicts");
+        assert_eq!(projection.status, "ready_for_review");
+        assert_eq!(projection.source_branch.as_deref(), Some("codex/fmc-pr11"));
+        assert_eq!(projection.target_branch.as_deref(), Some("main"));
+        assert_eq!(projection.author.as_deref(), Some("codex"));
+        assert_eq!(projection.summary.as_deref(), Some("Resolved PR conflicts"));
+        assert_eq!(projection.created_at, "2026-06-12T00:00:00.000Z");
+        assert_eq!(projection.updated_at, "2026-06-12T00:00:00.000Z");
+        let change_set: serde_json::Value = serde_json::from_str(&projection.change_set).unwrap();
+        assert_eq!(change_set["labels"][0], "aivcs");
+    }
+
+    #[test]
+    fn aivcs_projection_from_run_scopes_numeric_pr_id_by_repo() {
+        let body = models::CreateRun {
+            repo: "stevedores-org/data-fabric".into(),
+            trigger: None,
+            actor: None,
+            metadata: Some(serde_json::json!({
+                "aivcs": {
+                    "change_set": {
+                        "number": 158,
+                        "state": "open",
+                        "head_ref": "feature/change-set",
+                        "base_ref": "main"
+                    }
+                }
+            })),
+        };
+
+        let projection =
+            aivcs_projection_from_run("tenant-a", "run-2", &body, "2026-06-12T00:00:00.000Z")
+                .expect("projection");
+
+        assert_eq!(projection.id, "stevedores-org/data-fabric#158");
+        assert_eq!(projection.title, "158");
+        assert_eq!(projection.status, "open");
+        assert_eq!(projection.source_branch.as_deref(), Some("feature/change-set"));
+        assert_eq!(projection.target_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn aivcs_projection_from_run_ignores_runs_without_change_set() {
+        let body = models::CreateRun {
+            repo: "stevedores-org/data-fabric".into(),
+            trigger: None,
+            actor: None,
+            metadata: Some(serde_json::json!({ "ref": "main" })),
+        };
+
+        assert!(aivcs_projection_from_run(
+            "tenant-a",
+            "run-3",
+            &body,
+            "2026-06-12T00:00:00.000Z"
+        )
+        .is_none());
     }
 
     // ── Pagination helpers: list_policy_rules / list_agents ─────
