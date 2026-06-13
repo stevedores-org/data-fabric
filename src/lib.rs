@@ -1,4 +1,5 @@
 use serde::Serialize;
+use wasm_bindgen::JsValue;
 use worker::*;
 
 mod db;
@@ -18,6 +19,7 @@ mod tenant;
 mod tenant_security;
 mod verification;
 mod openapi;
+mod gemini_service;
 
 pub use task_do::TaskLeaseManager;
 pub use thread_do::ThreadManager;
@@ -729,7 +731,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "https://do/launch",
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(serde_wasm_bindgen::to_value(&envelope).map_err(|e| Error::RustError(e.to_string()))?),
+                    body: Some(JsValue::from_str(&serde_json::to_string(&envelope).map_err(|e| Error::RustError(e.to_string()))?)),
                     headers,
                     ..Default::default()
                 }
@@ -1033,7 +1035,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "https://do/enqueue",
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(serde_wasm_bindgen::to_value(&task).map_err(|e| Error::RustError(e.to_string()))?),
+                    body: Some(JsValue::from_str(&serde_json::to_string(&task).map_err(|e| Error::RustError(e.to_string()))?)),
                     ..Default::default()
                 },
             )?;
@@ -1184,7 +1186,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 &format!("https://do/complete/{}", task_id),
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
+                    body: Some(JsValue::from_str(&serde_json::to_string(&body).map_err(|e| Error::RustError(e.to_string()))?)),
                     ..Default::default()
                 },
             )?;
@@ -1215,7 +1217,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 &format!("https://do/fail/{}", task_id),
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
+                    body: Some(JsValue::from_str(&serde_json::to_string(&body).map_err(|e| Error::RustError(e.to_string()))?)),
                     ..Default::default()
                 },
             )?;
@@ -1484,7 +1486,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "https://do/checkpoint",
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?),
+                    body: Some(JsValue::from_str(&serde_json::to_string(&body).map_err(|e| Error::RustError(e.to_string()))?)),
                     headers,
                     ..Default::default()
                 },
@@ -2511,6 +2513,12 @@ pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Conte
         msg.ack();
     }
     Ok(())
+}
+
+/// Scheduled event: poll Gemini batch jobs and other background maintenance.
+#[event(scheduled)]
+pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Result<()> {
+    gemini_service::poll_gemini_jobs(&env).await
 }
 
 pub(crate) fn generate_id() -> Result<String> {

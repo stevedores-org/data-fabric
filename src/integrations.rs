@@ -17,6 +17,7 @@ pub enum IntegrationTarget {
     Aivcs,
     LlamaRs,
     Mom,
+    Gemini,
 }
 
 impl IntegrationTarget {
@@ -26,6 +27,7 @@ impl IntegrationTarget {
             Self::Aivcs => "aivcs",
             Self::LlamaRs => "llama_rs",
             Self::Mom => "mom",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -690,6 +692,287 @@ pub mod mom {
     }
 }
 
+// ── Gemini Integration ──────────────────────────────────────────
+
+/// Gemini integration module for large-scale background processing.
+pub mod gemini {
+    use super::*;
+
+    /// Gemini Batch API request (JSONL line)
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct BatchRequest {
+        pub key: String,
+        pub request: GenerateContentRequest,
+    }
+
+    /// Gemini GenerateContentRequest
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct GenerateContentRequest {
+        pub contents: Vec<Content>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub system_instruction: Option<Content>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tools: Option<Vec<serde_json::Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tool_config: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub safety_settings: Option<Vec<serde_json::Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub generation_config: Option<serde_json::Value>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct Content {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub role: Option<String>,
+        pub parts: Vec<Part>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct Part {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub inline_data: Option<InlineData>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub file_data: Option<FileData>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub function_call: Option<FunctionCall>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub function_response: Option<FunctionResponse>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct InlineData {
+        pub mime_type: String,
+        pub data: String,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct FileData {
+        pub mime_type: String,
+        pub file_uri: String,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct FunctionCall {
+        pub name: String,
+        pub args: serde_json::Value,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct FunctionResponse {
+        pub name: String,
+        pub response: serde_json::Value,
+    }
+
+    /// Status of a Gemini Batch Job.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum BatchJobState {
+        Unspecified,
+        Pending,
+        Running,
+        Succeeded,
+        Failed,
+        Cancelled,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct BatchJob {
+        pub name: String,
+        pub state: BatchJobState,
+        pub create_time: String,
+        pub completion_time: Option<String>,
+        pub response_file: Option<String>,
+        pub error: Option<serde_json::Value>,
+    }
+
+    /// Client for interacting with Gemini API.
+    pub struct GeminiClient {
+        pub api_key: String,
+    }
+
+    impl GeminiClient {
+        pub fn new(api_key: String) -> Self {
+            Self { api_key }
+        }
+
+        /// Upload a file to Gemini File API using resumable protocol.
+        pub async fn upload_file(
+            &self,
+            data: Vec<u8>,
+            mime_type: &str,
+            display_name: Option<&str>,
+        ) -> Result<String, String> {
+            use worker::wasm_bindgen::JsValue;
+
+            let url = format!(
+                "https://generativelanguage.googleapis.com/upload/v1beta/files?key={}",
+                self.api_key
+            );
+
+            let metadata = serde_json::json!({
+                "file": {
+                    "display_name": display_name.unwrap_or("batch_input.jsonl"),
+                }
+            });
+
+            let mut opts = worker::RequestInit::new();
+            opts.with_method(worker::Method::Post);
+
+            let headers = worker::Headers::new();
+            headers
+                .append("X-Goog-Upload-Protocol", "resumable")
+                .map_err(|e| format!("{:?}", e))?;
+            headers
+                .append("X-Goog-Upload-Header-Content-Length", &data.len().to_string())
+                .map_err(|e| format!("{:?}", e))?;
+            headers
+                .append("X-Goog-Upload-Header-Content-Type", mime_type)
+                .map_err(|e| format!("{:?}", e))?;
+            headers
+                .append("Content-Type", "application/json")
+                .map_err(|e| format!("{:?}", e))?;
+            opts.with_headers(headers);
+            opts.with_body(Some(JsValue::from_str(
+                &serde_json::to_string(&metadata).unwrap(),
+            )));
+
+            let req = worker::Request::new_with_init(&url, &opts).map_err(|e| format!("{:?}", e))?;
+            let res = worker::Fetch::Request(req)
+                .send()
+                .await
+                .map_err(|e| format!("{:?}", e))?;
+
+            if res.status_code() != 200 {
+                return Err(format!("Gemini File API init error: {}", res.status_code()));
+            }
+
+            let upload_url = res
+                .headers()
+                .get("Location")
+                .map_err(|e| format!("{:?}", e))?
+                .ok_or("Missing Location header")?;
+
+            // Now PUT the data
+            let mut put_opts = worker::RequestInit::new();
+            put_opts.with_method(worker::Method::Put);
+
+            let array = js_sys::Uint8Array::new_with_length(data.len() as u32);
+            array.copy_from(&data);
+            put_opts.with_body(Some(array.into()));
+
+            let put_req =
+                worker::Request::new_with_init(&upload_url, &put_opts).map_err(|e| format!("{:?}", e))?;
+            let mut put_res = worker::Fetch::Request(put_req)
+                .send()
+                .await
+                .map_err(|e| format!("{:?}", e))?;
+
+            if put_res.status_code() != 200 && put_res.status_code() != 201 {
+                return Err(format!(
+                    "Gemini File API upload error: {}",
+                    put_res.status_code()
+                ));
+            }
+
+            #[derive(Deserialize)]
+            struct FileResponse {
+                file: FileInfo,
+            }
+            #[derive(Deserialize)]
+            struct FileInfo {
+                name: String,
+            }
+
+            let info = put_res
+                .json::<FileResponse>()
+                .await
+                .map_err(|e| format!("{:?}", e))?;
+            Ok(info.file.name)
+        }
+
+        /// Create a batch job from a previously uploaded file.
+        pub async fn create_batch_job(
+            &self,
+            model: &str,
+            input_file: &str,
+            display_name: Option<&str>,
+        ) -> Result<BatchJob, String> {
+            use worker::wasm_bindgen::JsValue;
+
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:createBatchJob?key={}",
+                model, self.api_key
+            );
+
+            let mut body = serde_json::json!({
+                "input_config": {
+                    "source": input_file,
+                }
+            });
+
+            if let Some(name) = display_name {
+                body.as_object_mut()
+                    .unwrap()
+                    .insert("display_name".to_string(), serde_json::json!(name));
+            }
+
+            let mut opts = worker::RequestInit::new();
+            opts.with_method(worker::Method::Post);
+
+            let headers = worker::Headers::new();
+            headers
+                .append("Content-Type", "application/json")
+                .map_err(|e| format!("{:?}", e))?;
+            opts.with_headers(headers);
+            opts.with_body(Some(JsValue::from_str(
+                &serde_json::to_string(&body).unwrap(),
+            )));
+
+            let req = worker::Request::new_with_init(&url, &opts).map_err(|e| format!("{:?}", e))?;
+            let mut res = worker::Fetch::Request(req)
+                .send()
+                .await
+                .map_err(|e| format!("{:?}", e))?;
+
+            if res.status_code() != 200 {
+                return Err(format!(
+                    "Gemini API error: {} {}",
+                    res.status_code(),
+                    res.text().await.unwrap_or_default()
+                ));
+            }
+
+            res.json::<BatchJob>()
+                .await
+                .map_err(|e| format!("{:?}", e))
+        }
+
+        /// Get status of a batch job.
+        pub async fn get_batch_job(&self, name: &str) -> Result<BatchJob, String> {
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/{}?key={}",
+                name, self.api_key
+            );
+
+            let mut res = worker::Fetch::Url(url.parse().map_err(|e| format!("{:?}", e))?)
+                .send()
+                .await
+                .map_err(|e| format!("{:?}", e))?;
+
+            if res.status_code() != 200 {
+                return Err(format!("Gemini API error: {}", res.status_code()));
+            }
+
+            res.json::<BatchJob>()
+                .await
+                .map_err(|e| format!("{:?}", e))
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1134,6 +1417,7 @@ mod tests {
             IntegrationTarget::Aivcs,
             IntegrationTarget::LlamaRs,
             IntegrationTarget::Mom,
+            IntegrationTarget::Gemini,
         ];
         for target in &targets {
             let json = serde_json::to_string(target).unwrap();
@@ -1154,5 +1438,53 @@ mod tests {
         let json = serde_json::to_string(&reg).unwrap();
         let parsed: RegisterIntegration = serde_json::from_str(&json).unwrap();
         assert_eq!(reg, parsed);
+    }
+
+    // ── Gemini integration tests ───────────────────────────
+
+    #[test]
+    fn gemini_batch_request_serde() {
+        let req = gemini::BatchRequest {
+            key: "req-1".into(),
+            request: gemini::GenerateContentRequest {
+                contents: vec![gemini::Content {
+                    role: Some("user".into()),
+                    parts: vec![gemini::Part {
+                        text: Some("Summarize this: event data".into()),
+                        inline_data: None,
+                        file_data: None,
+                        function_call: None,
+                        function_response: None,
+                    }],
+                }],
+                system_instruction: None,
+                tools: None,
+                tool_config: None,
+                safety_settings: None,
+                generation_config: None,
+            },
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: gemini::BatchRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, parsed);
+        assert!(json.contains("Summarize this"));
+    }
+
+    #[test]
+    fn gemini_batch_job_serde() {
+        let job = gemini::BatchJob {
+            name: "batchJobs/123".into(),
+            state: gemini::BatchJobState::Running,
+            create_time: "2026-05-30T10:00:00Z".into(),
+            completion_time: None,
+            response_file: None,
+            error: None,
+        };
+
+        let json = serde_json::to_string(&job).unwrap();
+        assert!(json.contains("RUNNING"));
+        let parsed: gemini::BatchJob = serde_json::from_str(&json).unwrap();
+        assert_eq!(job, parsed);
     }
 }

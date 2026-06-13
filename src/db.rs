@@ -4496,6 +4496,83 @@ pub async fn touch_integration(
     Ok(())
 }
 
+// ── Gemini Batch Jobs (WS6+) ──────────────────────────────────
+
+pub async fn create_gemini_batch_job(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    job: &crate::integrations::gemini::BatchJob,
+    model: &str,
+    input_file: &str,
+) -> Result<()> {
+    let now = now_iso();
+    let status = serde_json::to_string(&job.state).unwrap().replace("\"", "");
+
+    db.prepare(
+        "INSERT INTO gemini_batch_jobs (id, tenant_id, job_name, model, status, input_file, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&job.name),
+        JsValue::from_str(model),
+        JsValue::from_str(&status),
+        JsValue::from_str(input_file),
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
+}
+
+pub async fn update_gemini_batch_job(
+    db: &D1Database,
+    tenant_id: &str,
+    job: &crate::integrations::gemini::BatchJob,
+) -> Result<()> {
+    let status = serde_json::to_string(&job.state).unwrap().replace("\"", "");
+    let completed_at = job.completion_time.clone();
+
+    db.prepare(
+        "UPDATE gemini_batch_jobs SET status = ?1, output_file = ?2, error_json = ?3, completed_at = ?4
+         WHERE tenant_id = ?5 AND job_name = ?6",
+    )
+    .bind(&[
+        JsValue::from_str(&status),
+        opt_str(&job.response_file),
+        opt_json(&job.error),
+        opt_str(&completed_at),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&job.name),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
+}
+
+pub async fn list_pending_gemini_batch_jobs(
+    db: &D1Database,
+) -> Result<Vec<(String, String, String)>> {
+    #[derive(serde::Deserialize)]
+    struct JobRow {
+        tenant_id: String,
+        job_name: String,
+        model: String,
+    }
+
+    let result: D1Result = db
+        .prepare("SELECT tenant_id, job_name, model FROM gemini_batch_jobs WHERE status IN ('PENDING', 'RUNNING')")
+        .all()
+        .await?;
+
+    let rows: Vec<JobRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| (r.tenant_id, r.job_name, r.model)).collect())
+}
+
 pub async fn get_integration(
     db: &D1Database,
     tenant_id: &str,
