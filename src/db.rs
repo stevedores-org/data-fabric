@@ -826,8 +826,16 @@ fn aivcs_projection_from_run(
     now: &str,
 ) -> Option<AivcsPullRequestUpsert> {
     let change_set = body.metadata.as_ref()?.get("aivcs")?.get("change_set")?;
-    let id = json_string(change_set, &["id", "number", "pull_request_id"])?;
-    let title = json_string(change_set, &["title"]).unwrap_or_else(|| id.clone());
+    let explicit_id = json_string(change_set, &["id"]);
+    let source_id = explicit_id
+        .clone()
+        .or_else(|| json_string(change_set, &["number", "pull_request_id"]))?;
+    let id = if explicit_id.is_some() {
+        source_id.clone()
+    } else {
+        format!("{}#{}", body.repo, source_id)
+    };
+    let title = json_string(change_set, &["title"]).unwrap_or_else(|| source_id.clone());
     let status = json_string(change_set, &["status", "state"]).unwrap_or_else(|| "open".into());
     let created_at = json_string(change_set, &["created_at"]).unwrap_or_else(|| now.into());
     let updated_at = json_string(change_set, &["updated_at"]).unwrap_or_else(|| now.into());
@@ -5289,7 +5297,7 @@ mod tests {
     }
 
     #[test]
-    fn aivcs_projection_from_run_accepts_numeric_change_set_id() {
+    fn aivcs_projection_from_run_scopes_numeric_pr_id_by_repo() {
         let body = models::CreateRun {
             repo: "stevedores-org/data-fabric".into(),
             trigger: None,
@@ -5310,7 +5318,7 @@ mod tests {
             aivcs_projection_from_run("tenant-a", "run-2", &body, "2026-06-12T00:00:00.000Z")
                 .expect("projection");
 
-        assert_eq!(projection.id, "158");
+        assert_eq!(projection.id, "stevedores-org/data-fabric#158");
         assert_eq!(projection.title, "158");
         assert_eq!(projection.status, "open");
         assert_eq!(projection.source_branch.as_deref(), Some("feature/change-set"));

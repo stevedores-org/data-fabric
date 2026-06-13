@@ -236,6 +236,9 @@ pub mod aivcs {
             meta.insert("branch".into(), serde_json::Value::String(branch.clone()));
         }
         if let Some(ref user_meta) = evt.metadata {
+            if let Some(aivcs_meta) = user_meta.get("aivcs") {
+                meta.insert("aivcs".into(), aivcs_meta.clone());
+            }
             meta.insert("metadata".into(), user_meta.clone());
         }
 
@@ -836,6 +839,33 @@ mod tests {
         let meta = run.metadata.unwrap();
         assert_eq!(meta["source"], "aivcs");
         assert_eq!(meta["commit_sha"], "abc123");
+    }
+
+    #[test]
+    fn aivcs_adapt_to_run_promotes_aivcs_metadata() {
+        let evt = aivcs::PipelineEvent {
+            pipeline_id: "p1".into(),
+            repo: "stevedores-org/data-fabric".into(),
+            event_type: aivcs::PipelineEventType::PipelineStart,
+            commit_sha: None,
+            branch: None,
+            actor: "ci-bot".into(),
+            artifacts: None,
+            metadata: Some(serde_json::json!({
+                "aivcs": {
+                    "change_set": {
+                        "number": 162,
+                        "title": "AIVCS projection"
+                    }
+                }
+            })),
+        };
+
+        let run = aivcs::adapt_to_run(&evt).unwrap();
+        let meta = run.metadata.unwrap();
+
+        assert_eq!(meta["aivcs"]["change_set"]["number"], 162);
+        assert_eq!(meta["metadata"]["aivcs"]["change_set"]["number"], 162);
     }
 
     #[test]
