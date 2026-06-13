@@ -2174,6 +2174,113 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 },
             )
         })
+        // ── AIVCS: change_set routes (issue #148) ────────────────
+        .get_async("/v1/change-sets", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            let repo = params.get("repo").map(|s| s.as_ref());
+            let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
+            let d1 = ctx.env.d1("DB")?;
+            if let Some(r) = repo {
+                let list = db::list_change_sets_by_repo(&d1, &tenant_ctx.tenant_id, r, limit).await?;
+                Response::from_json(&serde_json::json!({ "change_sets": list }))
+            } else {
+                Response::error("missing required query parameter: repo", 400)
+            }
+        })
+        .get_async("/v1/change-sets/:id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let id = ctx.param("id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            match db::get_change_set(&d1, &tenant_ctx.tenant_id, &id).await? {
+                Some(cs) => Response::from_json(&cs),
+                None => Response::error("change_set not found", 404),
+            }
+        })
+        // ── AIVCS: review projections routes (issue #148) ────────
+        .get_async("/v1/review-threads", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            let review_id = params.get("review_id").map(|s| s.as_ref());
+            let d1 = ctx.env.d1("DB")?;
+            if let Some(rid) = review_id {
+                let list = db::list_review_threads_for_review(&d1, &tenant_ctx.tenant_id, rid, 100).await?;
+                Response::from_json(&serde_json::json!({ "review_threads": list }))
+            } else {
+                Response::error("missing required query parameter: review_id", 400)
+            }
+        })
+        .get_async("/v1/review-threads/:id/comments", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let thread_id = ctx.param("id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            let list = db::list_review_comments_for_thread(&d1, &tenant_ctx.tenant_id, &thread_id, 100).await?;
+            Response::from_json(&serde_json::json!({ "comments": list }))
+        })
+        .get_async("/v1/review-threads/:id/anchors", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let thread_id = ctx.param("id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            let list = db::list_file_anchors_for_thread(&d1, &tenant_ctx.tenant_id, &thread_id, 100).await?;
+            Response::from_json(&serde_json::json!({ "file_anchors": list }))
+        })
+        .get_async("/v1/human-decisions", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            let review_id = params.get("review_id").map(|s| s.as_ref());
+            let d1 = ctx.env.d1("DB")?;
+            if let Some(rid) = review_id {
+                let list = db::list_human_decisions_by_review(&d1, &tenant_ctx.tenant_id, rid).await?;
+                Response::from_json(&serde_json::json!({ "human_decisions": list }))
+            } else {
+                Response::error("missing required query parameter: review_id", 400)
+            }
+        })
+
+        .get_async("/v1/ci-check-runs", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            let change_set_id = params.get("change_set_id").map(|s| s.as_ref());
+            let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
+            let d1 = ctx.env.d1("DB")?;
+            if let Some(cs_id) = change_set_id {
+                let list = db::list_ci_check_runs_for_change_set(&d1, &tenant_ctx.tenant_id, cs_id, limit).await?;
+                Response::from_json(&serde_json::json!({ "ci_check_runs": list }))
+            } else {
+                Response::error("missing required query parameter: change_set_id", 400)
+            }
+        })
+
+        .get_async("/v1/events", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            let since = params.get("since").map(|s| s.as_ref());
+            let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
+            let d1 = ctx.env.d1("DB")?;
+            let list = db::list_events_bronze(&d1, &tenant_ctx.tenant_id, since, limit).await?;
+            Response::from_json(&serde_json::json!({ "events": list }))
+        })
+
+        .get_async("/v1/branches", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            let repo = params.get("repo").map(|s| s.as_ref());
+            let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
+            let d1 = ctx.env.d1("DB")?;
+            if let Some(r) = repo {
+                let list = db::list_branches_by_repo(&d1, &tenant_ctx.tenant_id, r, limit).await?;
+                Response::from_json(&serde_json::json!({ "branches": list }))
+            } else {
+                Response::error("missing required query parameter: repo", 400)
+            }
+        })
+
         .run(req, env)
         .await;
 

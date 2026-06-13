@@ -262,3 +262,25 @@ mod tests {
         assert!(payload.confidence.is_none());
     }
 }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct CiCheckRun {
+    pub id: String,
+    pub change_set_id: String,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub url: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct Branch {
+    pub id: String,
+    pub repo: String,
+    pub name: String,
+    pub head_sha: String,
+    pub agent_owner: Option<String>,
+    pub status: String,
+    pub created_at: String,
+}
