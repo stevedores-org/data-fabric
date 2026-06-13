@@ -139,10 +139,7 @@ mod tests {
     #[test]
     fn every_constant_follows_dot_lowercase_pattern() {
         for c in ALL {
-            assert!(
-                !c.is_empty(),
-                "constant must not be empty"
-            );
+            assert!(!c.is_empty(), "constant must not be empty");
             assert!(
                 c.contains('.'),
                 "constant {:?} must contain at least one '.'",
@@ -159,11 +156,7 @@ mod tests {
                 c
             );
             // Reject any non-ASCII to keep grep simple.
-            assert!(
-                c.is_ascii(),
-                "constant {:?} must be ASCII",
-                c
-            );
+            assert!(c.is_ascii(), "constant {:?} must be ASCII", c);
             // No leading or trailing dot, and no empty segments.
             assert!(
                 !c.starts_with('.') && !c.ends_with('.'),
@@ -206,8 +199,8 @@ mod tests {
             "checkpoint.taken",
             "graph.event",
             "",
-            "aivcs", // missing trailing dot — should not match prefix "aivcs."
-            "agent", // bare "agent" is not an AIVCS-owned namespace
+            "aivcs",             // missing trailing dot — should not match prefix "aivcs."
+            "agent",             // bare "agent" is not an AIVCS-owned namespace
             "agent.other.thing", // "agent.other." is not one of the AIVCS sub-namespaces
             "ci.other.thing",    // only "ci.check." is AIVCS-owned
         ];

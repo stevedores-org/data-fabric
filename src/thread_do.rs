@@ -351,7 +351,11 @@ mod tests {
     fn history_is_trimmed_at_documented_cap() {
         let mut history: VecDeque<Checkpoint> = VecDeque::new();
         for i in 0..(MAX_HISTORY_ENTRIES + 5) {
-            append_to_history(&mut history, make_cp(&format!("cp-{i:03}")), MAX_HISTORY_ENTRIES);
+            append_to_history(
+                &mut history,
+                make_cp(&format!("cp-{i:03}")),
+                MAX_HISTORY_ENTRIES,
+            );
         }
 
         assert_eq!(history.len(), MAX_HISTORY_ENTRIES);

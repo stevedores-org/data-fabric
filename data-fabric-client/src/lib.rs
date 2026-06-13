@@ -1,9 +1,9 @@
 pub mod types;
 
-use types::*;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::{Client as HttpClient, Method, RequestBuilder, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
+use types::*;
 
 /// Reserved character set for a single URI path segment per RFC 3986. Anything
 /// outside `pchar` (which excludes `/`, `?`, `#`, etc.) must be percent-encoded
@@ -38,10 +38,7 @@ pub enum Error {
     Config(String),
 
     #[error("API error (status {status}): {message}")]
-    Api {
-        status: StatusCode,
-        message: String,
-    },
+    Api { status: StatusCode, message: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -69,12 +66,13 @@ impl ClientConfig {
     pub fn from_env() -> Result<Self> {
         let base_url = std::env::var("DATA_FABRIC_URL")
             .unwrap_or_else(|_| "https://data-fabric.data-fabric.svc.cluster.local".to_string());
-        
-        let tenant_id = std::env::var("DATA_FABRIC_TENANT_ID")
-            .map_err(|_| Error::Config("DATA_FABRIC_TENANT_ID environment variable is missing".to_string()))?;
-        
-        let tenant_role = std::env::var("DATA_FABRIC_TENANT_ROLE")
-            .unwrap_or_else(|_| "builder".to_string());
+
+        let tenant_id = std::env::var("DATA_FABRIC_TENANT_ID").map_err(|_| {
+            Error::Config("DATA_FABRIC_TENANT_ID environment variable is missing".to_string())
+        })?;
+
+        let tenant_role =
+            std::env::var("DATA_FABRIC_TENANT_ROLE").unwrap_or_else(|_| "builder".to_string());
 
         // Read from files first
         let mut cf_client_id = read_secret_file("/var/run/secrets/data-fabric/client-id");
@@ -118,7 +116,9 @@ impl Client {
 
     fn prepare_request(&self, method: Method, path: &str) -> RequestBuilder {
         let url = format!("{}{}", self.config.base_url.trim_end_matches('/'), path);
-        let mut req = self.http.request(method, url)
+        let mut req = self
+            .http
+            .request(method, url)
             .header("x-tenant-id", &self.config.tenant_id)
             .header("x-tenant-role", &self.config.tenant_role);
 
@@ -157,7 +157,7 @@ impl Client {
     }
 
     // ── Health ─────────────────────────────────────────────────────────────
-    
+
     pub async fn check_root(&self) -> Result<String> {
         let resp = self.prepare_request(Method::GET, "/").send().await?;
         let status = resp.status();
@@ -176,7 +176,7 @@ impl Client {
     }
 
     // ── Runs ───────────────────────────────────────────────────────────────
-    
+
     pub async fn create_run(&self, run: &CreateRun) -> Result<Created> {
         self.send_request(Method::POST, "/v1/runs", Some(run)).await
     }
@@ -197,7 +197,8 @@ impl Client {
         if let Some(c) = cursor {
             path.push_str(&format!("cursor={}&", c));
         }
-        self.send_request::<(), serde_json::Value>(Method::GET, &path, None).await
+        self.send_request::<(), serde_json::Value>(Method::GET, &path, None)
+            .await
     }
 
     pub async fn get_run(&self, id: &str) -> Result<Run> {
@@ -207,11 +208,12 @@ impl Client {
 
     pub async fn get_pull_request(&self, id: &str) -> Result<AivcsPullRequest> {
         let path = format!("/v1/pull-requests/{}", encode_path_segment(id));
-        self.send_request::<(), AivcsPullRequest>(Method::GET, &path, None).await
+        self.send_request::<(), AivcsPullRequest>(Method::GET, &path, None)
+            .await
     }
 
     // ── WS2 Tasks ──────────────────────────────────────────────────────────
-    
+
     pub async fn create_task(&self, run_id: &str, task: &CreateTask) -> Result<Created> {
         let path = format!("/v1/runs/{}/tasks", run_id);
         self.send_request(Method::POST, &path, Some(task)).await
@@ -219,13 +221,15 @@ impl Client {
 
     pub async fn list_tasks(&self, run_id: &str) -> Result<serde_json::Value> {
         let path = format!("/v1/runs/{}/tasks", run_id);
-        self.send_request::<(), serde_json::Value>(Method::GET, &path, None).await
+        self.send_request::<(), serde_json::Value>(Method::GET, &path, None)
+            .await
     }
 
     // ── Agent Tasks ────────────────────────────────────────────────────────
-    
+
     pub async fn create_agent_task(&self, task: &CreateAgentTask) -> Result<TaskCreated> {
-        self.send_request(Method::POST, "/v1/tasks", Some(task)).await
+        self.send_request(Method::POST, "/v1/tasks", Some(task))
+            .await
     }
 
     /// Build the HTTP request used by [`Client::claim_next_task`].
@@ -258,7 +262,11 @@ impl Client {
         builder.build().map_err(Error::from)
     }
 
-    pub async fn claim_next_task(&self, agent_id: &str, capabilities: &[String]) -> Result<Option<AgentTask>> {
+    pub async fn claim_next_task(
+        &self,
+        agent_id: &str,
+        capabilities: &[String],
+    ) -> Result<Option<AgentTask>> {
         let req = self.build_claim_next_task_request(agent_id, capabilities)?;
         let resp = self.http.execute(req).await?;
         if resp.status() == StatusCode::NO_CONTENT {
@@ -293,52 +301,73 @@ impl Client {
             .map_err(Error::from)
     }
 
-    pub async fn complete_task(&self, task_id: &str, req: &TaskCompleteRequest) -> Result<serde_json::Value> {
+    pub async fn complete_task(
+        &self,
+        task_id: &str,
+        req: &TaskCompleteRequest,
+    ) -> Result<serde_json::Value> {
         let path = format!("/mcp/task/{}/complete", task_id);
         self.send_request(Method::POST, &path, Some(req)).await
     }
 
-    pub async fn fail_task(&self, task_id: &str, req: &TaskFailRequest) -> Result<serde_json::Value> {
+    pub async fn fail_task(
+        &self,
+        task_id: &str,
+        req: &TaskFailRequest,
+    ) -> Result<serde_json::Value> {
         let path = format!("/mcp/task/{}/fail", task_id);
         self.send_request(Method::POST, &path, Some(req)).await
     }
 
     // ── Agents ─────────────────────────────────────────────────────────────
-    
+
     pub async fn register_agent(&self, agent: &RegisterAgent) -> Result<serde_json::Value> {
-        self.send_request(Method::POST, "/v1/agents", Some(agent)).await
+        self.send_request(Method::POST, "/v1/agents", Some(agent))
+            .await
     }
 
     pub async fn list_agents(&self) -> Result<serde_json::Value> {
-        self.send_request::<(), serde_json::Value>(Method::GET, "/v1/agents", None).await
+        self.send_request::<(), serde_json::Value>(Method::GET, "/v1/agents", None)
+            .await
     }
 
     // ── Checkpoints ────────────────────────────────────────────────────────
-    
-    pub async fn create_checkpoint(&self, checkpoint: &CreateCheckpoint) -> Result<CheckpointCreated> {
-        self.send_request(Method::POST, "/v1/checkpoints", Some(checkpoint)).await
+
+    pub async fn create_checkpoint(
+        &self,
+        checkpoint: &CreateCheckpoint,
+    ) -> Result<CheckpointCreated> {
+        self.send_request(Method::POST, "/v1/checkpoints", Some(checkpoint))
+            .await
     }
 
-    pub async fn get_latest_checkpoint_for_thread(&self, thread_id: &str) -> Result<serde_json::Value> {
+    pub async fn get_latest_checkpoint_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<serde_json::Value> {
         let path = format!("/v1/checkpoints/threads/{}", thread_id);
-        self.send_request::<(), serde_json::Value>(Method::GET, &path, None).await
+        self.send_request::<(), serde_json::Value>(Method::GET, &path, None)
+            .await
     }
 
     pub async fn get_checkpoint(&self, id: &str) -> Result<Checkpoint> {
         let path = format!("/v1/checkpoints/{}", id);
-        self.send_request::<(), Checkpoint>(Method::GET, &path, None).await
+        self.send_request::<(), Checkpoint>(Method::GET, &path, None)
+            .await
     }
 
     pub async fn delete_checkpoint(&self, id: &str) -> Result<serde_json::Value> {
         let path = format!("/v1/checkpoints/{}", id);
-        self.send_request::<(), serde_json::Value>(Method::DELETE, &path, None).await
+        self.send_request::<(), serde_json::Value>(Method::DELETE, &path, None)
+            .await
     }
 
     // ── Artifacts ──────────────────────────────────────────────────────────
-    
+
     pub async fn put_artifact(&self, key: &str, data: Vec<u8>) -> Result<ArtifactStoredResponse> {
         let path = format!("/v1/artifacts/{}", key);
-        let resp = self.prepare_request(Method::PUT, &path)
+        let resp = self
+            .prepare_request(Method::PUT, &path)
             .header("content-type", "application/octet-stream")
             .body(data)
             .send()
@@ -359,14 +388,19 @@ impl Client {
     }
 
     // ── Policy ─────────────────────────────────────────────────────────────
-    
+
     pub async fn check_policy(&self, req: &PolicyCheckRequest) -> Result<PolicyCheckResponse> {
-        self.send_request(Method::POST, "/v1/policies/check", Some(req)).await
+        self.send_request(Method::POST, "/v1/policies/check", Some(req))
+            .await
     }
 
     // ── Metrics ────────────────────────────────────────────────────────────
-    
-    pub async fn get_pilot_metrics(&self, window: Option<&str>, task_type: Option<&str>) -> Result<PilotMetrics> {
+
+    pub async fn get_pilot_metrics(
+        &self,
+        window: Option<&str>,
+        task_type: Option<&str>,
+    ) -> Result<PilotMetrics> {
         let mut path = "/v1/metrics/pilot?".to_string();
         if let Some(w) = window {
             path.push_str(&format!("window={}&", w));
@@ -374,35 +408,63 @@ impl Client {
         if let Some(t) = task_type {
             path.push_str(&format!("task_type={}&", t));
         }
-        self.send_request::<(), PilotMetrics>(Method::GET, &path, None).await
+        self.send_request::<(), PilotMetrics>(Method::GET, &path, None)
+            .await
     }
 
     // ── Graph Events ───────────────────────────────────────────────────────
-    
+
     pub async fn post_graph_events(&self, batch: &GraphEventBatch) -> Result<GraphEventAck> {
-        self.send_request(Method::POST, "/v1/graph-events", Some(batch)).await
+        self.send_request(Method::POST, "/v1/graph-events", Some(batch))
+            .await
     }
 
     // ── Integrations (WS6) ─────────────────────────────────────────────────
-    
-    pub async fn ingest_oxidizedgraph_events(&self, batch: &GraphExecBatch) -> Result<serde_json::Value> {
-        self.send_request(Method::POST, "/v1/integrations/oxidizedgraph/events", Some(batch)).await
+
+    pub async fn ingest_oxidizedgraph_events(
+        &self,
+        batch: &GraphExecBatch,
+    ) -> Result<serde_json::Value> {
+        self.send_request(
+            Method::POST,
+            "/v1/integrations/oxidizedgraph/events",
+            Some(batch),
+        )
+        .await
     }
 
     pub async fn ingest_aivcs_events(&self, evt: &PipelineEvent) -> Result<serde_json::Value> {
-        self.send_request(Method::POST, "/v1/integrations/aivcs/events", Some(evt)).await
+        self.send_request(Method::POST, "/v1/integrations/aivcs/events", Some(evt))
+            .await
     }
 
-    pub async fn submit_llama_inference(&self, req: &InferenceRequest) -> Result<serde_json::Value> {
-        self.send_request(Method::POST, "/v1/integrations/llama-rs/inference", Some(req)).await
+    pub async fn submit_llama_inference(
+        &self,
+        req: &InferenceRequest,
+    ) -> Result<serde_json::Value> {
+        self.send_request(
+            Method::POST,
+            "/v1/integrations/llama-rs/inference",
+            Some(req),
+        )
+        .await
     }
 
-    pub async fn ingest_llama_telemetry(&self, telemetry: &InferenceTelemetry) -> Result<serde_json::Value> {
-        self.send_request(Method::POST, "/v1/integrations/llama-rs/telemetry", Some(telemetry)).await
+    pub async fn ingest_llama_telemetry(
+        &self,
+        telemetry: &InferenceTelemetry,
+    ) -> Result<serde_json::Value> {
+        self.send_request(
+            Method::POST,
+            "/v1/integrations/llama-rs/telemetry",
+            Some(telemetry),
+        )
+        .await
     }
 
     pub async fn get_llama_context(&self, req: &ContextRequest) -> Result<ContextPackResponse> {
-        self.send_request(Method::POST, "/v1/integrations/llama-rs/context", Some(req)).await
+        self.send_request(Method::POST, "/v1/integrations/llama-rs/context", Some(req))
+            .await
     }
 }
 
@@ -429,7 +491,11 @@ mod tests {
         let req = client
             .build_claim_next_task_request("agent-1", &["rust".to_string(), "wasm".to_string()])
             .expect("request must build");
-        assert_eq!(req.method(), &Method::POST, "must use POST per PR #140 contract");
+        assert_eq!(
+            req.method(),
+            &Method::POST,
+            "must use POST per PR #140 contract"
+        );
     }
 
     /// `agent_id` and `cap` belong on the query string (the new POST handler
@@ -451,7 +517,10 @@ mod tests {
             .collect();
         assert_eq!(pairs.get("agent_id").map(String::as_str), Some("agent-1"));
         assert_eq!(pairs.get("cap").map(String::as_str), Some("rust,wasm"));
-        assert!(req.body().is_none(), "POST body must be empty; the handler reads from query params");
+        assert!(
+            req.body().is_none(),
+            "POST body must be empty; the handler reads from query params"
+        );
     }
 
     /// `cap` is optional per the OpenAPI spec — omit it entirely when no
@@ -466,7 +535,10 @@ mod tests {
             .expect("request must build");
         let query = req.url().query().unwrap_or("");
         assert!(query.contains("agent_id=agent-1"));
-        assert!(!query.contains("cap="), "cap must be omitted when no capabilities are supplied, got: {query}");
+        assert!(
+            !query.contains("cap="),
+            "cap must be omitted when no capabilities are supplied, got: {query}"
+        );
     }
 
     /// Regression test: `agent_id` and the `cap` values must be percent-encoded
@@ -491,11 +563,11 @@ mod tests {
         );
 
         // Exactly one `cap` parameter must be present (the legitimate one).
-        let cap_count = url
-            .query_pairs()
-            .filter(|(k, _)| k == "cap")
-            .count();
-        assert_eq!(cap_count, 1, "expected exactly one cap param, got {cap_count} in {query}");
+        let cap_count = url.query_pairs().filter(|(k, _)| k == "cap").count();
+        assert_eq!(
+            cap_count, 1,
+            "expected exactly one cap param, got {cap_count} in {query}"
+        );
 
         // The agent_id pair must round-trip to the original (decoded) value.
         let agent_id_value = url

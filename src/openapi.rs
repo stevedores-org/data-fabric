@@ -497,7 +497,6 @@ pub fn get_openapi_spec() -> &'static str {
 }"#
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::get_openapi_spec;
@@ -610,4 +609,3 @@ mod tests {
         assert_eq!(agent_id_param["in"].as_str(), Some("query"));
     }
 }
-

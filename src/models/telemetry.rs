@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use super::reasoning::TokenCost;
+use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
 pub const REASONING_TRACE_SCHEMA_VERSION: u32 = 1;
