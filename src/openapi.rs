@@ -259,6 +259,50 @@ pub fn get_openapi_spec() -> &'static str {
         }
       }
     },
+    "/v1/pull-requests/{id}": {
+      "get": {
+        "summary": "Get AIVCS Pull Request",
+        "description": "Returns the AIVCS review queue projection sourced from runs.metadata.aivcs.change_set.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "AIVCS pull request projection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["id", "repo", "run_id", "title", "status", "change_set", "created_at", "updated_at"],
+                  "properties": {
+                    "id": { "type": "string" },
+                    "repo": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "status": { "type": "string" },
+                    "source_branch": { "type": "string" },
+                    "target_branch": { "type": "string" },
+                    "author": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "change_set": { "type": "object" },
+                    "created_at": { "type": "string", "format": "date-time" },
+                    "updated_at": { "type": "string", "format": "date-time" }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pull request projection not found"
+          }
+        }
+      }
+    },
     "/v1/checkpoints": {
       "post": {
         "summary": "Save Checkpoint",

@@ -356,6 +356,19 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => errors::error_response("RUN_NOT_FOUND", "run not found", 404),
             }
         })
+        .get_async("/v1/pull-requests/:id", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let id = ctx.param("id").unwrap().to_string();
+            let d1 = ctx.env.d1("DB")?;
+            match db::get_aivcs_pull_request(&d1, &tenant_ctx.tenant_id, &id).await? {
+                Some(pr) => Response::from_json(&pr),
+                None => errors::error_response(
+                    "PULL_REQUEST_NOT_FOUND",
+                    "pull request not found",
+                    404,
+                ),
+            }
+        })
         // ── AIVCS issue #148 slice 4: explicit run pause/resume ─────
         //
         // These are scoped to runs only — task-level pause/resume is a

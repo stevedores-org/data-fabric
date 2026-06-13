@@ -53,6 +53,22 @@ pub struct Created {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AivcsPullRequest {
+    pub id: String,
+    pub repo: String,
+    pub run_id: String,
+    pub title: String,
+    pub status: String,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub author: Option<String>,
+    pub summary: Option<String>,
+    pub change_set: serde_json::Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 // WS2 Task types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
