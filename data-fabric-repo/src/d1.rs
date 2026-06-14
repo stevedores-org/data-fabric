@@ -99,10 +99,7 @@ where
         let stmt = self
             .db
             .prepare(self.select_sql)
-            .bind(&[
-                JsValue::from_str(tenant_id),
-                JsValue::from_str(id),
-            ])
+            .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])
             .map_err(Error::from)?;
         let res = stmt.all().await.map_err(Error::from)?;
         (self.decode)(&res)
@@ -129,10 +126,7 @@ where
         let (tenant_id, id) = key;
         self.db
             .prepare(self.delete_sql)
-            .bind(&[
-                JsValue::from_str(tenant_id),
-                JsValue::from_str(id),
-            ])
+            .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])
             .map_err(Error::from)?
             .run()
             .await

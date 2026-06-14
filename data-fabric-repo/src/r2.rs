@@ -43,7 +43,12 @@ impl Repository for R2Repository<'_> {
     type Value = Vec<u8>;
 
     async fn get(&self, key: &Self::Key) -> Result<Option<Self::Value>, Error> {
-        let obj = self.bucket.get(key.clone()).execute().await.map_err(Error::from)?;
+        let obj = self
+            .bucket
+            .get(key.clone())
+            .execute()
+            .await
+            .map_err(Error::from)?;
         match obj {
             Some(obj) => match obj.body() {
                 Some(body) => {

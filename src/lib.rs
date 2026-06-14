@@ -1,3 +1,4 @@
+#![allow(unused_must_use)]
 use serde::Serialize;
 use wasm_bindgen::JsValue;
 use worker::*;
@@ -7,18 +8,18 @@ mod errors;
 mod integrations;
 mod metrics;
 mod models;
+mod openapi;
 mod pagination;
+mod play_do;
 mod policy;
 mod storage;
 mod task_do;
-mod thread_do;
-mod play_do;
-mod vector_index;
 mod tenant;
 #[allow(dead_code)]
 mod tenant_security;
+mod thread_do;
+mod vector_index;
 mod verification;
-mod openapi;
 mod gemini_service;
 
 pub use task_do::TaskLeaseManager;
@@ -93,10 +94,7 @@ mod do_url_tests {
     fn build_do_url_encodes_injected_query_separators() {
         let url = build_do_url(
             "/claim",
-            &[
-                ("agent_id", "agent-1&caps=evil"),
-                ("caps", "rust"),
-            ],
+            &[("agent_id", "agent-1&caps=evil"), ("caps", "rust")],
         )
         .expect("url must build");
 
@@ -107,10 +105,7 @@ mod do_url_tests {
 
         // Exactly one `caps` parameter — the legitimate one. If the injected
         // `&caps=evil` had been interpolated raw, we'd see two.
-        let caps_count = parsed
-            .query_pairs()
-            .filter(|(k, _)| k == "caps")
-            .count();
+        let caps_count = parsed.query_pairs().filter(|(k, _)| k == "caps").count();
         assert_eq!(caps_count, 1, "expected one caps param, url was: {}", url);
 
         // The agent_id round-trips with `&` and `=` preserved as data, not
@@ -135,10 +130,7 @@ mod do_url_tests {
     fn build_do_url_encodes_path_aware_chars_in_query() {
         let url = build_do_url(
             "/heartbeat",
-            &[
-                ("task_id", "abc/extra?injected=1"),
-                ("agent_id", "agent#1"),
-            ],
+            &[("task_id", "abc/extra?injected=1"), ("agent_id", "agent#1")],
         )
         .expect("url must build");
 
@@ -351,7 +343,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/v1/runs/:id", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let id = ctx.param("id").expect("param id is required by route").to_string();
+            let id = ctx
+                .param("id")
+                .expect("param id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             match db::get_run(&d1, &tenant_ctx.tenant_id, &id).await? {
                 Some(run) => Response::from_json(&run),
@@ -360,15 +355,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/v1/pull-requests/:id", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let id = ctx.param("id").expect("param id is required by route").to_string();
+            let id = ctx
+                .param("id")
+                .expect("param id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             match db::get_aivcs_pull_request(&d1, &tenant_ctx.tenant_id, &id).await? {
                 Some(pr) => Response::from_json(&pr),
-                None => errors::error_response(
-                    "PULL_REQUEST_NOT_FOUND",
-                    "pull request not found",
-                    404,
-                ),
+                None => {
+                    errors::error_response("PULL_REQUEST_NOT_FOUND", "pull request not found", 404)
+                }
             }
         })
         // ── AIVCS issue #148 slice 4: explicit run pause/resume ─────
@@ -394,7 +390,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     403,
                 );
             }
-            let run_id = ctx.param("run_id").expect("param run_id is required by route").to_string();
+            let run_id = ctx
+                .param("run_id")
+                .expect("param run_id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             let actor = tenant_ctx.actor();
             match db::pause_run(&d1, &tenant_ctx.tenant_id, &run_id, &actor).await? {
@@ -429,7 +428,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     403,
                 );
             }
-            let run_id = ctx.param("run_id").expect("param run_id is required by route").to_string();
+            let run_id = ctx
+                .param("run_id")
+                .expect("param run_id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             let actor = tenant_ctx.actor();
             match db::resume_run(&d1, &tenant_ctx.tenant_id, &run_id, &actor).await? {
@@ -476,7 +478,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         // ── WS2 Tasks (run-scoped, D1-backed) ───────────────
         .post_async("/v1/runs/:run_id/tasks", |mut req, ctx| async move {
-            let run_id = ctx.param("run_id").expect("param run_id is required by route").to_string();
+            let run_id = ctx
+                .param("run_id")
+                .expect("param run_id is required by route")
+                .to_string();
             let body: models::CreateTask = req.json().await?;
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
@@ -489,7 +494,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/v1/runs/:run_id/tasks", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let run_id = ctx.param("run_id").expect("param run_id is required by route").to_string();
+            let run_id = ctx
+                .param("run_id")
+                .expect("param run_id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             let tasks = db::list_ws2_tasks(&d1, &tenant_ctx.tenant_id, &run_id).await?;
             Response::from_json(&serde_json::json!({ "tasks": tasks }))
@@ -576,7 +584,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let body: models::RetrieveMemoryRequest = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
-            
+
             let start = js_sys::Date::now();
 
             // 1. Semantic Search via Vectorize (if query provided)
@@ -599,11 +607,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             // 2. Relational Search + Filter via D1
             // Hybrid approach: use semantic IDs if available, or just use D1 filters
-            let response = db::retrieve_memory_hybrid(&d1, &tenant_ctx.tenant_id, &body, &semantic_ids).await?;
+            let response =
+                db::retrieve_memory_hybrid(&d1, &tenant_ctx.tenant_id, &body, &semantic_ids)
+                    .await?;
 
             let _latency_ms = (js_sys::Date::now() - start) as i64;
             // Update latency in response if needed, though D1 usually tracks its own
-            
+
             Response::from_json(&response)
         })
         .post_async("/v1/memory/context-pack", |mut req, ctx| async move {
@@ -663,7 +673,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── Plays (Orchestration) ──────────────────────────────
         .post_async("/v1/plays/:name/launch", |mut req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let play_name = ctx.param("name").expect("param name is required by route").to_string();
+            let play_name = ctx
+                .param("name")
+                .expect("param name is required by route")
+                .to_string();
             // Bad JSON in the body is a client contract violation: explicitly
             // reject with 400 instead of silently falling back to a default
             // request (which would mask the violation as a 200 OK). An empty
@@ -706,7 +719,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             // address another tenant's PlayManager state. See PR body for the
             // cutover note — existing PlayManager DOs are unreachable under
             // the new name.
-            let run_id = body.job_id.unwrap_or_else(|| generate_id().expect("failed to generate id"));
+            let run_id = body
+                .job_id
+                .unwrap_or_else(|| generate_id().expect("failed to generate id"));
             let do_name = play_do_name(&tenant_ctx.tenant_id, &run_id);
             let namespace = ctx.env.durable_object("PLAY_MANAGER")?;
             let stub = namespace.id_from_name(&do_name)?.get_stub()?;
@@ -734,10 +749,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     body: Some(JsValue::from_str(&serde_json::to_string(&envelope).map_err(|e| Error::RustError(e.to_string()))?)),
                     headers,
                     ..Default::default()
-                }
+                },
             )?;
             let mut do_resp = stub.fetch_with_request(do_req).await?;
-            
+
             let result: serde_json::Value = do_resp.json().await?;
             Response::from_json(&result)
         })
@@ -866,7 +881,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/v1/policies/rules/:id", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let id = ctx.param("id").expect("param id is required by route").to_string();
+            let id = ctx
+                .param("id")
+                .expect("param id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             match db::get_policy_rule(&d1, &tenant_ctx.tenant_id, &id).await? {
                 Some(rule) => Response::from_json(&rule.into_response()),
@@ -874,7 +892,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         })
         .patch_async("/v1/policies/rules/:id", |mut req, ctx| async move {
-            let id = ctx.param("id").expect("param id is required by route").to_string();
+            let id = ctx
+                .param("id")
+                .expect("param id is required by route")
+                .to_string();
             let body: models::UpdatePolicyRule = req.json().await?;
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             // Validate verdict if provided
@@ -908,7 +929,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .delete_async("/v1/policies/rules/:id", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let id = ctx.param("id").expect("param id is required by route").to_string();
+            let id = ctx
+                .param("id")
+                .expect("param id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             let deleted = db::delete_policy_rule(&d1, &tenant_ctx.tenant_id, &id).await?;
             if deleted {
@@ -1084,7 +1108,6 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 return Ok(Response::empty()?.with_status(204));
             }
 
-
             let mut task: models::AgentTask = do_resp.json().await?;
 
             // Sync to D1 (best effort)
@@ -1094,13 +1117,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             // Augment task with agent's memory context from MOM (if available)
             let mom_endpoint = ctx.env.var("MOM_ENDPOINT").ok().map(|v| v.to_string());
             if let Some(endpoint) = mom_endpoint {
-                let memory_context = augment_task_with_memory(
-                    &agent_id,
-                    &tenant_ctx.tenant_id,
-                    &task,
-                    &endpoint,
-                )
-                .await;
+                let memory_context =
+                    augment_task_with_memory(&agent_id, &tenant_ctx.tenant_id, &task, &endpoint)
+                        .await;
                 task.memory_context = memory_context;
             }
             Response::from_json(&task)
@@ -1154,7 +1173,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
             let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
-            
+
             let do_url = build_do_url(
                 "/heartbeat",
                 &[("task_id", &task_id), ("agent_id", &agent_id)],
@@ -1178,10 +1197,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None => return Response::error("missing task id", 400),
             };
             let body: models::TaskCompleteRequest = req.json().await?;
-            
+
             let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
             let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
-            
+
             let do_req = Request::new_with_init(
                 &format!("https://do/complete/{}", task_id),
                 &RequestInit {
@@ -1212,7 +1231,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let namespace = ctx.env.durable_object("TASK_LEASE_MANAGER")?;
             let stub = namespace.id_from_name(&tenant_ctx.tenant_id)?.get_stub()?;
-            
+
             let do_req = Request::new_with_init(
                 &format!("https://do/fail/{}", task_id),
                 &RequestInit {
@@ -1222,7 +1241,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 },
             )?;
             let mut do_resp = stub.fetch_with_request(do_req).await?;
-            
+
             if do_resp.status_code() == 200 {
                 let task: models::AgentTask = do_resp.json().await?;
                 // Sync to D1
@@ -1254,18 +1273,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
-            let cursor = match pagination::AgentsCursor::decode(
-                params.get("cursor").map(|s| s.as_str()),
-            ) {
-                Ok(c) => c,
-                Err(_) => {
-                    return errors::error_response(
-                        "INVALID_CURSOR",
-                        "cursor is malformed; echo back the next_cursor from a prior response",
-                        400,
-                    );
-                }
-            };
+            let cursor =
+                match pagination::AgentsCursor::decode(params.get("cursor").map(|s| s.as_str())) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return errors::error_response(
+                            "INVALID_CURSOR",
+                            "cursor is malformed; echo back the next_cursor from a prior response",
+                            400,
+                        );
+                    }
+                };
             let d1 = ctx.env.d1("DB")?;
             let (agents, next_cursor) =
                 db::list_agents(&d1, &tenant_ctx.tenant_id, limit, cursor.as_ref()).await?;
@@ -1292,10 +1310,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             db::record_telemetry(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
 
-            Response::from_json(&models::TelemetryAck {
-                id,
-                accepted: true,
-            })
+            Response::from_json(&models::TelemetryAck { id, accepted: true })
         })
         // ── Reasoning traces (Epic 3 / #111) ─────────────────
         .post_async("/v1/reasoning-traces", |mut req, ctx| async move {
@@ -1419,12 +1434,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     return Response::error("field must be 'inputs' or 'outputs'", 400);
                 }
                 let d1 = ctx.env.d1("DB")?;
-                let trace = match db::get_reasoning_trace(&d1, &tenant_ctx.tenant_id, &trace_id)
-                    .await?
-                {
-                    Some(t) => t,
-                    None => return Response::error("reasoning trace not found", 404),
-                };
+                let trace =
+                    match db::get_reasoning_trace(&d1, &tenant_ctx.tenant_id, &trace_id).await? {
+                        Some(t) => t,
+                        None => return Response::error("reasoning trace not found", 404),
+                    };
                 let (inline, r2_key) = if field == "inputs" {
                     (trace.inputs_inline, trace.inputs_r2_key)
                 } else {
@@ -1503,14 +1517,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "/v1/checkpoints/threads/:thread_id",
             |req, ctx| async move {
                 let tenant_ctx = tenant::tenant_from_request(&req)?;
-                let thread_id = ctx.param("thread_id").expect("param thread_id is required by route").to_string();
+                let thread_id = ctx
+                    .param("thread_id")
+                    .expect("param thread_id is required by route")
+                    .to_string();
 
                 // 1. Try fast path via ThreadManager Durable Object.
                 // Same tenant-scoped naming as the POST checkpoint handler.
                 let do_name = thread_do_name(&tenant_ctx.tenant_id, &thread_id);
                 let namespace = ctx.env.durable_object("THREAD_MANAGER")?;
                 let stub = namespace.id_from_name(&do_name)?.get_stub()?;
-                
+
                 let do_req = Request::new("https://do/latest", Method::Get)?;
                 let mut do_resp = stub.fetch_with_request(do_req).await?;
 
@@ -1541,7 +1558,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         )
         .get_async("/v1/checkpoints/:id", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let id = ctx.param("id").expect("param id is required by route").to_string();
+            let id = ctx
+                .param("id")
+                .expect("param id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             match db::get_checkpoint_by_id(&d1, &tenant_ctx.tenant_id, &id).await? {
                 Some(row) => Response::from_json(&row.into_checkpoint()),
@@ -1724,7 +1744,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── Gold Layer: Run Summaries (WS3) ─────────────────────
         .get_async("/v1/runs/:run_id/summary", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let run_id = ctx.param("run_id").expect("param run_id is required by route").to_string();
+            let run_id = ctx
+                .param("run_id")
+                .expect("param run_id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             match db::get_run_summary(&d1, &tenant_ctx.tenant_id, &run_id).await? {
                 Some(summary) => Response::from_json(&summary),
@@ -1745,7 +1768,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .get_async("/v1/gold/runs/:run_id/task-graph", |req, ctx| async move {
             let started = js_sys::Date::now();
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let run_id = ctx.param("run_id").expect("param run_id is required by route").to_string();
+            let run_id = ctx
+                .param("run_id")
+                .expect("param run_id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             let edges = db::get_task_dependencies(&d1, &tenant_ctx.tenant_id, &run_id).await?;
             timed_json_response(
@@ -1899,7 +1925,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/v1/integrations/:id", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let id = ctx.param("id").expect("param id is required by route").to_string();
+            let id = ctx
+                .param("id")
+                .expect("param id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             match db::get_integration(&d1, &tenant_ctx.tenant_id, &id).await? {
                 Some(integration) => Response::from_json(&integration),
@@ -1908,7 +1937,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .patch_async("/v1/integrations/:id", |mut req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let id = ctx.param("id").expect("param id is required by route").to_string();
+            let id = ctx
+                .param("id")
+                .expect("param id is required by route")
+                .to_string();
             let body: integrations::UpdateIntegration = req.json().await?;
             let d1 = ctx.env.d1("DB")?;
             db::update_integration(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
@@ -1919,7 +1951,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .delete_async("/v1/integrations/:id", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let id = ctx.param("id").expect("param id is required by route").to_string();
+            let id = ctx
+                .param("id")
+                .expect("param id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             let deleted = db::delete_integration(&d1, &tenant_ctx.tenant_id, &id).await?;
             if deleted {
@@ -2042,24 +2077,25 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             // Extract change_set_id for ci_check_run projection
             let cs_id_opt = {
-                let change_set_opt = evt.metadata.as_ref()
+                let change_set_opt = evt
+                    .metadata
+                    .as_ref()
                     .and_then(|m| m.get("aivcs"))
                     .and_then(|a| a.get("change_set").or_else(|| a.get("pull_request")));
-                
+
                 let explicit_id = change_set_opt
                     .and_then(|cs| cs.get("id"))
                     .and_then(|v| v.as_str().map(|s| s.to_string()));
-                
-                let source_id = explicit_id.clone()
-                    .or_else(|| {
-                        change_set_opt
-                            .and_then(|cs| cs.get("number").or_else(|| cs.get("pull_request_id")))
-                            .and_then(|v| match v {
-                                serde_json::Value::String(s) => Some(s.clone()),
-                                serde_json::Value::Number(n) => Some(n.to_string()),
-                                _ => None,
-                            })
-                    });
+
+                let source_id = explicit_id.clone().or_else(|| {
+                    change_set_opt
+                        .and_then(|cs| cs.get("number").or_else(|| cs.get("pull_request_id")))
+                        .and_then(|v| match v {
+                            serde_json::Value::String(s) => Some(s.clone()),
+                            serde_json::Value::Number(n) => Some(n.to_string()),
+                            _ => None,
+                        })
+                });
 
                 source_id.map(|src_id| {
                     if explicit_id.is_none() && src_id.chars().all(|c| c.is_ascii_digit()) {
@@ -2078,7 +2114,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     _ => "completed",
                 };
 
-                let conclusion = evt.metadata.as_ref()
+                let conclusion = evt
+                    .metadata
+                    .as_ref()
                     .and_then(|m| m.get("conclusion").or_else(|| m.get("state")))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
@@ -2090,12 +2128,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                         }
                     });
 
-                let url = evt.metadata.as_ref()
+                let url = evt
+                    .metadata
+                    .as_ref()
                     .and_then(|m| m.get("url").or_else(|| m.get("html_url")))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
-                let name = evt.metadata.as_ref()
+                let name = evt
+                    .metadata
+                    .as_ref()
                     .and_then(|m| m.get("name").or_else(|| m.get("stage")))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
@@ -2112,7 +2154,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     status,
                     &conclusion,
                     &url,
-                ).await {
+                )
+                .await
+                {
                     worker::console_log!("ERROR: aivcs upsert_ci_check_run failed: {e:?}");
                 }
             }
@@ -2220,7 +2264,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let d1 = ctx.env.d1("DB")?;
-            let now = js_sys::Date::new_0().to_iso_string().as_string().expect("Date should be a valid string");
+            let now = js_sys::Date::new_0()
+                .to_iso_string()
+                .as_string()
+                .expect("Date should be a valid string");
 
             let mut events: Vec<(String, &models::GraphEvent, String)> =
                 Vec::with_capacity(body.events.len());
@@ -2269,13 +2316,18 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── AIVCS: change_set routes (issue #148) ────────────────
         .get_async("/v1/change-sets", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
-            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            let url = req
+                .url()
+                .map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
             let repo = params.get("repo").map(|s| s.as_ref());
             let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
             let d1 = ctx.env.d1("DB")?;
             if let Some(r) = repo {
-                let list = db::list_change_sets_by_repo(&d1, &tenant_ctx.tenant_id, r, limit).await?;
+                let list =
+                    db::list_change_sets_by_repo(&d1, &tenant_ctx.tenant_id, r, limit).await?;
                 Response::from_json(&serde_json::json!({ "change_sets": list }))
             } else {
                 Response::error("missing required query parameter: repo", 400)
@@ -2283,7 +2335,10 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/v1/change-sets/:id", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let id = ctx.param("id").expect("param id is required by route").to_string();
+            let id = ctx
+                .param("id")
+                .expect("param id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
             match db::get_change_set(&d1, &tenant_ctx.tenant_id, &id).await? {
                 Some(cs) => Response::from_json(&cs),
@@ -2293,12 +2348,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ── AIVCS: review projections routes (issue #148) ────────
         .get_async("/v1/review-threads", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
-            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            let url = req
+                .url()
+                .map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
             let review_id = params.get("review_id").map(|s| s.as_ref());
             let d1 = ctx.env.d1("DB")?;
             if let Some(rid) = review_id {
-                let list = db::list_review_threads_for_review(&d1, &tenant_ctx.tenant_id, rid, 100).await?;
+                let list = db::list_review_threads_for_review(&d1, &tenant_ctx.tenant_id, rid, 100)
+                    .await?;
                 Response::from_json(&serde_json::json!({ "review_threads": list }))
             } else {
                 Response::error("missing required query parameter: review_id", 400)
@@ -2306,64 +2366,94 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/v1/review-threads/:id/comments", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let thread_id = ctx.param("id").expect("param id is required by route").to_string();
+            let thread_id = ctx
+                .param("id")
+                .expect("param id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
-            let list = db::list_review_comments_for_thread(&d1, &tenant_ctx.tenant_id, &thread_id, 100).await?;
+            let list =
+                db::list_review_comments_for_thread(&d1, &tenant_ctx.tenant_id, &thread_id, 100)
+                    .await?;
             Response::from_json(&serde_json::json!({ "comments": list }))
         })
         .get_async("/v1/review-threads/:id/anchors", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let thread_id = ctx.param("id").expect("param id is required by route").to_string();
+            let thread_id = ctx
+                .param("id")
+                .expect("param id is required by route")
+                .to_string();
             let d1 = ctx.env.d1("DB")?;
-            let list = db::list_file_anchors_for_thread(&d1, &tenant_ctx.tenant_id, &thread_id, 100).await?;
+            let list =
+                db::list_file_anchors_for_thread(&d1, &tenant_ctx.tenant_id, &thread_id, 100)
+                    .await?;
             Response::from_json(&serde_json::json!({ "file_anchors": list }))
         })
         .get_async("/v1/human-decisions", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
-            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            let url = req
+                .url()
+                .map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
             let review_id = params.get("review_id").map(|s| s.as_ref());
             let d1 = ctx.env.d1("DB")?;
             if let Some(rid) = review_id {
-                let list = db::list_human_decisions_by_review(&d1, &tenant_ctx.tenant_id, rid).await?;
+                let list =
+                    db::list_human_decisions_by_review(&d1, &tenant_ctx.tenant_id, rid).await?;
                 Response::from_json(&serde_json::json!({ "human_decisions": list }))
             } else {
                 Response::error("missing required query parameter: review_id", 400)
             }
         })
-
         .get_async("/v1/ci-check-runs", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
-            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
-            let change_set_id = params.get("change_set_id")
+            let url = req
+                .url()
+                .map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
+            let change_set_id = params
+                .get("change_set_id")
                 .or_else(|| params.get("pr_id"))
                 .map(|s| s.as_ref());
             let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
             let d1 = ctx.env.d1("DB")?;
             if let Some(cs_id) = change_set_id {
-                let list = db::list_ci_check_runs_for_change_set(&d1, &tenant_ctx.tenant_id, cs_id, limit).await?;
+                let list =
+                    db::list_ci_check_runs_for_change_set(&d1, &tenant_ctx.tenant_id, cs_id, limit)
+                        .await?;
                 Response::from_json(&serde_json::json!({ "ci_check_runs": list }))
             } else {
-                Response::error("missing required query parameter: change_set_id or pr_id", 400)
+                Response::error(
+                    "missing required query parameter: change_set_id or pr_id",
+                    400,
+                )
             }
         })
-
         .get_async("/v1/events", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
-            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            let url = req
+                .url()
+                .map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
             let since = params.get("since").map(|s| s.as_ref());
             let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
             let d1 = ctx.env.d1("DB")?;
             let list = db::list_events_bronze(&d1, &tenant_ctx.tenant_id, since, limit).await?;
             Response::from_json(&serde_json::json!({ "events": list }))
         })
-
         .get_async("/v1/branches", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
-            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
-            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            let url = req
+                .url()
+                .map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
             let repo = params.get("repo").map(|s| s.as_ref());
             let limit = pagination::clamp_limit(params.get("limit").and_then(|s| s.parse().ok()));
             let d1 = ctx.env.d1("DB")?;
@@ -2374,7 +2464,6 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Response::error("missing required query parameter: repo", 400)
             }
         })
-
         .run(req, env)
         .await;
 
@@ -2462,7 +2551,10 @@ pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Conte
                 continue;
             };
 
-        let now = js_sys::Date::new_0().to_iso_string().as_string().expect("Date should be a valid string");
+        let now = js_sys::Date::new_0()
+            .to_iso_string()
+            .as_string()
+            .expect("Date should be a valid string");
 
         // Note: silver promotion is done synchronously in POST /v1/graph-events.
         // The queue consumer handles only causality edges and gold layer summaries.
@@ -2517,6 +2609,7 @@ pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Conte
 
 /// Scheduled event: poll Gemini batch jobs and other background maintenance.
 #[event(scheduled)]
+#[allow(unused_must_use)]
 pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Result<()> {
     gemini_service::poll_gemini_jobs(&env).await
 }
@@ -2656,7 +2749,13 @@ fn sanitize_retry_after(raw: Option<&str>) -> u32 {
 fn looks_like_http_date(s: &str) -> bool {
     const WEEKDAYS_SHORT: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     const WEEKDAYS_LONG: [&str; 7] = [
-        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
     ];
     // Length sanity — shortest legal form (asctime: "Sun Nov  6 08:49:37 1994") is 24 chars;
     // longest legal form (RFC 850 with "Wednesday") is around 33 chars. Allow some slack.
@@ -2709,7 +2808,10 @@ fn classify_do_response(status: u16, retry_after_header: Option<&str>) -> DoForw
                 }
             })
         };
-        DoForwardAction::Forward { status, retry_after }
+        DoForwardAction::Forward {
+            status,
+            retry_after,
+        }
     }
 }
 
@@ -2724,14 +2826,13 @@ fn classify_do_response(status: u16, retry_after_header: Option<&str>) -> DoForw
 /// generic success (or, worse, a 500) and the backpressure feature is mute.
 async fn forward_do_response(mut do_resp: Response) -> Result<Option<Response>> {
     let status = do_resp.status_code();
-    let retry_after = do_resp
-        .headers()
-        .get("retry-after")
-        .ok()
-        .flatten();
+    let retry_after = do_resp.headers().get("retry-after").ok().flatten();
     match classify_do_response(status, retry_after.as_deref()) {
         DoForwardAction::Success => Ok(None),
-        DoForwardAction::Forward { status, retry_after } => {
+        DoForwardAction::Forward {
+            status,
+            retry_after,
+        } => {
             let content_type = do_resp
                 .headers()
                 .get("content-type")
@@ -2933,7 +3034,10 @@ mod tests {
         // ENQUEUE_RETRY_AFTER_SECS value (30) so a missing header
         // doesn't downgrade the contract.
         assert_eq!(DEFAULT_DO_RETRY_AFTER_SECS, 30);
-        assert_eq!(DEFAULT_DO_RETRY_AFTER_SECS, super::task_do::ENQUEUE_RETRY_AFTER_SECS);
+        assert_eq!(
+            DEFAULT_DO_RETRY_AFTER_SECS,
+            super::task_do::ENQUEUE_RETRY_AFTER_SECS
+        );
     }
 
     #[test]
@@ -3000,10 +3104,7 @@ mod tests {
         }
 
         // Absent header — falls back to default.
-        assert_eq!(
-            sanitize_retry_after(None),
-            DEFAULT_DO_RETRY_AFTER_SECS,
-        );
+        assert_eq!(sanitize_retry_after(None), DEFAULT_DO_RETRY_AFTER_SECS,);
     }
 
     #[test]
@@ -3211,10 +3312,9 @@ mod tests {
 
     #[test]
     fn parse_play_launch_body_accepts_valid_json() {
-        let parsed = parse_play_launch_body(
-            r#"{"play_name":"deploy","job_id":"j-1","metadata":null}"#,
-        )
-        .expect("valid JSON body should parse");
+        let parsed =
+            parse_play_launch_body(r#"{"play_name":"deploy","job_id":"j-1","metadata":null}"#)
+                .expect("valid JSON body should parse");
         assert_eq!(parsed.play_name, "deploy");
         assert_eq!(parsed.job_id.as_deref(), Some("j-1"));
         assert!(parsed.metadata.is_none());

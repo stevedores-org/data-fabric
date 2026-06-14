@@ -1016,7 +1016,10 @@ pub async fn pause_run(
         }));
     }
 
-    if matches!(current.status.as_str(), "succeeded" | "failed" | "cancelled") {
+    if matches!(
+        current.status.as_str(),
+        "succeeded" | "failed" | "cancelled"
+    ) {
         return Ok(PauseOutcome::Terminal {
             current_status: current.status,
         });
@@ -1024,10 +1027,7 @@ pub async fn pause_run(
 
     let update = db
         .prepare(SQL_PAUSE_RUN)
-        .bind(&[
-            JsValue::from_str(tenant_id),
-            JsValue::from_str(run_id),
-        ])?
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
         .run()
         .await?;
 
@@ -1119,10 +1119,7 @@ pub async fn resume_run(
 
     let update = db
         .prepare(SQL_RESUME_RUN)
-        .bind(&[
-            JsValue::from_str(tenant_id),
-            JsValue::from_str(run_id),
-        ])?
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
         .run()
         .await?;
 
@@ -4498,6 +4495,7 @@ pub async fn touch_integration(
 
 // ── Gemini Batch Jobs (WS6+) ──────────────────────────────────
 
+#[allow(dead_code)]
 pub async fn create_gemini_batch_job(
     db: &D1Database,
     tenant_id: &str,
@@ -4961,23 +4959,46 @@ pub async fn list_ci_check_runs_for_change_set(
                WHERE tenant_id = ?1 AND change_set_id = ?2 \
                ORDER BY created_at DESC \
                LIMIT ?3";
-    let stmt = d1.prepare(sql)
-        .bind(&[
-            tenant_id.into(),
-            change_set_id.into(),
-            limit.into(),
-        ])?;
+    let stmt = d1
+        .prepare(sql)
+        .bind(&[tenant_id.into(), change_set_id.into(), limit.into()])?;
     let result = stmt.all().await?;
     let mut runs = Vec::new();
     for row in result.results::<serde_json::Value>()? {
         runs.push(models::aivcs::CiCheckRun {
-            id: row.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            change_set_id: row.get("change_set_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            name: row.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            status: row.get("status").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            conclusion: row.get("conclusion").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            url: row.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            created_at: row.get("created_at").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            id: row
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            change_set_id: row
+                .get("change_set_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: row
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            status: row
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            conclusion: row
+                .get("conclusion")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            url: row
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            created_at: row
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
         });
     }
     Ok(runs)
@@ -4994,7 +5015,8 @@ pub async fn upsert_ci_check_run(
     conclusion: &Option<String>,
     url: &Option<String>,
 ) -> Result<()> {
-    let sql = "INSERT INTO ci_check_run (tenant_id, id, change_set_id, name, status, conclusion, url) \
+    let sql =
+        "INSERT INTO ci_check_run (tenant_id, id, change_set_id, name, status, conclusion, url) \
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                ON CONFLICT(tenant_id, id) DO UPDATE SET \
                    status = excluded.status, \
@@ -5038,7 +5060,8 @@ pub async fn list_events_bronze(
     };
 
     let stmt = if let Some(s) = since {
-        d1.prepare(sql).bind(&[tenant_id.into(), s.into(), limit.into()])?
+        d1.prepare(sql)
+            .bind(&[tenant_id.into(), s.into(), limit.into()])?
     } else {
         d1.prepare(sql).bind(&[tenant_id.into(), limit.into()])?
     };
@@ -5047,18 +5070,49 @@ pub async fn list_events_bronze(
     let mut events = Vec::new();
     for row in result.results::<serde_json::Value>()? {
         let mut evt = serde_json::Map::new();
-        evt.insert("id".into(), row.get("id").unwrap_or(&serde_json::Value::Null).clone());
-        evt.insert("run_id".into(), row.get("run_id").unwrap_or(&serde_json::Value::Null).clone());
-        evt.insert("thread_id".into(), row.get("thread_id").unwrap_or(&serde_json::Value::Null).clone());
-        evt.insert("event_type".into(), row.get("event_type").unwrap_or(&serde_json::Value::Null).clone());
-        evt.insert("node_id".into(), row.get("node_id").unwrap_or(&serde_json::Value::Null).clone());
-        evt.insert("actor".into(), row.get("actor").unwrap_or(&serde_json::Value::Null).clone());
+        evt.insert(
+            "id".into(),
+            row.get("id").unwrap_or(&serde_json::Value::Null).clone(),
+        );
+        evt.insert(
+            "run_id".into(),
+            row.get("run_id")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        evt.insert(
+            "thread_id".into(),
+            row.get("thread_id")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        evt.insert(
+            "event_type".into(),
+            row.get("event_type")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        evt.insert(
+            "node_id".into(),
+            row.get("node_id")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        evt.insert(
+            "actor".into(),
+            row.get("actor").unwrap_or(&serde_json::Value::Null).clone(),
+        );
         if let Some(payload_str) = row.get("payload").and_then(|v| v.as_str()) {
             if let Ok(payload_json) = serde_json::from_str::<serde_json::Value>(payload_str) {
                 evt.insert("payload".into(), payload_json);
             }
         }
-        evt.insert("created_at".into(), row.get("created_at").unwrap_or(&serde_json::Value::Null).clone());
+        evt.insert(
+            "created_at".into(),
+            row.get("created_at")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
         events.push(serde_json::Value::Object(evt));
     }
     Ok(events)
@@ -5077,23 +5131,47 @@ pub async fn list_branches_by_repo(
                WHERE tenant_id = ?1 AND repo = ?2 \
                ORDER BY created_at DESC \
                LIMIT ?3";
-    let stmt = d1.prepare(sql)
-        .bind(&[
-            tenant_id.into(),
-            repo.into(),
-            limit.into(),
-        ])?;
+    let stmt = d1
+        .prepare(sql)
+        .bind(&[tenant_id.into(), repo.into(), limit.into()])?;
     let result = stmt.all().await?;
     let mut branches = Vec::new();
     for row in result.results::<serde_json::Value>()? {
         branches.push(models::aivcs::Branch {
-            id: row.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            repo: row.get("repo").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            name: row.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            head_sha: row.get("head_sha").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            agent_owner: row.get("agent_owner").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            status: row.get("status").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            created_at: row.get("created_at").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            id: row
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            repo: row
+                .get("repo")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: row
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            head_sha: row
+                .get("head_sha")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            agent_owner: row
+                .get("agent_owner")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            status: row
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            created_at: row
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
         });
     }
     Ok(branches)
@@ -5550,7 +5628,10 @@ mod tests {
         assert_eq!(projection.id, "stevedores-org/data-fabric#158");
         assert_eq!(projection.title, "158");
         assert_eq!(projection.status, "open");
-        assert_eq!(projection.source_branch.as_deref(), Some("feature/change-set"));
+        assert_eq!(
+            projection.source_branch.as_deref(),
+            Some("feature/change-set")
+        );
         assert_eq!(projection.target_branch.as_deref(), Some("main"));
     }
 
@@ -5563,13 +5644,10 @@ mod tests {
             metadata: Some(serde_json::json!({ "ref": "main" })),
         };
 
-        assert!(aivcs_projection_from_run(
-            "tenant-a",
-            "run-3",
-            &body,
-            "2026-06-12T00:00:00.000Z"
-        )
-        .is_none());
+        assert!(
+            aivcs_projection_from_run("tenant-a", "run-3", &body, "2026-06-12T00:00:00.000Z")
+                .is_none()
+        );
     }
 
     // ── Pagination helpers: list_policy_rules / list_agents ─────
@@ -6085,4 +6163,3 @@ mod tests {
         }
     }
 }
-

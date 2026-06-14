@@ -4,6 +4,7 @@ use wasm_bindgen::JsValue;
 use worker::*;
 
 /// Summarize telemetry for a tenant using Gemini Batch API.
+#[allow(dead_code)]
 pub async fn summarize_telemetry_batch(
     env: &Env,
     tenant_id: &str,

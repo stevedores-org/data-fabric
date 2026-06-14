@@ -695,6 +695,7 @@ pub mod mom {
 // ── Gemini Integration ──────────────────────────────────────────
 
 /// Gemini integration module for large-scale background processing.
+#[allow(dead_code)]
 pub mod gemini {
     use super::*;
 
