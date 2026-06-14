@@ -33,7 +33,7 @@ impl<'a> R2Repository<'a> {
 }
 
 #[async_trait(?Send)]
-impl<'a> Repository for R2Repository<'a> {
+impl Repository for R2Repository<'_> {
     /// R2 keys are flat strings — no tenant dimension at the bucket level.
     /// Tenant scoping at the *application* level is implemented by prefixing
     /// keys with the tenant id, same as the existing `src/storage.rs`
@@ -43,7 +43,12 @@ impl<'a> Repository for R2Repository<'a> {
     type Value = Vec<u8>;
 
     async fn get(&self, key: &Self::Key) -> Result<Option<Self::Value>, Error> {
-        let obj = self.bucket.get(key.clone()).execute().await.map_err(Error::from)?;
+        let obj = self
+            .bucket
+            .get(key.clone())
+            .execute()
+            .await
+            .map_err(Error::from)?;
         match obj {
             Some(obj) => match obj.body() {
                 Some(body) => {

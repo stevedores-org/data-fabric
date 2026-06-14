@@ -15,8 +15,7 @@ use worker::*;
 // statements the cross_tenant_sql_shape tests will fail.
 
 /// SELECT for `get_play_definition` — scoped by tenant_id then name.
-const SQL_GET_PLAY_DEFINITION: &str =
-    "SELECT name, goal, tasks_json FROM play_definitions \
+const SQL_GET_PLAY_DEFINITION: &str = "SELECT name, goal, tasks_json FROM play_definitions \
      WHERE tenant_id = ?1 AND name = ?2";
 
 /// INSERT for `create_policy_escalation` — tenant_id is the first column.
@@ -29,9 +28,153 @@ const SQL_UPSERT_RATE_LIMIT_COUNTER: &str =
     "INSERT INTO policy_rate_limit_counters (\n            tenant_id, id, actor, action_class, window_start_epoch, window_seconds, count, updated_at\n         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)\n         ON CONFLICT(id) DO UPDATE SET\n            count = count + 1,\n            updated_at = excluded.updated_at";
 
 /// SELECT for the rate-limit count, also tenant-scoped.
-const SQL_SELECT_RATE_LIMIT_COUNT: &str =
-    "SELECT count FROM policy_rate_limit_counters \
+const SQL_SELECT_RATE_LIMIT_COUNT: &str = "SELECT count FROM policy_rate_limit_counters \
      WHERE tenant_id = ?1 AND id = ?2";
+
+// ── AIVCS: change_set SQL constants (issue #148, slice 1) ──────────
+//
+// The `change_set` table is the projection AIVCS uses above the diff
+// artifact (R2). All three statements below bind `tenant_id` as `?1`
+// so cross-tenant reads/writes are impossible — the
+// `cross_tenant_sql_change_set_*` tests in `mod tests` pin this.
+
+/// INSERT into `change_set`. tenant_id is the first column and ?1.
+pub const SQL_INSERT_CHANGE_SET: &str =
+    "INSERT INTO change_set (tenant_id, id, repo, base_ref, head_ref, author_agent_id, status, risk_level, confidence, run_id, diff_artifact_key, summary_artifact_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+
+/// SELECT a single `change_set` row by (tenant_id, id).
+pub const SQL_GET_CHANGE_SET: &str =
+    "SELECT id, repo, base_ref, head_ref, author_agent_id, status, risk_level, confidence, run_id, diff_artifact_key, summary_artifact_key, created_at \
+     FROM change_set \
+     WHERE tenant_id = ?1 AND id = ?2";
+
+/// SELECT recent `change_set` rows for a repo. ORDER BY created_at DESC,
+/// LIMIT is bound as `?3` so callers can page (cursor-based pagination
+/// lands with the HTTP route in a later slice).
+pub const SQL_LIST_CHANGE_SETS_BY_REPO: &str =
+    "SELECT id, repo, base_ref, head_ref, author_agent_id, status, risk_level, confidence, run_id, diff_artifact_key, summary_artifact_key, created_at \
+     FROM change_set \
+     WHERE tenant_id = ?1 AND repo = ?2 \
+     ORDER BY created_at DESC \
+     LIMIT ?3";
+
+// ── AIVCS review projections (issue #148 slice 2) ──────────────
+//
+// All four projection tables introduced in migration 0016 carry
+// `tenant_id` as the leading PRIMARY KEY component. The SQL
+// statements below MUST bind `tenant_id` as ?1 on every read and
+// every write; the cross-tenant tests at the bottom of this file
+// assert that shape.
+//
+// The constants and CRUD helpers below are not yet referenced from
+// `lib.rs` — slice 2 is projection-only. They are exercised by the
+// cross-tenant SQL-shape tests at the bottom of this file and will
+// be consumed by the slice-3+ HTTP routes and the projection
+// follower. `#[allow(dead_code)]` keeps the wasm `-D warnings`
+// build green until those slices land.
+
+#[allow(dead_code)]
+const SQL_INSERT_REVIEW_THREAD: &str =
+    "INSERT INTO review_thread (tenant_id, id, review_id, change_set_id, status, created_at, resolved_at)\n     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+
+#[allow(dead_code)]
+const SQL_GET_REVIEW_THREAD: &str =
+    "SELECT id, review_id, change_set_id, status, created_at, resolved_at \
+     FROM review_thread WHERE tenant_id = ?1 AND id = ?2";
+
+#[allow(dead_code)]
+const SQL_LIST_REVIEW_THREADS_FOR_REVIEW: &str =
+    "SELECT id, review_id, change_set_id, status, created_at, resolved_at \
+     FROM review_thread WHERE tenant_id = ?1 AND review_id = ?2 \
+     ORDER BY created_at ASC LIMIT ?3";
+
+#[allow(dead_code)]
+const SQL_UPDATE_REVIEW_THREAD_STATUS: &str =
+    "UPDATE review_thread SET status = ?3, resolved_at = ?4 \
+     WHERE tenant_id = ?1 AND id = ?2";
+
+#[allow(dead_code)]
+const SQL_INSERT_REVIEW_COMMENT: &str =
+    "INSERT INTO review_comment (tenant_id, id, thread_id, actor, body, parent_comment_id, created_at)\n     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+
+#[allow(dead_code)]
+const SQL_LIST_REVIEW_COMMENTS_FOR_THREAD: &str =
+    "SELECT id, thread_id, actor, body, parent_comment_id, created_at \
+     FROM review_comment WHERE tenant_id = ?1 AND thread_id = ?2 \
+     ORDER BY created_at ASC, id ASC LIMIT ?3";
+
+#[allow(dead_code)]
+const SQL_INSERT_REVIEW_THREAD_RESOLUTION: &str =
+    "INSERT INTO review_thread_resolution (tenant_id, thread_id, resolved_by, resolution, note, resolved_at)\n     VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
+#[allow(dead_code)]
+const SQL_GET_REVIEW_THREAD_RESOLUTION: &str =
+    "SELECT thread_id, resolved_by, resolution, note, resolved_at \
+     FROM review_thread_resolution WHERE tenant_id = ?1 AND thread_id = ?2";
+
+#[allow(dead_code)]
+const SQL_INSERT_FILE_ANCHOR: &str =
+    "INSERT INTO file_anchor (tenant_id, id, thread_id, file_path, start_line, end_line, side)\n     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+
+#[allow(dead_code)]
+const SQL_LIST_FILE_ANCHORS_FOR_THREAD: &str =
+    "SELECT id, thread_id, file_path, start_line, end_line, side \
+     FROM file_anchor WHERE tenant_id = ?1 AND thread_id = ?2 \
+     ORDER BY file_path ASC, start_line ASC, id ASC LIMIT ?3";
+/// Issue #148 / AIVCS slice 3 — INSERT into the `human_decision` projection.
+///
+/// `tenant_id` is the first column (and bound to ?1) so cross-tenant
+/// writes can't slip past the WS8 isolation tests. The projection
+/// carries seven typed columns plus `tenant_id` and `id`; the
+/// `created_at` column is populated by SQLite's column default rather
+/// than by a bound parameter so retries from the same wall-clock pin
+/// to a single value.
+const SQL_INSERT_HUMAN_DECISION: &str =
+    "INSERT INTO human_decision (tenant_id, id, run_id, review_id, actor, decision_type, reason, policy_decision_id, resulting_event_id)\n         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+
+/// SELECT for `list_human_decisions_by_run` — tenant-scoped, ordered by
+/// `created_at` ascending so the UI can render the human-decision
+/// timeline per run without a second sort pass.
+const SQL_LIST_HUMAN_DECISIONS_BY_RUN: &str =
+    "SELECT id, run_id, review_id, actor, decision_type, reason, policy_decision_id, resulting_event_id, created_at \
+     FROM human_decision \
+     WHERE tenant_id = ?1 AND run_id = ?2 \
+     ORDER BY created_at ASC, id ASC";
+
+/// SELECT for `list_human_decisions_by_review` — tenant-scoped, ordered
+/// by `created_at` ascending. Mirrors the by-run query shape so the BFF
+/// can share a row decoder.
+const SQL_LIST_HUMAN_DECISIONS_BY_REVIEW: &str =
+    "SELECT id, run_id, review_id, actor, decision_type, reason, policy_decision_id, resulting_event_id, created_at \
+     FROM human_decision \
+     WHERE tenant_id = ?1 AND review_id = ?2 \
+     ORDER BY created_at ASC, id ASC";
+
+/// UPDATE for `pause_run` (AIVCS issue #148 'Pause Agent' slice 4).
+///
+/// Tenant-scoped on `?1` and guarded against transitioning out of a
+/// terminal state — the guard is what makes the operation correct
+/// concurrently with a run completing on the orchestrator side. If the
+/// run already moved to 'succeeded' / 'failed' / 'cancelled' the UPDATE
+/// affects zero rows and the handler surfaces `RUN_IN_TERMINAL_STATE`.
+///
+/// `paused_at` is stamped only when transitioning from a pausable state
+/// (`created` or `running`). Already-paused runs are handled idempotently
+/// in `pause_run` before this UPDATE is issued.
+pub const SQL_PAUSE_RUN: &str =
+    "UPDATE runs SET status = 'paused', paused_at = datetime('now'), updated_at = datetime('now') \
+     WHERE tenant_id = ?1 AND id = ?2 \
+       AND status IN ('created', 'running')";
+
+/// UPDATE for `resume_run` (AIVCS issue #148 'Pause Agent' slice 4).
+///
+/// Tenant-scoped on `?1` and guarded so resume is only valid out of
+/// 'paused'. Resuming a run that is already running, or one that has
+/// reached a terminal state, affects zero rows and the handler surfaces
+/// `RUN_NOT_PAUSED`.
+pub const SQL_RESUME_RUN: &str =
+    "UPDATE runs SET status = 'running', resumed_at = datetime('now'), updated_at = datetime('now') \
+     WHERE tenant_id = ?1 AND id = ?2 AND status = 'paused'";
 
 pub fn now_iso() -> String {
     js_sys::Date::new_0().to_iso_string().as_string().unwrap()
@@ -104,7 +247,10 @@ pub async fn sync_task_status(
     tenant_id: &str,
     task: &models::AgentTask,
 ) -> Result<()> {
-    let result_json = task.result.as_ref().map(|v| serde_json::to_string(v).unwrap());
+    let result_json = task
+        .result
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap());
 
     db.prepare(
         "UPDATE mcp_tasks SET status = ?1, agent_id = ?2, result = ?3, retry_count = ?4, lease_expires_at = ?5, completed_at = ?6
@@ -238,8 +384,7 @@ pub async fn list_agents(
 ) -> Result<(Vec<models::Agent>, Option<crate::pagination::AgentsCursor>)> {
     let fetch_limit = limit.saturating_add(1);
 
-    let mut clauses: Vec<String> =
-        vec!["tenant_id = ?".into(), "status = 'active'".into()];
+    let mut clauses: Vec<String> = vec!["tenant_id = ?".into(), "status = 'active'".into()];
     let mut bindings: Vec<JsValue> = vec![JsValue::from_str(tenant_id)];
 
     if let Some(c) = cursor {
@@ -605,7 +750,122 @@ pub async fn create_run(
     ])?
     .run()
     .await?;
+    if let Some(projection) = aivcs_projection_from_run(tenant_id, id, body, &now) {
+        upsert_aivcs_pull_request(db, &projection).await?;
+    }
     Ok(())
+}
+
+async fn upsert_aivcs_pull_request(db: &D1Database, pr: &AivcsPullRequestUpsert) -> Result<()> {
+    db.prepare(
+        "INSERT INTO gold_aivcs_review_queue (
+            tenant_id, id, repo, run_id, title, status, source_branch, target_branch,
+            author, summary, change_set, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(tenant_id, id) DO UPDATE SET
+            repo = excluded.repo,
+            run_id = excluded.run_id,
+            title = excluded.title,
+            status = excluded.status,
+            source_branch = excluded.source_branch,
+            target_branch = excluded.target_branch,
+            author = excluded.author,
+            summary = excluded.summary,
+            change_set = excluded.change_set,
+            updated_at = excluded.updated_at",
+    )
+    .bind(&[
+        JsValue::from_str(&pr.tenant_id),
+        JsValue::from_str(&pr.id),
+        JsValue::from_str(&pr.repo),
+        JsValue::from_str(&pr.run_id),
+        JsValue::from_str(&pr.title),
+        JsValue::from_str(&pr.status),
+        opt_string(&pr.source_branch),
+        opt_string(&pr.target_branch),
+        opt_string(&pr.author),
+        opt_string(&pr.summary),
+        JsValue::from_str(&pr.change_set),
+        JsValue::from_str(&pr.created_at),
+        JsValue::from_str(&pr.updated_at),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn get_aivcs_pull_request(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<AivcsPullRequestResponse>> {
+    let row: Option<AivcsPullRequestRow> = db
+        .prepare(
+            "SELECT id, repo, run_id, title, status, source_branch, target_branch,
+                    author, summary, change_set, created_at, updated_at
+             FROM gold_aivcs_review_queue
+             WHERE tenant_id = ?1 AND id = ?2",
+        )
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.into_response()))
+}
+
+fn opt_string(s: &Option<String>) -> JsValue {
+    match s {
+        Some(s) => JsValue::from_str(s),
+        None => JsValue::NULL,
+    }
+}
+
+fn aivcs_projection_from_run(
+    tenant_id: &str,
+    run_id: &str,
+    body: &models::CreateRun,
+    now: &str,
+) -> Option<AivcsPullRequestUpsert> {
+    let change_set = body.metadata.as_ref()?.get("aivcs")?.get("change_set")?;
+    let explicit_id = json_string(change_set, &["id"]);
+    let source_id = explicit_id
+        .clone()
+        .or_else(|| json_string(change_set, &["number", "pull_request_id"]))?;
+    let id = if explicit_id.is_some() {
+        source_id.clone()
+    } else {
+        format!("{}#{}", body.repo, source_id)
+    };
+    let title = json_string(change_set, &["title"]).unwrap_or_else(|| source_id.clone());
+    let status = json_string(change_set, &["status", "state"]).unwrap_or_else(|| "open".into());
+    let created_at = json_string(change_set, &["created_at"]).unwrap_or_else(|| now.into());
+    let updated_at = json_string(change_set, &["updated_at"]).unwrap_or_else(|| now.into());
+    let change_set_json = serde_json::to_string(change_set).ok()?;
+
+    Some(AivcsPullRequestUpsert {
+        tenant_id: tenant_id.into(),
+        id,
+        repo: body.repo.clone(),
+        run_id: run_id.into(),
+        title,
+        status,
+        source_branch: json_string(change_set, &["source_branch", "head_ref", "head"]),
+        target_branch: json_string(change_set, &["target_branch", "base_ref", "base"]),
+        author: json_string(change_set, &["author", "actor"]),
+        summary: json_string(change_set, &["summary", "description"]),
+        change_set: change_set_json,
+        created_at,
+        updated_at,
+    })
+}
+
+fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(|v| match v {
+            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
 }
 
 /// List runs for `tenant_id` ordered by `(created_at DESC, id DESC)`.
@@ -677,6 +937,236 @@ pub async fn get_run(db: &D1Database, tenant_id: &str, id: &str) -> Result<Optio
         .first(None)
         .await?;
     Ok(row.map(|r| r.into_run_response()))
+}
+
+// ── AIVCS slice 4 (issue #148): pause / resume run state ─────────────
+//
+// These helpers are the storage half of the POST /v1/runs/{run_id}/pause
+// and /resume endpoints. The HTTP-level idempotency rules
+// (already-paused → 200, terminal → 409, not-paused → 409) are layered
+// in the handler in lib.rs; this module only owns the SQL transition
+// and the resulting row read-back.
+
+/// Result of a successful pause/resume transition. The handler folds
+/// this into the response envelope. `paused_at` / `resumed_at` are
+/// `Option<String>` because a freshly-paused run hasn't been resumed
+/// yet (and vice versa) — we surface whichever timestamp the transition
+/// just wrote.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct RunStatusUpdate {
+    pub id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<String>,
+}
+
+/// Outcome of attempting a pause transition. `Paused` is the
+/// happy-path 200; `AlreadyPaused` is the idempotent 200; `Terminal`
+/// maps to 409 RUN_IN_TERMINAL_STATE; `NotFound` is a guard for the
+/// case where the run doesn't exist for the tenant at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PauseOutcome {
+    Paused(RunStatusUpdate),
+    AlreadyPaused(RunStatusUpdate),
+    Terminal { current_status: String },
+    NotFound,
+}
+
+/// Outcome of attempting a resume transition. `Resumed` is the
+/// happy-path 200; `NotPaused` maps to 409 RUN_NOT_PAUSED (covers the
+/// case where the run is in any non-paused state, including terminal);
+/// `NotFound` is the missing-row guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    Resumed(RunStatusUpdate),
+    NotPaused { current_status: String },
+    NotFound,
+}
+
+/// Attempt to pause a run. The decision tree is:
+///
+/// 1. Look up the run scoped by tenant. Missing → `NotFound`.
+/// 2. If status is already 'paused' → `AlreadyPaused` with the existing
+///    `paused_at` (do not restamp — that would mask the original pause
+///    time and confuse audit). The handler returns 200 idempotently.
+/// 3. If status is terminal → `Terminal { current_status }`. The handler
+///    returns 409 with the current state in the envelope so the caller
+///    knows why.
+/// 4. Otherwise issue `SQL_PAUSE_RUN`. We re-read the row to surface
+///    the canonical `paused_at` instead of synthesising it from the
+///    handler's wall clock (so D1 is the source of truth).
+pub async fn pause_run(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+    actor: &str,
+) -> Result<PauseOutcome> {
+    let Some(current) = get_run(db, tenant_id, run_id).await? else {
+        return Ok(PauseOutcome::NotFound);
+    };
+
+    if current.status == "paused" {
+        return Ok(PauseOutcome::AlreadyPaused(RunStatusUpdate {
+            id: current.id,
+            status: current.status,
+            paused_at: current.paused_at,
+            resumed_at: None,
+        }));
+    }
+
+    if matches!(
+        current.status.as_str(),
+        "succeeded" | "failed" | "cancelled"
+    ) {
+        return Ok(PauseOutcome::Terminal {
+            current_status: current.status,
+        });
+    }
+
+    let update = db
+        .prepare(SQL_PAUSE_RUN)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
+        .run()
+        .await?;
+
+    let changed = update
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+
+    if !changed {
+        let Some(refreshed) = get_run(db, tenant_id, run_id).await? else {
+            return Ok(PauseOutcome::NotFound);
+        };
+        return match refreshed.status.as_str() {
+            "paused" => Ok(PauseOutcome::AlreadyPaused(RunStatusUpdate {
+                id: refreshed.id,
+                status: refreshed.status,
+                paused_at: refreshed.paused_at,
+                resumed_at: None,
+            })),
+            "succeeded" | "failed" | "cancelled" => Ok(PauseOutcome::Terminal {
+                current_status: refreshed.status,
+            }),
+            other => Ok(PauseOutcome::Terminal {
+                current_status: other.to_string(),
+            }),
+        };
+    }
+
+    // Provenance: append `run.paused` to events_bronze so the WS3 trace
+    // pipeline and any downstream consumer (UI, audit, replay) can see
+    // the transition. We synthesise an event id and use the same
+    // `datetime('now')`-style timestamp the runs row carries.
+    let event_id = format!("evt_pause_{run_id}_{}", now_iso());
+    let payload = serde_json::json!({
+        "transition": "pause",
+        "from_status": current.status,
+        "to_status": "paused",
+    });
+    db.prepare(
+        "INSERT INTO events_bronze (tenant_id, id, run_id, thread_id, event_type, node_id, actor, payload, created_at)
+         VALUES (?1, ?2, ?3, NULL, 'run.paused', NULL, ?4, ?5, datetime('now'))",
+    )
+    .bind(&[
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&event_id),
+        JsValue::from_str(run_id),
+        JsValue::from_str(actor),
+        JsValue::from_str(&payload.to_string()),
+    ])?
+    .run()
+    .await?;
+
+    // Re-read so paused_at reflects what D1 actually wrote
+    // (datetime('now') is evaluated server-side).
+    let refreshed = get_run(db, tenant_id, run_id).await?.ok_or_else(|| {
+        Error::RustError("run vanished between pause UPDATE and read-back".to_string())
+    })?;
+
+    Ok(PauseOutcome::Paused(RunStatusUpdate {
+        id: refreshed.id,
+        status: refreshed.status,
+        paused_at: refreshed.paused_at,
+        resumed_at: None,
+    }))
+}
+
+/// Attempt to resume a run. The decision tree is:
+///
+/// 1. Look up the run scoped by tenant. Missing → `NotFound`.
+/// 2. If status is not 'paused' → `NotPaused { current_status }`. The
+///    handler returns 409 RUN_NOT_PAUSED.
+/// 3. Otherwise issue `SQL_RESUME_RUN`, re-read, and surface
+///    `resumed_at` from D1.
+pub async fn resume_run(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+    actor: &str,
+) -> Result<ResumeOutcome> {
+    let Some(current) = get_run(db, tenant_id, run_id).await? else {
+        return Ok(ResumeOutcome::NotFound);
+    };
+
+    if current.status != "paused" {
+        return Ok(ResumeOutcome::NotPaused {
+            current_status: current.status,
+        });
+    }
+
+    let update = db
+        .prepare(SQL_RESUME_RUN)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
+        .run()
+        .await?;
+
+    let changed = update
+        .meta()?
+        .map(|m| m.changes.unwrap_or(0) > 0)
+        .unwrap_or(false);
+
+    if !changed {
+        let Some(refreshed) = get_run(db, tenant_id, run_id).await? else {
+            return Ok(ResumeOutcome::NotFound);
+        };
+        return Ok(ResumeOutcome::NotPaused {
+            current_status: refreshed.status,
+        });
+    }
+
+    let event_id = format!("evt_resume_{run_id}_{}", now_iso());
+    let payload = serde_json::json!({
+        "transition": "resume",
+        "from_status": current.status,
+        "to_status": "running",
+    });
+    db.prepare(
+        "INSERT INTO events_bronze (tenant_id, id, run_id, thread_id, event_type, node_id, actor, payload, created_at)
+         VALUES (?1, ?2, ?3, NULL, 'run.resumed', NULL, ?4, ?5, datetime('now'))",
+    )
+    .bind(&[
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&event_id),
+        JsValue::from_str(run_id),
+        JsValue::from_str(actor),
+        JsValue::from_str(&payload.to_string()),
+    ])?
+    .run()
+    .await?;
+
+    let refreshed = get_run(db, tenant_id, run_id).await?.ok_or_else(|| {
+        Error::RustError("run vanished between resume UPDATE and read-back".to_string())
+    })?;
+
+    Ok(ResumeOutcome::Resumed(RunStatusUpdate {
+        id: refreshed.id,
+        status: refreshed.status,
+        paused_at: None,
+        resumed_at: refreshed.resumed_at,
+    }))
 }
 
 // ── WS5 Retrieval + Memory Federation ───────────────────────────
@@ -923,7 +1413,7 @@ pub async fn retrieve_memory_hybrid(
     }
 
     let qlike = format!("%{}%", req.query.to_lowercase());
-    
+
     if !semantic_ids.is_empty() {
         let mut id_placeholders = Vec::new();
         for id in semantic_ids {
@@ -932,7 +1422,7 @@ pub async fn retrieve_memory_hybrid(
             idx += 1;
         }
         let id_clause = id_placeholders.join(", ");
-        
+
         where_parts.push(format!(
             "(id IN ({}) OR (lower(summary) LIKE ?{} OR lower(COALESCE(title, '')) LIKE ?{} OR lower(COALESCE(tags, '')) LIKE ?{}))",
             id_clause, idx, idx + 1, idx + 2
@@ -944,7 +1434,7 @@ pub async fn retrieve_memory_hybrid(
             idx + 2
         ));
     }
-    
+
     bind.push(JsValue::from_str(&qlike));
     bind.push(JsValue::from_str(&qlike));
     bind.push(JsValue::from_str(&qlike));
@@ -982,7 +1472,7 @@ pub async fn retrieve_memory_hybrid(
         }
 
         let mut score = score_candidate(&row, &req.query, now_ms);
-        
+
         // Semantic boost: if ID was in semantic_ids, boost the score
         if semantic_ids.contains(&row.id) {
             score += 2.0; // High boost for vector match
@@ -1449,22 +1939,22 @@ pub async fn create_policy_escalation(
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
         .unwrap_or_else(|| "{}".into());
     db.prepare(SQL_INSERT_POLICY_ESCALATION)
-    .bind(&[
-        JsValue::from_str(tenant_id),
-        JsValue::from_str(escalation_id),
-        JsValue::from_str(decision_id),
-        JsValue::from_str(action),
-        JsValue::from_str(actor),
-        match resource {
-            Some(r) => JsValue::from_str(r),
-            None => JsValue::NULL,
-        },
-        JsValue::from_str(&format!("{:?}", risk).to_ascii_lowercase()),
-        JsValue::from_str(&payload),
-        JsValue::from_str(&now),
-    ])?
-    .run()
-    .await?;
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(escalation_id),
+            JsValue::from_str(decision_id),
+            JsValue::from_str(action),
+            JsValue::from_str(actor),
+            match resource {
+                Some(r) => JsValue::from_str(r),
+                None => JsValue::NULL,
+            },
+            JsValue::from_str(&format!("{:?}", risk).to_ascii_lowercase()),
+            JsValue::from_str(&payload),
+            JsValue::from_str(&now),
+        ])?
+        .run()
+        .await?;
     Ok(())
 }
 
@@ -1739,7 +2229,10 @@ pub async fn list_policy_rules(
     tenant_id: &str,
     limit: u32,
     cursor: Option<&crate::pagination::PolicyRulesCursor>,
-) -> Result<(Vec<PolicyRuleRow>, Option<crate::pagination::PolicyRulesCursor>)> {
+) -> Result<(
+    Vec<PolicyRuleRow>,
+    Option<crate::pagination::PolicyRulesCursor>,
+)> {
     let fetch_limit = limit.saturating_add(1);
 
     let mut clauses: Vec<String> = vec!["tenant_id = ?".into()];
@@ -2163,7 +2656,10 @@ pub async fn record_telemetry(
     body: &models::TelemetrySnapshot,
 ) -> Result<()> {
     let now = now_iso();
-    let payload_json = body.payload.as_ref().map(|v| serde_json::to_string(v).unwrap());
+    let payload_json = body
+        .payload
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap());
 
     db.prepare(
         "INSERT INTO telemetry_snapshots (
@@ -2242,8 +2738,9 @@ pub async fn insert_reasoning_trace(
     payload: ReasoningPayloadRefs<'_>,
 ) -> Result<bool> {
     let now = now_iso();
-    let res: D1Result = db.prepare(
-        "INSERT INTO reasoning_traces (
+    let res: D1Result = db
+        .prepare(
+            "INSERT INTO reasoning_traces (
             id, tenant_id, schema_version,
             agent_id, job_id, parent_span_id, step_number, step_type,
             inputs_inline, inputs_r2_key, outputs_inline, outputs_r2_key,
@@ -2253,30 +2750,42 @@ pub async fn insert_reasoning_trace(
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
          )
          ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
-    )
-    .bind(&[
-        JsValue::from_str(id),
-        JsValue::from_str(tenant_id),
-        JsValue::from(body.schema_version),
-        JsValue::from_str(&body.agent_id),
-        JsValue::from_str(&body.job_id),
-        opt_str(&body.parent_span_id),
-        JsValue::from(body.step_number),
-        JsValue::from_str(body.step_type.as_str()),
-        payload.inputs_inline.map(JsValue::from_str).unwrap_or(JsValue::NULL),
-        payload.inputs_r2_key.map(JsValue::from_str).unwrap_or(JsValue::NULL),
-        payload.outputs_inline.map(JsValue::from_str).unwrap_or(JsValue::NULL),
-        payload.outputs_r2_key.map(JsValue::from_str).unwrap_or(JsValue::NULL),
-        JsValue::from(body.tokens.input),
-        JsValue::from(body.tokens.output),
-        JsValue::from(body.tokens.cached),
-        JsValue::from_str(&body.started_at),
-        opt_str(&body.completed_at),
-        JsValue::from_str(&body.idempotency_key),
-        JsValue::from_str(&now),
-    ])?
-    .run()
-    .await?;
+        )
+        .bind(&[
+            JsValue::from_str(id),
+            JsValue::from_str(tenant_id),
+            JsValue::from(body.schema_version),
+            JsValue::from_str(&body.agent_id),
+            JsValue::from_str(&body.job_id),
+            opt_str(&body.parent_span_id),
+            JsValue::from(body.step_number),
+            JsValue::from_str(body.step_type.as_str()),
+            payload
+                .inputs_inline
+                .map(JsValue::from_str)
+                .unwrap_or(JsValue::NULL),
+            payload
+                .inputs_r2_key
+                .map(JsValue::from_str)
+                .unwrap_or(JsValue::NULL),
+            payload
+                .outputs_inline
+                .map(JsValue::from_str)
+                .unwrap_or(JsValue::NULL),
+            payload
+                .outputs_r2_key
+                .map(JsValue::from_str)
+                .unwrap_or(JsValue::NULL),
+            JsValue::from(body.tokens.input),
+            JsValue::from(body.tokens.output),
+            JsValue::from(body.tokens.cached),
+            JsValue::from_str(&body.started_at),
+            opt_str(&body.completed_at),
+            JsValue::from_str(&body.idempotency_key),
+            JsValue::from_str(&now),
+        ])?
+        .run()
+        .await?;
 
     let inserted = res
         .meta()?
@@ -2475,21 +2984,22 @@ pub async fn check_and_increment_rate_limit(
     // its own per-(actor, action_class, window) slot. Before this change
     // two tenants sharing an actor name (e.g. "agent-1") collided into a
     // single counter and one tenant could exhaust the other's quota.
-    let counter_id = rate_limit_counter_id(tenant_id, actor, action_class, window_start, window_seconds);
+    let counter_id =
+        rate_limit_counter_id(tenant_id, actor, action_class, window_start, window_seconds);
     let now_iso = now_iso();
 
     db.prepare(SQL_UPSERT_RATE_LIMIT_COUNTER)
-    .bind(&[
-        JsValue::from_str(tenant_id),
-        JsValue::from_str(&counter_id),
-        JsValue::from_str(actor),
-        JsValue::from_str(action_class),
-        JsValue::from(window_start),
-        JsValue::from(window_seconds),
-        JsValue::from_str(&now_iso),
-    ])?
-    .run()
-    .await?;
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&counter_id),
+            JsValue::from_str(actor),
+            JsValue::from_str(action_class),
+            JsValue::from(window_start),
+            JsValue::from(window_seconds),
+            JsValue::from_str(&now_iso),
+        ])?
+        .run()
+        .await?;
 
     // SELECT is also tenant-scoped as defense-in-depth: even though the
     // counter_id already includes tenant_id, the WHERE clause makes the
@@ -2595,6 +3105,221 @@ async fn list_old_keys(
 
 fn days_ago_expr(days: i64) -> String {
     format!("-{} days", days.max(1))
+}
+
+// ── AIVCS review projections (issue #148 slice 2) ──────────────
+//
+// CRUD helpers for the four review-projection tables introduced by
+// migration 0016. Every helper takes `tenant_id` as the leading
+// argument and binds it as ?1; the SQL constants used here are
+// asserted to keep that shape by the `cross_tenant_sql_aivcs_*` tests.
+//
+// No HTTP routes are wired in this slice; the helpers exist so the
+// follower process and (later) BFF can write/read the projection
+// without re-typing SQL.
+
+#[allow(dead_code)]
+pub async fn insert_review_thread(
+    db: &D1Database,
+    tenant_id: &str,
+    thread: &models::aivcs_review::ReviewThread,
+) -> Result<()> {
+    db.prepare(SQL_INSERT_REVIEW_THREAD)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&thread.id),
+            JsValue::from_str(&thread.review_id),
+            opt_str(&thread.change_set_id),
+            JsValue::from_str(thread.status.as_sql()),
+            JsValue::from_str(&thread.created_at),
+            opt_str(&thread.resolved_at),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn get_review_thread(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<models::aivcs_review::ReviewThread>> {
+    let row: Option<ReviewThreadRow> = db
+        .prepare(SQL_GET_REVIEW_THREAD)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
+        .first(None)
+        .await?;
+    Ok(row.and_then(|r| r.into_review_thread()))
+}
+
+#[allow(dead_code)]
+pub async fn list_review_threads_for_review(
+    db: &D1Database,
+    tenant_id: &str,
+    review_id: &str,
+    limit: u32,
+) -> Result<Vec<models::aivcs_review::ReviewThread>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_REVIEW_THREADS_FOR_REVIEW)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(review_id),
+            JsValue::from(limit),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<ReviewThreadRow> = result.results()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.into_review_thread())
+        .collect())
+}
+
+#[allow(dead_code)]
+pub async fn update_review_thread_status(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    status: models::aivcs_review::ReviewThreadStatus,
+    resolved_at: Option<&str>,
+) -> Result<()> {
+    let resolved_at_js = match resolved_at {
+        Some(s) => JsValue::from_str(s),
+        None => JsValue::NULL,
+    };
+    db.prepare(SQL_UPDATE_REVIEW_THREAD_STATUS)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(id),
+            JsValue::from_str(status.as_sql()),
+            resolved_at_js,
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn insert_review_comment(
+    db: &D1Database,
+    tenant_id: &str,
+    comment: &models::aivcs_review::ReviewComment,
+) -> Result<()> {
+    db.prepare(SQL_INSERT_REVIEW_COMMENT)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&comment.id),
+            JsValue::from_str(&comment.thread_id),
+            JsValue::from_str(&comment.actor.to_sql_actor()),
+            JsValue::from_str(&comment.body),
+            opt_str(&comment.parent_comment_id),
+            JsValue::from_str(&comment.created_at),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn list_review_comments_for_thread(
+    db: &D1Database,
+    tenant_id: &str,
+    thread_id: &str,
+    limit: u32,
+) -> Result<Vec<models::aivcs_review::ReviewComment>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_REVIEW_COMMENTS_FOR_THREAD)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(thread_id),
+            JsValue::from(limit),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<ReviewCommentRow> = result.results()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.into_review_comment())
+        .collect())
+}
+
+#[allow(dead_code)]
+pub async fn insert_review_thread_resolution(
+    db: &D1Database,
+    tenant_id: &str,
+    resolution: &models::aivcs_review::ReviewThreadResolution,
+) -> Result<()> {
+    db.prepare(SQL_INSERT_REVIEW_THREAD_RESOLUTION)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&resolution.thread_id),
+            JsValue::from_str(&resolution.resolved_by),
+            JsValue::from_str(resolution.resolution.as_sql()),
+            opt_str(&resolution.note),
+            JsValue::from_str(&resolution.resolved_at),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn get_review_thread_resolution(
+    db: &D1Database,
+    tenant_id: &str,
+    thread_id: &str,
+) -> Result<Option<models::aivcs_review::ReviewThreadResolution>> {
+    let row: Option<ReviewThreadResolutionRow> = db
+        .prepare(SQL_GET_REVIEW_THREAD_RESOLUTION)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(thread_id)])?
+        .first(None)
+        .await?;
+    Ok(row.and_then(|r| r.into_resolution()))
+}
+
+#[allow(dead_code)]
+pub async fn insert_file_anchor(
+    db: &D1Database,
+    tenant_id: &str,
+    anchor: &models::aivcs_review::FileAnchor,
+) -> Result<()> {
+    db.prepare(SQL_INSERT_FILE_ANCHOR)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&anchor.id),
+            JsValue::from_str(&anchor.thread_id),
+            JsValue::from_str(&anchor.file_path),
+            JsValue::from_f64(anchor.start_line() as f64),
+            JsValue::from_f64(anchor.end_line() as f64),
+            JsValue::from_str(anchor.side.as_sql()),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn list_file_anchors_for_thread(
+    db: &D1Database,
+    tenant_id: &str,
+    thread_id: &str,
+    limit: u32,
+) -> Result<Vec<models::aivcs_review::FileAnchor>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_FILE_ANCHORS_FOR_THREAD)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(thread_id),
+            JsValue::from(limit),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<FileAnchorRow> = result.results()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.into_file_anchor())
+        .collect())
 }
 
 // ── Internal row types ──────────────────────────────────────────
@@ -2830,6 +3555,15 @@ pub struct RunRow {
     pub created_at: String,
     pub updated_at: String,
     pub metadata: Option<String>,
+    // AIVCS issue #148 slice 4: pause/resume bookkeeping. Optional
+    // because rows that pre-date migration 0018 won't have these set,
+    // and the columns are nullable. `#[serde(default)]` lets D1's
+    // serde_wasm_bindgen deserializer tolerate either nulls or missing
+    // columns during the migration window.
+    #[serde(default)]
+    pub paused_at: Option<String>,
+    #[serde(default)]
+    pub resumed_at: Option<String>,
 }
 
 impl RunRow {
@@ -2843,6 +3577,8 @@ impl RunRow {
             created_at: self.created_at,
             updated_at: self.updated_at,
             metadata: self.metadata.and_then(|s| serde_json::from_str(&s).ok()),
+            paused_at: self.paused_at,
+            resumed_at: self.resumed_at,
         }
     }
 }
@@ -2857,6 +3593,82 @@ pub struct RunResponse {
     pub created_at: String,
     pub updated_at: String,
     pub metadata: Option<serde_json::Value>,
+    /// Last pause timestamp (server-stamped on the pause transition).
+    /// `None` for runs that have never been paused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
+    /// Last resume timestamp (server-stamped on the resume transition).
+    /// `None` for runs that have never been resumed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+struct AivcsPullRequestUpsert {
+    tenant_id: String,
+    id: String,
+    repo: String,
+    run_id: String,
+    title: String,
+    status: String,
+    source_branch: Option<String>,
+    target_branch: Option<String>,
+    author: Option<String>,
+    summary: Option<String>,
+    change_set: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AivcsPullRequestRow {
+    pub id: String,
+    pub repo: String,
+    pub run_id: String,
+    pub title: String,
+    pub status: String,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub author: Option<String>,
+    pub summary: Option<String>,
+    pub change_set: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl AivcsPullRequestRow {
+    pub fn into_response(self) -> AivcsPullRequestResponse {
+        AivcsPullRequestResponse {
+            id: self.id,
+            repo: self.repo,
+            run_id: self.run_id,
+            title: self.title,
+            status: self.status,
+            source_branch: self.source_branch,
+            target_branch: self.target_branch,
+            author: self.author,
+            summary: self.summary,
+            change_set: serde_json::from_str(&self.change_set).unwrap_or(serde_json::Value::Null),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AivcsPullRequestResponse {
+    pub id: String,
+    pub repo: String,
+    pub run_id: String,
+    pub title: String,
+    pub status: String,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub author: Option<String>,
+    pub summary: Option<String>,
+    pub change_set: serde_json::Value,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2899,6 +3711,111 @@ pub struct Ws2TaskResponse {
     pub created_at: String,
     pub updated_at: String,
     pub metadata: Option<serde_json::Value>,
+}
+
+// ── AIVCS review-projection row types (issue #148 slice 2) ─────
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct ReviewThreadRow {
+    id: String,
+    review_id: String,
+    change_set_id: Option<String>,
+    status: String,
+    created_at: String,
+    resolved_at: Option<String>,
+}
+
+#[allow(dead_code)]
+impl ReviewThreadRow {
+    fn into_review_thread(self) -> Option<models::aivcs_review::ReviewThread> {
+        let status = models::aivcs_review::ReviewThreadStatus::from_sql(&self.status)?;
+        Some(models::aivcs_review::ReviewThread {
+            id: self.id,
+            review_id: self.review_id,
+            change_set_id: self.change_set_id,
+            status,
+            created_at: self.created_at,
+            resolved_at: self.resolved_at,
+        })
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct ReviewCommentRow {
+    id: String,
+    thread_id: String,
+    actor: String,
+    body: String,
+    parent_comment_id: Option<String>,
+    created_at: String,
+}
+
+#[allow(dead_code)]
+impl ReviewCommentRow {
+    fn into_review_comment(self) -> Option<models::aivcs_review::ReviewComment> {
+        let actor = models::aivcs_review::CommentActor::from_sql_actor(&self.actor)?;
+        Some(models::aivcs_review::ReviewComment {
+            id: self.id,
+            thread_id: self.thread_id,
+            actor,
+            body: self.body,
+            parent_comment_id: self.parent_comment_id,
+            created_at: self.created_at,
+        })
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct ReviewThreadResolutionRow {
+    thread_id: String,
+    resolved_by: String,
+    resolution: String,
+    note: Option<String>,
+    resolved_at: String,
+}
+
+#[allow(dead_code)]
+impl ReviewThreadResolutionRow {
+    fn into_resolution(self) -> Option<models::aivcs_review::ReviewThreadResolution> {
+        let resolution = models::aivcs_review::Resolution::from_sql(&self.resolution)?;
+        Some(models::aivcs_review::ReviewThreadResolution {
+            thread_id: self.thread_id,
+            resolved_by: self.resolved_by,
+            resolution,
+            note: self.note,
+            resolved_at: self.resolved_at,
+        })
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct FileAnchorRow {
+    id: String,
+    thread_id: String,
+    file_path: String,
+    start_line: i64,
+    end_line: i64,
+    side: String,
+}
+
+#[allow(dead_code)]
+impl FileAnchorRow {
+    fn into_file_anchor(self) -> Option<models::aivcs_review::FileAnchor> {
+        let side = models::aivcs_review::AnchorSide::from_sql(&self.side)?;
+        models::aivcs_review::FileAnchor::from_row(
+            self.id,
+            self.thread_id,
+            self.file_path,
+            self.start_line,
+            self.end_line,
+            side,
+        )
+        .ok()
+    }
 }
 
 // ── Provenance Links (WS3: causality chain) ─────────────────────
@@ -3576,6 +4493,84 @@ pub async fn touch_integration(
     Ok(())
 }
 
+// ── Gemini Batch Jobs (WS6+) ──────────────────────────────────
+
+#[allow(dead_code)]
+pub async fn create_gemini_batch_job(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    job: &crate::integrations::gemini::BatchJob,
+    model: &str,
+    input_file: &str,
+) -> Result<()> {
+    let now = now_iso();
+    let status = serde_json::to_string(&job.state).unwrap().replace("\"", "");
+
+    db.prepare(
+        "INSERT INTO gemini_batch_jobs (id, tenant_id, job_name, model, status, input_file, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&job.name),
+        JsValue::from_str(model),
+        JsValue::from_str(&status),
+        JsValue::from_str(input_file),
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
+}
+
+pub async fn update_gemini_batch_job(
+    db: &D1Database,
+    tenant_id: &str,
+    job: &crate::integrations::gemini::BatchJob,
+) -> Result<()> {
+    let status = serde_json::to_string(&job.state).unwrap().replace("\"", "");
+    let completed_at = job.completion_time.clone();
+
+    db.prepare(
+        "UPDATE gemini_batch_jobs SET status = ?1, output_file = ?2, error_json = ?3, completed_at = ?4
+         WHERE tenant_id = ?5 AND job_name = ?6",
+    )
+    .bind(&[
+        JsValue::from_str(&status),
+        opt_str(&job.response_file),
+        opt_json(&job.error),
+        opt_str(&completed_at),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&job.name),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
+}
+
+pub async fn list_pending_gemini_batch_jobs(
+    db: &D1Database,
+) -> Result<Vec<(String, String, String)>> {
+    #[derive(serde::Deserialize)]
+    struct JobRow {
+        tenant_id: String,
+        job_name: String,
+        model: String,
+    }
+
+    let result: D1Result = db
+        .prepare("SELECT tenant_id, job_name, model FROM gemini_batch_jobs WHERE status IN ('PENDING', 'RUNNING')")
+        .all()
+        .await?;
+
+    let rows: Vec<JobRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| (r.tenant_id, r.job_name, r.model)).collect())
+}
+
 pub async fn get_integration(
     db: &D1Database,
     tenant_id: &str,
@@ -3686,6 +4681,503 @@ impl IntegrationRow {
     }
 }
 
+// ── AIVCS: change_set DB layer (issue #148, slice 1) ───────────────
+//
+// Projection above the diff artifact — see `migrations/0015_aivcs_change_set.sql`
+// and `models/aivcs.rs`. HTTP routes land in a later slice; this file only
+// owns the SQL + (tenant_id, ...) parameter wiring.
+
+/// Storage-string form of a [`RiskLevel`]. `RiskLevel` is `#[serde(rename_all =
+/// "snake_case")]`, so serializing yields a quoted JSON string (`"\"low\""`);
+/// strip the quotes to get the bare token we persist in the `risk_level` column.
+fn risk_level_storage_str(risk: RiskLevel) -> String {
+    // Serializing a Copy enum to JSON cannot fail — unwrap surfaces any
+    // future serde-attribute regression instead of silently writing "".
+    let s = serde_json::to_string(&risk).expect("RiskLevel always serializes");
+    s.trim_matches('"').to_string()
+}
+
+/// Reverse of [`risk_level_storage_str`].
+fn risk_level_from_storage_str(s: &str) -> Option<RiskLevel> {
+    serde_json::from_str(&format!("\"{s}\"")).ok()
+}
+
+#[allow(dead_code)] // HTTP route consumer lands in a later AIVCS slice.
+#[derive(Debug, serde::Deserialize)]
+struct ChangeSetRow {
+    id: String,
+    repo: String,
+    base_ref: String,
+    head_ref: String,
+    author_agent_id: Option<String>,
+    status: String,
+    risk_level: Option<String>,
+    confidence: Option<f64>,
+    run_id: Option<String>,
+    diff_artifact_key: Option<String>,
+    summary_artifact_key: Option<String>,
+    created_at: String,
+}
+
+#[allow(dead_code)] // HTTP route consumer lands in a later AIVCS slice.
+impl ChangeSetRow {
+    fn into_change_set(self) -> models::ChangeSet {
+        let status =
+            std::str::FromStr::from_str(&self.status).unwrap_or(models::ChangeSetStatus::Proposed);
+        let risk_level = self
+            .risk_level
+            .as_deref()
+            .and_then(risk_level_from_storage_str);
+        models::ChangeSet {
+            id: self.id,
+            repo: self.repo,
+            base_ref: self.base_ref,
+            head_ref: self.head_ref,
+            author_agent_id: self.author_agent_id,
+            status,
+            risk_level,
+            confidence: self.confidence,
+            run_id: self.run_id,
+            diff_artifact_key: self.diff_artifact_key,
+            summary_artifact_key: self.summary_artifact_key,
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// Insert a new `change_set` row. If `cs.id` is None, a random hex id is
+/// minted (consistent with how other entities in this file generate ids).
+#[allow(dead_code)] // HTTP route consumer lands in a later AIVCS slice.
+pub async fn create_change_set(
+    d1: &D1Database,
+    tenant_id: &str,
+    cs: &models::CreateChangeSet,
+) -> Result<models::ChangeSet> {
+    let id = match cs.id.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => random_hex_id()?,
+    };
+    let status = cs.status.unwrap_or(models::ChangeSetStatus::Proposed);
+    let status_str = status.as_str();
+    let risk_level_str = cs.risk_level.map(risk_level_storage_str);
+    let now = now_iso();
+
+    d1.prepare(SQL_INSERT_CHANGE_SET)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(&id),
+            JsValue::from_str(&cs.repo),
+            JsValue::from_str(&cs.base_ref),
+            JsValue::from_str(&cs.head_ref),
+            opt_str(&cs.author_agent_id),
+            JsValue::from_str(status_str),
+            opt_str(&risk_level_str),
+            cs.confidence.map(JsValue::from).unwrap_or(JsValue::NULL),
+            opt_str(&cs.run_id),
+            opt_str(&cs.diff_artifact_key),
+            opt_str(&cs.summary_artifact_key),
+        ])?
+        .run()
+        .await?;
+
+    Ok(models::ChangeSet {
+        id,
+        repo: cs.repo.clone(),
+        base_ref: cs.base_ref.clone(),
+        head_ref: cs.head_ref.clone(),
+        author_agent_id: cs.author_agent_id.clone(),
+        status,
+        risk_level: cs.risk_level,
+        confidence: cs.confidence,
+        run_id: cs.run_id.clone(),
+        diff_artifact_key: cs.diff_artifact_key.clone(),
+        summary_artifact_key: cs.summary_artifact_key.clone(),
+        created_at: now,
+    })
+}
+
+#[allow(dead_code)] // HTTP route consumer lands in a later AIVCS slice.
+pub async fn get_change_set(
+    d1: &D1Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<models::ChangeSet>> {
+    let row: Option<ChangeSetRow> = d1
+        .prepare(SQL_GET_CHANGE_SET)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.into_change_set()))
+}
+
+#[allow(dead_code)] // HTTP route consumer lands in a later AIVCS slice.
+pub async fn list_change_sets_by_repo(
+    d1: &D1Database,
+    tenant_id: &str,
+    repo: &str,
+    limit: u32,
+) -> Result<Vec<models::ChangeSet>> {
+    let result: D1Result = d1
+        .prepare(SQL_LIST_CHANGE_SETS_BY_REPO)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(repo),
+            JsValue::from(limit as f64),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<ChangeSetRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_change_set()).collect())
+}
+
+// ── Issue #148 / AIVCS slice 3 — human_decision projection ──────────
+//
+// Projection of human approve / request_changes / pause / resume / merge
+// decisions over runs and reviews. Events remain the source of truth in
+// `events_bronze`; this projection gives the UI / BFF an indexed shape
+// to list decisions per run or per review without scanning the event
+// log. Slice 3 is projection-only — no HTTP route yet.
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct HumanDecisionRow {
+    id: String,
+    run_id: Option<String>,
+    review_id: Option<String>,
+    actor: String,
+    decision_type: String,
+    reason: Option<String>,
+    policy_decision_id: Option<String>,
+    resulting_event_id: Option<String>,
+    created_at: String,
+}
+
+impl HumanDecisionRow {
+    #[allow(dead_code)]
+    fn into_decision(self) -> Option<models::HumanDecision> {
+        let decision_type = self
+            .decision_type
+            .parse::<models::HumanDecisionType>()
+            .ok()?;
+        Some(models::HumanDecision {
+            id: self.id,
+            run_id: self.run_id,
+            review_id: self.review_id,
+            actor: self.actor,
+            decision_type,
+            reason: self.reason,
+            policy_decision_id: self.policy_decision_id,
+            resulting_event_id: self.resulting_event_id,
+            created_at: self.created_at,
+        })
+    }
+}
+
+/// Insert one row into the `human_decision` projection. The caller mints
+/// `id` (typically a UUID) and is responsible for writing the bronze
+/// event whose id is passed back in `body.resulting_event_id`.
+///
+/// Tenant scoping: `tenant_id` is bound to ?1; see
+/// `SQL_INSERT_HUMAN_DECISION`.
+#[allow(dead_code)]
+pub async fn create_human_decision(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::CreateHumanDecision,
+) -> Result<()> {
+    db.prepare(SQL_INSERT_HUMAN_DECISION)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(id),
+            opt_str(&body.run_id),
+            opt_str(&body.review_id),
+            JsValue::from_str(&body.actor),
+            JsValue::from_str(body.decision_type.as_str()),
+            opt_str(&body.reason),
+            opt_str(&body.policy_decision_id),
+            opt_str(&body.resulting_event_id),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// List `human_decision` rows for one run, in `created_at` order. The
+/// projection is small (one row per human action on a run), so this
+/// returns the full set rather than paginating; pagination can be added
+/// in a follow-up slice if a single run accumulates enough decisions to
+/// warrant it.
+#[allow(dead_code)]
+pub async fn list_human_decisions_by_run(
+    db: &D1Database,
+    tenant_id: &str,
+    run_id: &str,
+) -> Result<Vec<models::HumanDecision>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_HUMAN_DECISIONS_BY_RUN)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
+        .all()
+        .await?;
+    let rows: Vec<HumanDecisionRow> = result.results()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(HumanDecisionRow::into_decision)
+        .collect())
+}
+
+/// List `human_decision` rows for one review, in `created_at` order. See
+/// `list_human_decisions_by_run` for pagination notes.
+#[allow(dead_code)]
+pub async fn list_human_decisions_by_review(
+    db: &D1Database,
+    tenant_id: &str,
+    review_id: &str,
+) -> Result<Vec<models::HumanDecision>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_HUMAN_DECISIONS_BY_REVIEW)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(review_id)])?
+        .all()
+        .await?;
+    let rows: Vec<HumanDecisionRow> = result.results()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(HumanDecisionRow::into_decision)
+        .collect())
+}
+
+// ── AIVCS: ci_check_run DB layer ─────────────────────────────────────────────
+
+pub async fn list_ci_check_runs_for_change_set(
+    d1: &worker::D1Database,
+    tenant_id: &str,
+    change_set_id: &str,
+    limit: u32,
+) -> Result<Vec<models::aivcs::CiCheckRun>> {
+    let sql = "SELECT id, change_set_id, name, status, conclusion, url, created_at \
+               FROM ci_check_run \
+               WHERE tenant_id = ?1 AND change_set_id = ?2 \
+               ORDER BY created_at DESC \
+               LIMIT ?3";
+    let stmt = d1
+        .prepare(sql)
+        .bind(&[tenant_id.into(), change_set_id.into(), limit.into()])?;
+    let result = stmt.all().await?;
+    let mut runs = Vec::new();
+    for row in result.results::<serde_json::Value>()? {
+        runs.push(models::aivcs::CiCheckRun {
+            id: row
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            change_set_id: row
+                .get("change_set_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: row
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            status: row
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            conclusion: row
+                .get("conclusion")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            url: row
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            created_at: row
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Ok(runs)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_ci_check_run(
+    db: &worker::D1Database,
+    tenant_id: &str,
+    id: &str,
+    change_set_id: &str,
+    name: &str,
+    status: &str,
+    conclusion: &Option<String>,
+    url: &Option<String>,
+) -> Result<()> {
+    let sql =
+        "INSERT INTO ci_check_run (tenant_id, id, change_set_id, name, status, conclusion, url) \
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+               ON CONFLICT(tenant_id, id) DO UPDATE SET \
+                   status = excluded.status, \
+                   conclusion = excluded.conclusion, \
+                   url = excluded.url";
+    db.prepare(sql)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(id),
+            JsValue::from_str(change_set_id),
+            JsValue::from_str(name),
+            JsValue::from_str(status),
+            opt_str(conclusion),
+            opt_str(url),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+// ── AIVCS: events_bronze DB layer ────────────────────────────────────────────
+
+pub async fn list_events_bronze(
+    d1: &worker::D1Database,
+    tenant_id: &str,
+    since: Option<&str>,
+    limit: u32,
+) -> Result<Vec<serde_json::Value>> {
+    let sql = if since.is_some() {
+        "SELECT id, run_id, thread_id, event_type, node_id, actor, payload, created_at \
+         FROM events_bronze \
+         WHERE tenant_id = ?1 AND created_at > ?2 \
+         ORDER BY created_at ASC \
+         LIMIT ?3"
+    } else {
+        "SELECT id, run_id, thread_id, event_type, node_id, actor, payload, created_at \
+         FROM events_bronze \
+         WHERE tenant_id = ?1 \
+         ORDER BY created_at ASC \
+         LIMIT ?2"
+    };
+
+    let stmt = if let Some(s) = since {
+        d1.prepare(sql)
+            .bind(&[tenant_id.into(), s.into(), limit.into()])?
+    } else {
+        d1.prepare(sql).bind(&[tenant_id.into(), limit.into()])?
+    };
+
+    let result = stmt.all().await?;
+    let mut events = Vec::new();
+    for row in result.results::<serde_json::Value>()? {
+        let mut evt = serde_json::Map::new();
+        evt.insert(
+            "id".into(),
+            row.get("id").unwrap_or(&serde_json::Value::Null).clone(),
+        );
+        evt.insert(
+            "run_id".into(),
+            row.get("run_id")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        evt.insert(
+            "thread_id".into(),
+            row.get("thread_id")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        evt.insert(
+            "event_type".into(),
+            row.get("event_type")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        evt.insert(
+            "node_id".into(),
+            row.get("node_id")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        evt.insert(
+            "actor".into(),
+            row.get("actor").unwrap_or(&serde_json::Value::Null).clone(),
+        );
+        if let Some(payload_str) = row.get("payload").and_then(|v| v.as_str()) {
+            if let Ok(payload_json) = serde_json::from_str::<serde_json::Value>(payload_str) {
+                evt.insert("payload".into(), payload_json);
+            }
+        }
+        evt.insert(
+            "created_at".into(),
+            row.get("created_at")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        events.push(serde_json::Value::Object(evt));
+    }
+    Ok(events)
+}
+
+// ── AIVCS: branch DB layer ───────────────────────────────────────────────────
+
+pub async fn list_branches_by_repo(
+    d1: &worker::D1Database,
+    tenant_id: &str,
+    repo: &str,
+    limit: u32,
+) -> Result<Vec<models::aivcs::Branch>> {
+    let sql = "SELECT id, repo, name, head_sha, agent_owner, status, created_at \
+               FROM branch \
+               WHERE tenant_id = ?1 AND repo = ?2 \
+               ORDER BY created_at DESC \
+               LIMIT ?3";
+    let stmt = d1
+        .prepare(sql)
+        .bind(&[tenant_id.into(), repo.into(), limit.into()])?;
+    let result = stmt.all().await?;
+    let mut branches = Vec::new();
+    for row in result.results::<serde_json::Value>()? {
+        branches.push(models::aivcs::Branch {
+            id: row
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            repo: row
+                .get("repo")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: row
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            head_sha: row
+                .get("head_sha")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            agent_owner: row
+                .get("agent_owner")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            status: row
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            created_at: row
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Ok(branches)
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3968,6 +5460,93 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    // ── AIVCS: change_set cross-tenant SQL shape (issue #148, slice 1) ─
+
+    #[test]
+    fn cross_tenant_sql_insert_change_set_writes_tenant_id_at_position_1() {
+        // The INSERT must bind `tenant_id` to ?1 and list it as the first
+        // column. Without that, an agent writing under tenant A could be
+        // surfaced to tenant B by the get/list helpers. The exact column-
+        // list-and-VALUES shape is asserted because this is the
+        // authoritative SQL that runs against D1.
+        let sql = SQL_INSERT_CHANGE_SET;
+        assert!(
+            sql.contains("INTO change_set"),
+            "insert SQL must target change_set; got: {sql}",
+        );
+        let col_list_start = sql.find("change_set (").expect("expected column list");
+        let col_list_tail = &sql[col_list_start..];
+        assert!(
+            col_list_tail.starts_with("change_set (tenant_id, id,"),
+            "tenant_id must be the first column of the INSERT list; got: {col_list_tail}",
+        );
+        assert!(
+            sql.contains("VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+            "insert SQL must bind tenant_id as ?1 and 12 total params; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_sql_get_change_set_filters_on_tenant_id_first() {
+        // The SELECT must include `tenant_id = ?1` in the WHERE clause,
+        // and tenant_id must be the FIRST predicate so an EXPLAIN cannot
+        // accidentally pick an index that ignores the tenant dimension.
+        let sql = SQL_GET_CHANGE_SET;
+        assert!(
+            sql.contains("FROM change_set"),
+            "get SQL must target change_set; got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE tenant_id = ?1 AND id = ?2"),
+            "get SQL must filter by tenant_id (?1) then id (?2); got: {sql}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_sql_list_change_sets_by_repo_filters_on_tenant_id_first() {
+        let sql = SQL_LIST_CHANGE_SETS_BY_REPO;
+        assert!(
+            sql.contains("FROM change_set"),
+            "list SQL must target change_set; got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE tenant_id = ?1 AND repo = ?2"),
+            "list SQL must filter by tenant_id (?1) then repo (?2); got: {sql}",
+        );
+        assert!(
+            sql.contains("ORDER BY created_at DESC"),
+            "list SQL must return newest-first; got: {sql}",
+        );
+        assert!(
+            sql.contains("LIMIT ?3"),
+            "list SQL must bind limit as ?3; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn change_set_risk_level_round_trips_through_storage_str() {
+        // The risk_level column stores the snake_case token (low | medium |
+        // high | critical). Both directions must round-trip so reads after
+        // a write produce an equal RiskLevel.
+        let levels = [
+            RiskLevel::Low,
+            RiskLevel::Medium,
+            RiskLevel::High,
+            RiskLevel::Critical,
+        ];
+        for r in levels {
+            let s = risk_level_storage_str(r);
+            assert!(
+                !s.contains('"'),
+                "stored risk_level must be a bare token, not quoted JSON; got: {s}",
+            );
+            let back = risk_level_from_storage_str(&s).expect("known risk_level must parse");
+            assert_eq!(back, r);
+        }
+        assert_eq!(risk_level_storage_str(RiskLevel::Low), "low");
+        assert!(risk_level_from_storage_str("not-a-risk").is_none());
+    }
+
     #[test]
     fn build_entity_refs_returns_none_when_no_supported_refs() {
         let evt = models::GraphEvent {
@@ -3980,6 +5559,95 @@ mod tests {
         };
 
         assert!(build_entity_refs(&evt).is_none());
+    }
+
+    #[test]
+    fn aivcs_projection_from_run_extracts_change_set() {
+        let body = models::CreateRun {
+            repo: "stevedores-org/aivcs-api".into(),
+            trigger: Some("pull_request".into()),
+            actor: Some("codex".into()),
+            metadata: Some(serde_json::json!({
+                "aivcs": {
+                    "change_set": {
+                        "id": "11",
+                        "title": "Fix merge conflicts",
+                        "status": "ready_for_review",
+                        "source_branch": "codex/fmc-pr11",
+                        "target_branch": "main",
+                        "author": "codex",
+                        "summary": "Resolved PR conflicts",
+                        "labels": ["aivcs"]
+                    }
+                }
+            })),
+        };
+
+        let projection =
+            aivcs_projection_from_run("tenant-a", "run-1", &body, "2026-06-12T00:00:00.000Z")
+                .expect("projection");
+
+        assert_eq!(projection.tenant_id, "tenant-a");
+        assert_eq!(projection.id, "11");
+        assert_eq!(projection.repo, "stevedores-org/aivcs-api");
+        assert_eq!(projection.run_id, "run-1");
+        assert_eq!(projection.title, "Fix merge conflicts");
+        assert_eq!(projection.status, "ready_for_review");
+        assert_eq!(projection.source_branch.as_deref(), Some("codex/fmc-pr11"));
+        assert_eq!(projection.target_branch.as_deref(), Some("main"));
+        assert_eq!(projection.author.as_deref(), Some("codex"));
+        assert_eq!(projection.summary.as_deref(), Some("Resolved PR conflicts"));
+        assert_eq!(projection.created_at, "2026-06-12T00:00:00.000Z");
+        assert_eq!(projection.updated_at, "2026-06-12T00:00:00.000Z");
+        let change_set: serde_json::Value = serde_json::from_str(&projection.change_set).unwrap();
+        assert_eq!(change_set["labels"][0], "aivcs");
+    }
+
+    #[test]
+    fn aivcs_projection_from_run_scopes_numeric_pr_id_by_repo() {
+        let body = models::CreateRun {
+            repo: "stevedores-org/data-fabric".into(),
+            trigger: None,
+            actor: None,
+            metadata: Some(serde_json::json!({
+                "aivcs": {
+                    "change_set": {
+                        "number": 158,
+                        "state": "open",
+                        "head_ref": "feature/change-set",
+                        "base_ref": "main"
+                    }
+                }
+            })),
+        };
+
+        let projection =
+            aivcs_projection_from_run("tenant-a", "run-2", &body, "2026-06-12T00:00:00.000Z")
+                .expect("projection");
+
+        assert_eq!(projection.id, "stevedores-org/data-fabric#158");
+        assert_eq!(projection.title, "158");
+        assert_eq!(projection.status, "open");
+        assert_eq!(
+            projection.source_branch.as_deref(),
+            Some("feature/change-set")
+        );
+        assert_eq!(projection.target_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn aivcs_projection_from_run_ignores_runs_without_change_set() {
+        let body = models::CreateRun {
+            repo: "stevedores-org/data-fabric".into(),
+            trigger: None,
+            actor: None,
+            metadata: Some(serde_json::json!({ "ref": "main" })),
+        };
+
+        assert!(
+            aivcs_projection_from_run("tenant-a", "run-3", &body, "2026-06-12T00:00:00.000Z")
+                .is_none()
+        );
     }
 
     // ── Pagination helpers: list_policy_rules / list_agents ─────
@@ -4086,5 +5754,412 @@ mod tests {
         // on (created_at, id).
         assert_eq!(cursor.priority, 100);
         assert_eq!(cursor.id, "r2");
+    }
+
+    // ── Cross-tenant SQL shape: AIVCS review projections (#148) ─
+
+    /// Every read against the AIVCS review-projection tables must
+    /// filter by `tenant_id = ?1`. Without this, threads, comments,
+    /// resolutions, or file anchors written under tenant A would be
+    /// visible to tenant B — a cross-tenant data leak through what
+    /// looks like a benign read model.
+    #[test]
+    fn cross_tenant_sql_aivcs_review_thread_select_filters_on_tenant_id() {
+        for (label, sql) in [
+            ("SQL_GET_REVIEW_THREAD", SQL_GET_REVIEW_THREAD),
+            (
+                "SQL_LIST_REVIEW_THREADS_FOR_REVIEW",
+                SQL_LIST_REVIEW_THREADS_FOR_REVIEW,
+            ),
+            (
+                "SQL_LIST_REVIEW_COMMENTS_FOR_THREAD",
+                SQL_LIST_REVIEW_COMMENTS_FOR_THREAD,
+            ),
+            (
+                "SQL_GET_REVIEW_THREAD_RESOLUTION",
+                SQL_GET_REVIEW_THREAD_RESOLUTION,
+            ),
+            (
+                "SQL_LIST_FILE_ANCHORS_FOR_THREAD",
+                SQL_LIST_FILE_ANCHORS_FOR_THREAD,
+            ),
+        ] {
+            assert!(
+                sql.contains("WHERE tenant_id = ?1"),
+                "{label} must filter by tenant_id as ?1; got: {sql}",
+            );
+        }
+    }
+
+    /// Every write into the AIVCS review-projection tables must bind
+    /// `tenant_id` as the leading column (so it lands as ?1) — this
+    /// matches the convention used by every other multi-tenant table
+    /// in the schema.
+    #[test]
+    fn cross_tenant_sql_aivcs_review_inserts_lead_with_tenant_id() {
+        for (table_name, sql) in [
+            ("review_thread", SQL_INSERT_REVIEW_THREAD),
+            ("review_comment", SQL_INSERT_REVIEW_COMMENT),
+            (
+                "review_thread_resolution",
+                SQL_INSERT_REVIEW_THREAD_RESOLUTION,
+            ),
+            ("file_anchor", SQL_INSERT_FILE_ANCHOR),
+        ] {
+            let needle = format!("{table_name} (");
+            let start = sql
+                .find(&needle)
+                .unwrap_or_else(|| panic!("expected INSERT into {table_name}; got: {sql}"));
+            let tail = &sql[start..];
+            assert!(
+                tail.starts_with(&format!("{table_name} (tenant_id,")),
+                "tenant_id must be the first column of the INSERT list for {table_name}; got: {tail}",
+            );
+            assert!(
+                sql.contains("(?1, ?2"),
+                "INSERT for {table_name} must bind tenant_id as ?1; got: {sql}",
+            );
+        }
+    }
+
+    /// The UPDATE for review-thread status must also be tenant-scoped
+    /// — otherwise tenant A could mark tenant B's thread resolved.
+    #[test]
+    fn cross_tenant_sql_aivcs_review_thread_update_scopes_to_tenant() {
+        assert!(
+            SQL_UPDATE_REVIEW_THREAD_STATUS.contains("WHERE tenant_id = ?1 AND id = ?2"),
+            "review_thread status update must filter by tenant_id and id; got: {}",
+            SQL_UPDATE_REVIEW_THREAD_STATUS,
+        );
+        assert!(
+            SQL_UPDATE_REVIEW_THREAD_STATUS.contains("UPDATE review_thread"),
+            "review_thread status update must target review_thread; got: {}",
+            SQL_UPDATE_REVIEW_THREAD_STATUS,
+        );
+    }
+    // ── Issue #148 / AIVCS slice 3 — human_decision SQL shape ───
+    //
+    // Companion to the WS8 cross-tenant tests above. The projection
+    // tables don't run against a live D1 from `cargo test` (wasm-only
+    // at runtime), so we lock in the SQL text: tenant_id must be ?1 on
+    // every read and every write, and the INSERT column list must
+    // carry all 7 typed columns plus tenant_id + id. If a future edit
+    // drops a column or moves tenant_id out of the leading position
+    // these tests fail at PR-review time rather than as a silent
+    // cross-tenant leak.
+
+    #[test]
+    fn cross_tenant_sql_insert_human_decision_binds_tenant_id_first() {
+        let sql = SQL_INSERT_HUMAN_DECISION;
+        assert!(
+            sql.contains("INTO human_decision"),
+            "create_human_decision SQL must target human_decision; got: {sql}",
+        );
+        let col_list_start = sql.find("human_decision (").expect("expected column list");
+        let col_list_tail = &sql[col_list_start..];
+        // tenant_id must be the first column of the INSERT column list.
+        assert!(
+            col_list_tail.starts_with("human_decision (tenant_id,"),
+            "tenant_id must be the first column of the INSERT list; got: {col_list_tail}",
+        );
+        // VALUES must bind tenant_id as ?1 and id as ?2.
+        let values_start = sql.find("VALUES (").expect("expected VALUES clause");
+        let values_tail = &sql[values_start..];
+        assert!(
+            values_tail.starts_with("VALUES (?1, ?2,"),
+            "tenant_id and id must be the leading bound parameters; got: {values_tail}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_sql_insert_human_decision_has_all_seven_typed_columns_plus_tenant_id() {
+        // Slice spec: the projection carries 7 typed columns (run_id,
+        // review_id, actor, decision_type, reason, policy_decision_id,
+        // resulting_event_id) plus tenant_id + id. created_at is filled
+        // by the DEFAULT, not bound. Pin the exact column list so a
+        // future migration that adds a column must also bump this test.
+        let sql = SQL_INSERT_HUMAN_DECISION;
+        for expected in [
+            "tenant_id",
+            "id",
+            "run_id",
+            "review_id",
+            "actor",
+            "decision_type",
+            "reason",
+            "policy_decision_id",
+            "resulting_event_id",
+        ] {
+            assert!(
+                sql.contains(expected),
+                "INSERT column list missing {expected}; got: {sql}",
+            );
+        }
+        // Exactly 9 bound parameters (?1..?9): tenant_id, id, plus the
+        // 7 typed columns. created_at is filled by the column DEFAULT.
+        for placeholder in ["?1", "?2", "?3", "?4", "?5", "?6", "?7", "?8", "?9"] {
+            assert!(
+                sql.contains(placeholder),
+                "INSERT must bind {placeholder}; got: {sql}",
+            );
+        }
+        assert!(
+            !sql.contains("?10"),
+            "INSERT must bind exactly 9 parameters (no created_at bind, that's a DEFAULT); got: {sql}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_sql_list_human_decisions_by_run_filters_on_tenant_id() {
+        // SELECT must include `tenant_id = ?1` in the WHERE clause so a
+        // tenant B request can't list tenant A's decisions for a
+        // colliding run_id.
+        let sql = SQL_LIST_HUMAN_DECISIONS_BY_RUN;
+        assert!(
+            sql.contains("FROM human_decision"),
+            "list_human_decisions_by_run SQL must read from human_decision; got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE tenant_id = ?1 AND run_id = ?2"),
+            "list_human_decisions_by_run SQL must filter by (tenant_id=?1, run_id=?2); got: {sql}",
+        );
+    }
+
+    #[test]
+    fn cross_tenant_sql_list_human_decisions_by_review_filters_on_tenant_id() {
+        let sql = SQL_LIST_HUMAN_DECISIONS_BY_REVIEW;
+        assert!(
+            sql.contains("FROM human_decision"),
+            "list_human_decisions_by_review SQL must read from human_decision; got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE tenant_id = ?1 AND review_id = ?2"),
+            "list_human_decisions_by_review SQL must filter by (tenant_id=?1, review_id=?2); got: {sql}",
+        );
+    }
+
+    #[test]
+    fn human_decision_row_decode_uses_decision_type_from_str() {
+        let row = HumanDecisionRow {
+            id: "hd-1".into(),
+            run_id: Some("run-1".into()),
+            review_id: None,
+            actor: "human:jane".into(),
+            decision_type: "request_changes".into(),
+            reason: Some("nits".into()),
+            policy_decision_id: None,
+            resulting_event_id: Some("ev-1".into()),
+            created_at: "2026-06-11T00:00:00.000Z".into(),
+        };
+        let decoded = row.into_decision().expect("valid decision_type");
+        assert_eq!(
+            decoded.decision_type,
+            models::HumanDecisionType::RequestChanges
+        );
+        assert_eq!(decoded.id, "hd-1");
+        assert_eq!(decoded.actor, "human:jane");
+        assert_eq!(decoded.resulting_event_id.as_deref(), Some("ev-1"));
+    }
+
+    #[test]
+    fn human_decision_row_decode_skips_unknown_decision_type() {
+        let row = HumanDecisionRow {
+            id: "hd-bad".into(),
+            run_id: Some("run-1".into()),
+            review_id: None,
+            actor: "human:jane".into(),
+            decision_type: "not_a_real_decision".into(),
+            reason: None,
+            policy_decision_id: None,
+            resulting_event_id: None,
+            created_at: "2026-06-11T00:00:00.000Z".into(),
+        };
+        assert!(row.into_decision().is_none());
+    }
+
+    // ── AIVCS issue #148 slice 4: pause/resume SQL shape ────────────
+    //
+    // These tests pin the SQL text of SQL_PAUSE_RUN / SQL_RESUME_RUN so a
+    // future edit can't silently drop the tenant_id filter (cross-tenant
+    // leak) or the status guard (illegal transition out of a terminal /
+    // already-paused state).
+
+    #[test]
+    fn sql_pause_run_has_tenant_id_leading_param() {
+        // tenant_id MUST be the first bound parameter (?1) so the worker
+        // can never accidentally pause a run that belongs to a different
+        // tenant — even if a downstream caller binds the wrong run_id.
+        let sql = SQL_PAUSE_RUN;
+        assert!(
+            sql.contains("WHERE tenant_id = ?1"),
+            "SQL_PAUSE_RUN must filter by tenant_id = ?1; got: {sql}",
+        );
+        assert!(
+            sql.contains("AND id = ?2"),
+            "SQL_PAUSE_RUN must bind run id as ?2; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn sql_pause_run_has_terminal_state_guard() {
+        // The status guard is what makes this a state machine, not a
+        // last-write-wins clobber. Only `created` and `running` may
+        // transition to `paused`.
+        let sql = SQL_PAUSE_RUN;
+        assert!(
+            sql.contains("status IN ('created', 'running')"),
+            "SQL_PAUSE_RUN must only pause created/running runs; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn sql_pause_run_sets_paused_at() {
+        // The handler returns paused_at in the response envelope, so the
+        // UPDATE must actually stamp it (and not leave it to a trigger,
+        // which D1 doesn't reliably support across migrations).
+        let sql = SQL_PAUSE_RUN;
+        assert!(
+            sql.contains("status = 'paused'"),
+            "SQL_PAUSE_RUN must set status to 'paused'; got: {sql}",
+        );
+        assert!(
+            sql.contains("paused_at = datetime('now')"),
+            "SQL_PAUSE_RUN must stamp paused_at server-side; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn sql_resume_run_has_tenant_id_leading_param() {
+        let sql = SQL_RESUME_RUN;
+        assert!(
+            sql.contains("WHERE tenant_id = ?1"),
+            "SQL_RESUME_RUN must filter by tenant_id = ?1; got: {sql}",
+        );
+        assert!(
+            sql.contains("AND id = ?2"),
+            "SQL_RESUME_RUN must bind run id as ?2; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn sql_resume_run_has_paused_guard() {
+        // The guard makes resume a no-op for any non-paused run
+        // (including terminal). The handler reads zero-changes as
+        // RUN_NOT_PAUSED.
+        let sql = SQL_RESUME_RUN;
+        assert!(
+            sql.contains("status = 'paused'"),
+            "SQL_RESUME_RUN must require status = 'paused' before resuming; got: {sql}",
+        );
+        assert!(
+            sql.contains("status = 'running'"),
+            "SQL_RESUME_RUN must set status to 'running'; got: {sql}",
+        );
+        assert!(
+            sql.contains("resumed_at = datetime('now')"),
+            "SQL_RESUME_RUN must stamp resumed_at server-side; got: {sql}",
+        );
+    }
+
+    #[test]
+    fn pause_resume_outcomes_serialize_status_update() {
+        // The RunStatusUpdate envelope serialised in handler responses
+        // must omit the opposite timestamp (paused_at on a pause
+        // response, resumed_at on a resume response). serde's
+        // skip_serializing_if = "Option::is_none" handles this — pin it
+        // here so a future derive change can't drop the attribute.
+        let paused = RunStatusUpdate {
+            id: "run-1".into(),
+            status: "paused".into(),
+            paused_at: Some("2026-06-11T00:00:00Z".into()),
+            resumed_at: None,
+        };
+        let json = serde_json::to_value(&paused).unwrap();
+        assert_eq!(json["id"], "run-1");
+        assert_eq!(json["status"], "paused");
+        assert_eq!(json["paused_at"], "2026-06-11T00:00:00Z");
+        assert!(
+            json.get("resumed_at").is_none(),
+            "resumed_at must be omitted from a fresh pause response; got: {json}",
+        );
+
+        let resumed = RunStatusUpdate {
+            id: "run-1".into(),
+            status: "running".into(),
+            paused_at: None,
+            resumed_at: Some("2026-06-11T00:01:00Z".into()),
+        };
+        let json = serde_json::to_value(&resumed).unwrap();
+        assert_eq!(json["status"], "running");
+        assert_eq!(json["resumed_at"], "2026-06-11T00:01:00Z");
+        assert!(
+            json.get("paused_at").is_none(),
+            "paused_at must be omitted from a fresh resume response; got: {json}",
+        );
+    }
+
+    // ── Outcome → HTTP code shape ───────────────────────────────────
+    //
+    // The handler in lib.rs maps these enums to the response codes
+    // mandated by the issue #148 spec. We pin the mapping here so a
+    // refactor of either the handler or the helper can't silently
+    // change the contract.
+
+    #[test]
+    fn pause_outcome_already_paused_is_idempotent_envelope() {
+        // already-paused must surface the existing paused_at, not
+        // synthesise a fresh one — restamping would mask the original
+        // pause time and corrupt the audit trail.
+        let outcome = PauseOutcome::AlreadyPaused(RunStatusUpdate {
+            id: "run-x".into(),
+            status: "paused".into(),
+            paused_at: Some("2026-06-10T12:00:00Z".into()),
+            resumed_at: None,
+        });
+        match outcome {
+            PauseOutcome::AlreadyPaused(update) => {
+                assert_eq!(update.status, "paused");
+                assert_eq!(update.paused_at.as_deref(), Some("2026-06-10T12:00:00Z"));
+            }
+            other => panic!("expected AlreadyPaused; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pause_outcome_terminal_reports_current_status_for_envelope() {
+        // The 409 envelope echoes back the offending state so the
+        // caller can present a sensible error to a human operator
+        // ("can't pause: run already succeeded") without a second
+        // round-trip.
+        for terminal in ["succeeded", "failed", "cancelled"] {
+            let outcome = PauseOutcome::Terminal {
+                current_status: terminal.to_string(),
+            };
+            match outcome {
+                PauseOutcome::Terminal { current_status } => {
+                    assert_eq!(current_status, terminal);
+                }
+                other => panic!("expected Terminal; got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resume_outcome_not_paused_reports_current_status() {
+        // Resume from any non-paused state (including terminal) is the
+        // same 409 RUN_NOT_PAUSED — we don't bifurcate the response
+        // shape based on which non-paused state the run is in. The
+        // current_status string is what disambiguates for the caller.
+        for state in ["running", "created", "succeeded", "failed", "cancelled"] {
+            let outcome = ResumeOutcome::NotPaused {
+                current_status: state.to_string(),
+            };
+            match outcome {
+                ResumeOutcome::NotPaused { current_status } => {
+                    assert_eq!(current_status, state);
+                }
+                other => panic!("expected NotPaused; got {other:?}"),
+            }
+        }
     }
 }

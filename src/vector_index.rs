@@ -1,56 +1,22 @@
-//! Semantic indexing helper backed by Workers AI + Vectorize.
-//!
-//! KNOWN LIMITATION (tracked in follow-up issue): the `SEMANTIC_INDEX` binding
-//! is declared as `[[vectorize]]` in `wrangler.toml`, but worker-rs 0.8.x has
-//! no typed `Env::vectorize()` accessor — only `ai`, `analytics_engine`,
-//! `service`, `kv`, `d1`, etc. (see `Env` in worker-0.8.3/src/env.rs).
-//!
-//! We currently fall back to `env.service("SEMANTIC_INDEX")` which returns a
-//! `Fetcher`. That works at compile time but the live binding object is a
-//! Vectorize index, not a Fetcher — so the `fetch_request` calls in `insert`
-//! and `query` fail at runtime. Every caller in `lib.rs` wraps these in
-//! `if let Ok(...)` so the failure is silent — semantic indexing is a no-op
-//! today and the worker continues without it.
-//!
-//! Three options to actually fix this:
-//!   1. Upgrade `worker` past the version that adds typed Vectorize support
-//!      and replace this whole module with the typed binding.
-//!   2. Hand-roll a Vectorize REST client using `reqwest`/`fetch` against
-//!      `api.cloudflare.com` (requires an API-token secret binding, not the
-//!      Vectorize binding).
-//!   3. Stand up a small JS Worker that exposes a fetch handler wrapping
-//!      `env.SEMANTIC_INDEX.{insert,query}`, and bind to it as a service
-//!      binding from this Rust worker (so `env.service(...)` is correct).
-//!
-//! Until then, every binding-acquire and fetch_request error path runs
-//! `inspect_err(|e| console_warn!(...))` so the broken path is observable
-//! via `wrangler tail` instead of silently dropping memory items. Log
-//! messages avoid embedding raw user-controlled values (memory IDs are
-//! truncated to a short prefix) to bound log cardinality on retry storms.
-
 use serde_json::json;
+use wasm_bindgen::{JsCast, JsValue};
 use worker::*;
 
 pub struct SemanticIndex {
     ai: Ai,
-    index: Fetcher,
+    index: JsValue,
 }
 
 impl SemanticIndex {
     pub fn new(env: &Env) -> Result<Self> {
-        let ai = env.ai("AI").inspect_err(|e| {
-            console_warn!(
-                "vector_index: env.ai(\"AI\") failed — semantic indexing disabled ({e:?})"
-            );
-        })?;
-        // KNOWN BUG: see module doc comment. `SEMANTIC_INDEX` is a Vectorize
-        // binding, not a service binding, so the returned Fetcher's
-        // fetch_request will fail at runtime against a real CF deployment.
-        let index = env.service("SEMANTIC_INDEX").inspect_err(|e| {
-            console_warn!(
-                "vector_index: env.service(\"SEMANTIC_INDEX\") failed — semantic indexing disabled ({e:?})"
-            );
-        })?;
+        let ai = env.ai("AI")?;
+        let index = js_sys::Reflect::get(env, &JsValue::from_str("SEMANTIC_INDEX"))
+            .map_err(|e| Error::RustError(format!("failed to get SEMANTIC_INDEX: {:?}", e)))?;
+        if index.is_undefined() {
+            return Err(Error::RustError(
+                "SEMANTIC_INDEX binding is undefined".into(),
+            ));
+        }
         Ok(Self { ai, index })
     }
 
@@ -58,11 +24,9 @@ impl SemanticIndex {
         let result: serde_json::Value = self
             .ai
             .run("@cf/baai/bge-base-en-v1.5", json!({ "text": [text] }))
-            .await
-            .inspect_err(|e| {
-                console_warn!("vector_index: AI.run failed — returning embed error ({e:?})");
-            })?;
+            .await?;
 
+        // Parse embedding from result
         // Workers AI result format for embeddings: {"data": [[0.1, ...]], "shape": [1, 768]}
         let embedding = result["data"][0]
             .as_array()
@@ -81,65 +45,70 @@ impl SemanticIndex {
         metadata: serde_json::Value,
     ) -> Result<()> {
         let body = json!({
-            "vectors": [{
-                "id": id,
-                "values": vector,
-                "metadata": metadata
-            }]
+            "id": id,
+            "values": vector,
+            "metadata": metadata
         });
 
-        let req = Request::new_with_init(
-            "http://vectorize/insert",
-            &RequestInit {
-                method: Method::Post,
-                body: Some(
-                    serde_wasm_bindgen::to_value(&body)
-                        .map_err(|e| Error::RustError(e.to_string()))?,
-                ),
-                ..Default::default()
-            },
-        )?;
+        // In JS, insert takes an array of vectors: index.insert([ { id, values, metadata } ])
+        let vectors = js_sys::Array::new();
+        vectors.push(
+            &serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?,
+        );
 
-        // See module doc comment — this call is expected to fail at runtime
-        // against the live Vectorize binding. The caller handles the error.
-        // Truncate id to a short prefix in the log to bound cardinality
-        // when retry storms hit (one log line per unique full id would
-        // blow up `wrangler tail` throughput).
-        let id_short: &str = id.get(..id.len().min(8)).unwrap_or("");
-        self.index.fetch_request(req).await.inspect_err(|e| {
-            console_warn!(
-                "vector_index: SEMANTIC_INDEX.fetch_request(insert) failed (id_prefix={id_short}) — binding-type mismatch, see vector_index.rs doc comment ({e:?})"
-            );
-        })?;
+        let insert_fn = js_sys::Reflect::get(&self.index, &JsValue::from_str("insert"))
+            .map_err(|e| Error::RustError(format!("failed to get insert method: {:?}", e)))?;
+        let insert_fn: js_sys::Function = insert_fn
+            .dyn_into()
+            .map_err(|_| Error::RustError("insert is not a function".into()))?;
+
+        let promise = insert_fn
+            .call1(&self.index, &vectors)
+            .map_err(|e| Error::RustError(format!("failed to call insert: {:?}", e)))?;
+        let promise: js_sys::Promise = promise
+            .dyn_into()
+            .map_err(|_| Error::RustError("insert did not return a promise".into()))?;
+
+        wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(|e| Error::RustError(format!("insert promise failed: {:?}", e)))?;
+
         Ok(())
     }
 
     pub async fn query(&self, vector: Vec<f32>, top_k: usize) -> Result<serde_json::Value> {
-        let body = json!({
-            "vector": vector,
+        // Convert vector to JsValue (which will be a JS array of numbers)
+        let js_vector =
+            serde_wasm_bindgen::to_value(&vector).map_err(|e| Error::RustError(e.to_string()))?;
+
+        // Convert options to JsValue
+        let options = json!({
             "topK": top_k,
             "returnMetadata": "all"
         });
+        let js_options =
+            serde_wasm_bindgen::to_value(&options).map_err(|e| Error::RustError(e.to_string()))?;
 
-        let req = Request::new_with_init(
-            "http://vectorize/query",
-            &RequestInit {
-                method: Method::Post,
-                body: Some(
-                    serde_wasm_bindgen::to_value(&body)
-                        .map_err(|e| Error::RustError(e.to_string()))?,
-                ),
-                ..Default::default()
-            },
-        )?;
+        let query_fn = js_sys::Reflect::get(&self.index, &JsValue::from_str("query"))
+            .map_err(|e| Error::RustError(format!("failed to get query method: {:?}", e)))?;
+        let query_fn: js_sys::Function = query_fn
+            .dyn_into()
+            .map_err(|_| Error::RustError("query is not a function".into()))?;
 
-        // See module doc comment — expected to fail at runtime.
-        // top_k is omitted from the log to keep cardinality bounded.
-        let mut resp = self.index.fetch_request(req).await.inspect_err(|e| {
-            console_warn!(
-                "vector_index: SEMANTIC_INDEX.fetch_request(query) failed — binding-type mismatch, see vector_index.rs doc comment ({e:?})"
-            );
-        })?;
-        resp.json().await
+        let promise = query_fn
+            .call2(&self.index, &js_vector, &js_options)
+            .map_err(|e| Error::RustError(format!("failed to call query: {:?}", e)))?;
+        let promise: js_sys::Promise = promise
+            .dyn_into()
+            .map_err(|_| Error::RustError("query did not return a promise".into()))?;
+
+        let result_js = wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(|e| Error::RustError(format!("query promise failed: {:?}", e)))?;
+
+        let result: serde_json::Value = serde_wasm_bindgen::from_value(result_js)
+            .map_err(|e| Error::RustError(e.to_string()))?;
+
+        Ok(result)
     }
 }

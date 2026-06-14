@@ -1,6 +1,7 @@
 use crate::models::{AgentTask, PlayDefinition, PlayTaskDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use wasm_bindgen::JsValue;
 use worker::*;
 
 /// Envelope sent by `POST /v1/plays/:name/launch` (in `lib.rs`) so the
@@ -60,7 +61,10 @@ impl DurableObject for PlayManager {
                     return Response::error("tenant_id required in launch envelope", 400);
                 }
 
-                let run_id = crate::generate_id().unwrap_or_else(|_| "err".to_string());
+                let run_id = req
+                    .headers()
+                    .get("x-run-id")?
+                    .ok_or_else(|| Error::RustError("missing x-run-id header".into()))?;
 
                 let state = PlayState {
                     definition: def.clone(),
@@ -212,10 +216,7 @@ impl PlayManager {
                 "https://do/enqueue",
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(
-                        serde_wasm_bindgen::to_value(&task)
-                            .map_err(|e| Error::RustError(e.to_string()))?,
-                    ),
+                    body: Some(JsValue::from_str(&serde_json::to_string(&task).map_err(|e| Error::RustError(e.to_string()))?)),
                     ..Default::default()
                 },
             )?;

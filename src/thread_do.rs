@@ -113,7 +113,10 @@ impl DurableObject for ThreadManager {
                 let body: CreateCheckpoint = req.json().await?;
                 let storage = self.state.storage();
 
-                let id = crate::generate_id().unwrap_or_else(|_| "err".to_string());
+                let id = req
+                    .headers()
+                    .get("x-checkpoint-id")?
+                    .ok_or_else(|| Error::RustError("missing x-checkpoint-id header".into()))?;
                 let now = js_sys::Date::now() as u64;
                 let created_at = js_sys::Date::new(&serde_wasm_bindgen::to_value(&now).unwrap())
                     .to_iso_string()
@@ -348,7 +351,11 @@ mod tests {
     fn history_is_trimmed_at_documented_cap() {
         let mut history: VecDeque<Checkpoint> = VecDeque::new();
         for i in 0..(MAX_HISTORY_ENTRIES + 5) {
-            append_to_history(&mut history, make_cp(&format!("cp-{i:03}")), MAX_HISTORY_ENTRIES);
+            append_to_history(
+                &mut history,
+                make_cp(&format!("cp-{i:03}")),
+                MAX_HISTORY_ENTRIES,
+            );
         }
 
         assert_eq!(history.len(), MAX_HISTORY_ENTRIES);
