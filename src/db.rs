@@ -4495,6 +4495,7 @@ pub async fn touch_integration(
 
 // ── Gemini Batch Jobs (WS6+) ──────────────────────────────────
 
+#[allow(dead_code)]
 pub async fn create_gemini_batch_job(
     db: &D1Database,
     tenant_id: &str,

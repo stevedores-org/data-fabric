@@ -1,3 +1,4 @@
+#![allow(unused_must_use)]
 use serde::Serialize;
 use wasm_bindgen::JsValue;
 use worker::*;
@@ -2608,6 +2609,7 @@ pub async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Conte
 
 /// Scheduled event: poll Gemini batch jobs and other background maintenance.
 #[event(scheduled)]
+#[allow(unused_must_use)]
 pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Result<()> {
     gemini_service::poll_gemini_jobs(&env).await
 }
