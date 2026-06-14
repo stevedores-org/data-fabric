@@ -98,7 +98,7 @@ max_retries = 3
 dead_letter_queue = "data-fabric-events-dlq-dev"
 
 [triggers]
-scheduled = ["*/10 * * * *"]
+crons = ["*/10 * * * *"]
 
 # ── Analytics Engine: API latency sink (WS10 pilot KPI #6) ──────
 # DEFERRED to a follow-up PR. Enabling AE at the account level alone is
