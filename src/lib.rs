@@ -2203,13 +2203,17 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
             let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
-            let review_id = params.get("review_id").map(|s| s.as_ref());
             let d1 = ctx.env.d1("DB")?;
-            if let Some(rid) = review_id {
+            // `pr_id` is the AIVCS pull-request id == change_set id (the native
+            // PR-equivalent — see migration 0015). Falls back to `review_id`.
+            if let Some(pr_id) = params.get("pr_id").map(|s| s.as_ref()) {
+                let list = db::list_review_threads_for_change_set(&d1, &tenant_ctx.tenant_id, pr_id, 100).await?;
+                Response::from_json(&serde_json::json!({ "review_threads": list }))
+            } else if let Some(rid) = params.get("review_id").map(|s| s.as_ref()) {
                 let list = db::list_review_threads_for_review(&d1, &tenant_ctx.tenant_id, rid, 100).await?;
                 Response::from_json(&serde_json::json!({ "review_threads": list }))
             } else {
-                Response::error("missing required query parameter: review_id", 400)
+                Response::error("missing required query parameter: pr_id or review_id", 400)
             }
         })
         .get_async("/v1/review-threads/:id/comments", |req, ctx| async move {
@@ -2225,6 +2229,20 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let d1 = ctx.env.d1("DB")?;
             let list = db::list_file_anchors_for_thread(&d1, &tenant_ctx.tenant_id, &thread_id, 100).await?;
             Response::from_json(&serde_json::json!({ "file_anchors": list }))
+        })
+        // Issue #159 — all file anchors across a pull request's review threads.
+        .get_async("/v1/file-anchors", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req.url().map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            let d1 = ctx.env.d1("DB")?;
+            // `pr_id` == change_set id; returns anchors across the PR's threads.
+            if let Some(pr_id) = params.get("pr_id").map(|s| s.as_ref()) {
+                let list = db::list_file_anchors_for_change_set(&d1, &tenant_ctx.tenant_id, pr_id, 100).await?;
+                Response::from_json(&serde_json::json!({ "file_anchors": list }))
+            } else {
+                Response::error("missing required query parameter: pr_id", 400)
+            }
         })
         .get_async("/v1/human-decisions", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
