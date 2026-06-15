@@ -118,10 +118,10 @@ impl DurableObject for ThreadManager {
                     .get("x-checkpoint-id")?
                     .ok_or_else(|| Error::RustError("missing x-checkpoint-id header".into()))?;
                 let now = js_sys::Date::now() as u64;
-                let created_at = js_sys::Date::new(&serde_wasm_bindgen::to_value(&now).unwrap())
+                let created_at = js_sys::Date::new(&serde_wasm_bindgen::to_value(&now).unwrap_or_default())
                     .to_iso_string()
                     .as_string()
-                    .unwrap();
+                    .unwrap_or_default();
 
                 // PR #132 crr finding (thread_do.rs:44/50): the size was
                 // measured but never compared against the 128 KB limit,
