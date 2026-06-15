@@ -206,7 +206,7 @@ impl PlayManager {
                 retry_count: 0,
                 max_retries: 3,
                 lease_expires_at: None,
-                created_at: js_sys::Date::new_0().to_iso_string().as_string().unwrap(),
+                created_at: js_sys::Date::new_0().to_iso_string().as_string().unwrap_or_default(),
                 completed_at: None,
                 memory_context: None,
                 tenant_id: Some(state.tenant_id.clone()),

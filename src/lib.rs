@@ -570,7 +570,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                         "run_id": body.run_id,
                         "tenant_id": tenant_ctx.tenant_id
                     });
-                    let _ = index.insert(&id, vector, metadata).await;
+                    if let Err(e) = index.insert(&id, vector, metadata).await {
+                        worker::console_error!("Failed to insert into Vectorize: {:?}", e);
+                    }
                 }
             }
 

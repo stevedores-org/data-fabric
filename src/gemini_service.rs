@@ -62,7 +62,7 @@ pub async fn summarize_telemetry_batch(
             },
         };
         
-        jsonl.push_str(&serde_json::to_string(&req).unwrap());
+        jsonl.push_str(&serde_json::to_string(&req).map_err(|e| Error::RustError(e.to_string()))?);
         jsonl.push('\n');
     }
 

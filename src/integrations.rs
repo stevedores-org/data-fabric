@@ -837,7 +837,7 @@ pub mod gemini {
                 .map_err(|e| format!("{:?}", e))?;
             opts.with_headers(headers);
             opts.with_body(Some(JsValue::from_str(
-                &serde_json::to_string(&metadata).unwrap(),
+                &serde_json::to_string(&metadata).map_err(|e| format!("{:?}", e))?,
             )));
 
             let req = worker::Request::new_with_init(&url, &opts).map_err(|e| format!("{:?}", e))?;
@@ -915,9 +915,9 @@ pub mod gemini {
             });
 
             if let Some(name) = display_name {
-                body.as_object_mut()
-                    .unwrap()
-                    .insert("display_name".to_string(), serde_json::json!(name));
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("display_name".to_string(), serde_json::json!(name));
+                }
             }
 
             let mut opts = worker::RequestInit::new();
@@ -929,7 +929,7 @@ pub mod gemini {
                 .map_err(|e| format!("{:?}", e))?;
             opts.with_headers(headers);
             opts.with_body(Some(JsValue::from_str(
-                &serde_json::to_string(&body).unwrap(),
+                &serde_json::to_string(&body).map_err(|e| format!("{:?}", e))?,
             )));
 
             let req = worker::Request::new_with_init(&url, &opts).map_err(|e| format!("{:?}", e))?;
