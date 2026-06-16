@@ -38,7 +38,7 @@ jobs:
         run: |
           CARGO_AUDIT_VER="v0.20.0"
           curl -sSfL "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2F${CARGO_AUDIT_VER}/cargo-audit-x86_64-unknown-linux-gnu-${CARGO_AUDIT_VER}.tgz" -o /tmp/cargo-audit.tgz
-          tar -xzf /tmp/cargo-audit.tgz -C /tmp
+          tar -xzf /tmp/cargo-audit.tgz -C /tmp --strip-components=1
           sudo mv /tmp/cargo-audit /usr/local/bin/
           cargo audit --version
 
