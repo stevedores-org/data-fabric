@@ -1609,7 +1609,10 @@ fn step_type_from_storage_str_falls_back_on_unknown() {
     // Future schema versions might add variants this binary hasn't seen.
     // The DB CHECK constraint blocks the typo path; this guards the
     // forward-compat path.
-    assert_eq!(StepType::from_storage_str("future_variant"), StepType::Other);
+    assert_eq!(
+        StepType::from_storage_str("future_variant"),
+        StepType::Other
+    );
     assert_eq!(StepType::from_storage_str(""), StepType::Other);
 }
 

@@ -67,11 +67,12 @@ impl RetryPolicy {
     /// Doubling proceeds in `u128` to avoid overflow on policies with large
     /// `initial_backoff_ms`, then clamps back into `u64`.
     pub fn backoff_for(&self, attempt_index: u32) -> Duration {
-        let base = self.initial_backoff_ms as u128;
+        let base = u128::from(self.initial_backoff_ms);
         let shifted = base
             .checked_shl(attempt_index)
-            .unwrap_or(self.max_backoff_ms as u128);
-        let capped = shifted.min(self.max_backoff_ms as u128) as u64;
+            .unwrap_or(u128::from(self.max_backoff_ms));
+        let capped =
+            u64::try_from(shifted.min(u128::from(self.max_backoff_ms))).unwrap_or(u64::MAX);
         Duration::from_millis(capped)
     }
 }
@@ -172,7 +173,7 @@ where
                 }
 
                 let base = policy.backoff_for(attempt);
-                let base_ms = base.as_millis() as u64;
+                let base_ms = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
                 let total = base_ms + jitter_ms(clock.now_ms(), base_ms);
                 sleeper.sleep(Duration::from_millis(total)).await;
             }
@@ -209,7 +210,7 @@ mod tests {
     impl Sleeper for RecordingSleeper {
         async fn sleep(&self, dur: Duration) {
             let mut v = self.0.take();
-            v.push(dur.as_millis() as u64);
+            v.push(u64::try_from(dur.as_millis()).unwrap_or(u64::MAX));
             self.0.set(v);
         }
     }
@@ -223,6 +224,7 @@ mod tests {
         use std::sync::Arc;
         use std::task::{Context, Poll, Wake, Waker};
         struct Noop;
+        #[allow(clippy::manual_noop_waker)]
         impl Wake for Noop {
             fn wake(self: Arc<Self>) {}
         }
@@ -304,18 +306,14 @@ mod tests {
         };
 
         let calls_inner = calls.clone();
-        let res: Result<(), Error> = block_on(with_retry_clock(
-            &policy,
-            &clock,
-            &sleeper,
-            move || {
+        let res: Result<(), Error> =
+            block_on(with_retry_clock(&policy, &clock, &sleeper, move || {
                 let c = calls_inner.clone();
                 async move {
                     c.set(c.get() + 1);
                     Err::<(), _>(Error::Transient("D1 busy".into()))
                 }
-            },
-        ));
+            }));
 
         assert!(matches!(res, Err(Error::Transient(_))));
         assert_eq!(calls.get(), 3, "expected exactly max_attempts calls");
@@ -332,18 +330,14 @@ mod tests {
         let policy = RetryPolicy::default_for_storage();
 
         let calls_inner = calls.clone();
-        let res: Result<(), Error> = block_on(with_retry_clock(
-            &policy,
-            &clock,
-            &sleeper,
-            move || {
+        let res: Result<(), Error> =
+            block_on(with_retry_clock(&policy, &clock, &sleeper, move || {
                 let c = calls_inner.clone();
                 async move {
                     c.set(c.get() + 1);
                     Err::<(), _>(Error::Permanent("nope".into()))
                 }
-            },
-        ));
+            }));
 
         assert!(matches!(res, Err(Error::Permanent(_))));
         assert_eq!(calls.get(), 1, "permanent error must not retry");
@@ -365,11 +359,8 @@ mod tests {
         };
 
         let calls_inner = calls.clone();
-        let res: Result<&'static str, Error> = block_on(with_retry_clock(
-            &policy,
-            &clock,
-            &sleeper,
-            move || {
+        let res: Result<&'static str, Error> =
+            block_on(with_retry_clock(&policy, &clock, &sleeper, move || {
                 let c = calls_inner.clone();
                 async move {
                     let n = c.get() + 1;
@@ -380,10 +371,9 @@ mod tests {
                         Ok("ok")
                     }
                 }
-            },
-        ));
+            }));
 
-        assert_eq!(res.unwrap(), "ok");
+        assert_eq!(res.unwrap_or_else(|_| panic!("should be ok")), "ok");
         assert_eq!(calls.get(), 2);
         assert_eq!(sleeps.take().len(), 1);
     }
@@ -397,18 +387,14 @@ mod tests {
         let policy = RetryPolicy::none();
 
         let calls_inner = calls.clone();
-        let _: Result<(), Error> = block_on(with_retry_clock(
-            &policy,
-            &clock,
-            &sleeper,
-            move || {
+        let _: Result<(), Error> =
+            block_on(with_retry_clock(&policy, &clock, &sleeper, move || {
                 let c = calls_inner.clone();
                 async move {
                     c.set(c.get() + 1);
                     Err::<(), _>(Error::Transient("once".into()))
                 }
-            },
-        ));
+            }));
 
         assert_eq!(calls.get(), 1);
         assert!(sleeps.take().is_empty());
@@ -430,12 +416,10 @@ mod tests {
             max_backoff_ms: 200,
         };
 
-        let _: Result<(), Error> = block_on(with_retry_clock(
-            &policy,
-            &clock,
-            &sleeper,
-            || async { Err::<(), _>(Error::Transient("x".into())) },
-        ));
+        let _: Result<(), Error> =
+            block_on(with_retry_clock(&policy, &clock, &sleeper, || async {
+                Err::<(), _>(Error::Transient("x".into()))
+            }));
 
         // backoff_for(0..3): 50, 100, 200 (200 doubled would be 200 capped).
         // jitter per step <= base/4.

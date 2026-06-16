@@ -1,6 +1,7 @@
 use crate::models::{AgentTask, PlayDefinition, PlayTaskDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use wasm_bindgen::JsValue;
 use worker::*;
 
 /// Envelope sent by `POST /v1/plays/:name/launch` (in `lib.rs`) so the
@@ -205,7 +206,7 @@ impl PlayManager {
                 retry_count: 0,
                 max_retries: 3,
                 lease_expires_at: None,
-                created_at: js_sys::Date::new_0().to_iso_string().as_string().unwrap(),
+                created_at: js_sys::Date::new_0().to_iso_string().as_string().unwrap_or_default(),
                 completed_at: None,
                 memory_context: None,
                 tenant_id: Some(state.tenant_id.clone()),
@@ -215,10 +216,7 @@ impl PlayManager {
                 "https://do/enqueue",
                 &RequestInit {
                     method: Method::Post,
-                    body: Some(
-                        serde_wasm_bindgen::to_value(&task)
-                            .map_err(|e| Error::RustError(e.to_string()))?,
-                    ),
+                    body: Some(JsValue::from_str(&serde_json::to_string(&task).map_err(|e| Error::RustError(e.to_string()))?)),
                     ..Default::default()
                 },
             )?;

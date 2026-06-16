@@ -1,26 +1,26 @@
 use data_fabric_client::{Client, ClientConfig};
-use std::net::TcpListener;
 use std::io::{Read, Write};
+use std::net::TcpListener;
 use tokio::task;
 
 #[tokio::test]
 async fn test_client_headers_and_response() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    
+
     // Spawn mock server thread
     let server_handle = task::spawn_blocking(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buffer = [0; 2048];
         let bytes_read = stream.read(&mut buffer).unwrap();
         let request_str = String::from_utf8_lossy(&buffer[..bytes_read]);
-        
+
         // Assert client headers
         assert!(request_str.contains("x-tenant-id: test-tenant"));
         assert!(request_str.contains("x-tenant-role: builder"));
         assert!(request_str.contains("cf-access-client-id: id-123"));
         assert!(request_str.contains("cf-access-client-secret: secret-456"));
-        
+
         let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"service\":\"data-fabric\",\"status\":\"ok\",\"mission\":\"testing\"}";
         stream.write_all(response.as_bytes()).unwrap();
         stream.flush().unwrap();
@@ -40,6 +40,47 @@ async fn test_client_headers_and_response() {
     assert_eq!(health.service, "data-fabric");
     assert_eq!(health.status, "ok");
     assert_eq!(health.mission, "testing");
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_client_get_pull_request_encodes_id() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server_handle = task::spawn_blocking(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0; 2048];
+        let bytes_read = stream.read(&mut buffer).unwrap();
+        let request_str = String::from_utf8_lossy(&buffer[..bytes_read]);
+
+        assert!(request_str.starts_with("GET /v1/pull-requests/owner%2Frepo%231 HTTP/1.1"));
+
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: application/json\r\n",
+            "\r\n",
+            r#"{"id":"owner/repo#1","repo":"stevedores-org/aivcs-api","run_id":"run-1","title":"Review","status":"open","source_branch":"feature/a","target_branch":"main","author":"codex","summary":"Ready","change_set":{"id":"owner/repo#1"},"created_at":"2026-06-12T00:00:00.000Z","updated_at":"2026-06-12T00:00:00.000Z"}"#
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    });
+
+    let config = ClientConfig {
+        base_url: format!("http://127.0.0.1:{}", port),
+        tenant_id: "test-tenant".to_string(),
+        tenant_role: "builder".to_string(),
+        cf_client_id: None,
+        cf_client_secret: None,
+    };
+
+    let client = Client::new(config);
+    let pr = client.get_pull_request("owner/repo#1").await.unwrap();
+
+    assert_eq!(pr.id, "owner/repo#1");
+    assert_eq!(pr.repo, "stevedores-org/aivcs-api");
+    assert_eq!(pr.change_set["id"], "owner/repo#1");
 
     server_handle.await.unwrap();
 }

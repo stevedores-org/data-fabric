@@ -118,10 +118,10 @@ impl DurableObject for ThreadManager {
                     .get("x-checkpoint-id")?
                     .ok_or_else(|| Error::RustError("missing x-checkpoint-id header".into()))?;
                 let now = js_sys::Date::now() as u64;
-                let created_at = js_sys::Date::new(&serde_wasm_bindgen::to_value(&now).unwrap())
+                let created_at = js_sys::Date::new(&serde_wasm_bindgen::to_value(&now).unwrap_or_default())
                     .to_iso_string()
                     .as_string()
-                    .unwrap();
+                    .unwrap_or_default();
 
                 // PR #132 crr finding (thread_do.rs:44/50): the size was
                 // measured but never compared against the 128 KB limit,
@@ -351,7 +351,11 @@ mod tests {
     fn history_is_trimmed_at_documented_cap() {
         let mut history: VecDeque<Checkpoint> = VecDeque::new();
         for i in 0..(MAX_HISTORY_ENTRIES + 5) {
-            append_to_history(&mut history, make_cp(&format!("cp-{i:03}")), MAX_HISTORY_ENTRIES);
+            append_to_history(
+                &mut history,
+                make_cp(&format!("cp-{i:03}")),
+                MAX_HISTORY_ENTRIES,
+            );
         }
 
         assert_eq!(history.len(), MAX_HISTORY_ENTRIES);

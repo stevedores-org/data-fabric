@@ -13,7 +13,9 @@ impl SemanticIndex {
         let index = js_sys::Reflect::get(env, &JsValue::from_str("SEMANTIC_INDEX"))
             .map_err(|e| Error::RustError(format!("failed to get SEMANTIC_INDEX: {:?}", e)))?;
         if index.is_undefined() {
-            return Err(Error::RustError("SEMANTIC_INDEX binding is undefined".into()));
+            return Err(Error::RustError(
+                "SEMANTIC_INDEX binding is undefined".into(),
+            ));
         }
         Ok(Self { ai, index })
     }
@@ -50,20 +52,25 @@ impl SemanticIndex {
 
         // In JS, insert takes an array of vectors: index.insert([ { id, values, metadata } ])
         let vectors = js_sys::Array::new();
-        vectors.push(&serde_wasm_bindgen::to_value(&body)
-            .map_err(|e| Error::RustError(e.to_string()))?);
+        vectors.push(
+            &serde_wasm_bindgen::to_value(&body).map_err(|e| Error::RustError(e.to_string()))?,
+        );
 
         let insert_fn = js_sys::Reflect::get(&self.index, &JsValue::from_str("insert"))
             .map_err(|e| Error::RustError(format!("failed to get insert method: {:?}", e)))?;
-        let insert_fn: js_sys::Function = insert_fn.dyn_into()
+        let insert_fn: js_sys::Function = insert_fn
+            .dyn_into()
             .map_err(|_| Error::RustError("insert is not a function".into()))?;
 
-        let promise = insert_fn.call1(&self.index, &vectors)
+        let promise = insert_fn
+            .call1(&self.index, &vectors)
             .map_err(|e| Error::RustError(format!("failed to call insert: {:?}", e)))?;
-        let promise: js_sys::Promise = promise.dyn_into()
+        let promise: js_sys::Promise = promise
+            .dyn_into()
             .map_err(|_| Error::RustError("insert did not return a promise".into()))?;
 
-        wasm_bindgen_futures::JsFuture::from(promise).await
+        wasm_bindgen_futures::JsFuture::from(promise)
+            .await
             .map_err(|e| Error::RustError(format!("insert promise failed: {:?}", e)))?;
 
         Ok(())
@@ -71,28 +78,32 @@ impl SemanticIndex {
 
     pub async fn query(&self, vector: Vec<f32>, top_k: usize) -> Result<serde_json::Value> {
         // Convert vector to JsValue (which will be a JS array of numbers)
-        let js_vector = serde_wasm_bindgen::to_value(&vector)
-            .map_err(|e| Error::RustError(e.to_string()))?;
+        let js_vector =
+            serde_wasm_bindgen::to_value(&vector).map_err(|e| Error::RustError(e.to_string()))?;
 
         // Convert options to JsValue
         let options = json!({
             "topK": top_k,
             "returnMetadata": "all"
         });
-        let js_options = serde_wasm_bindgen::to_value(&options)
-            .map_err(|e| Error::RustError(e.to_string()))?;
+        let js_options =
+            serde_wasm_bindgen::to_value(&options).map_err(|e| Error::RustError(e.to_string()))?;
 
         let query_fn = js_sys::Reflect::get(&self.index, &JsValue::from_str("query"))
             .map_err(|e| Error::RustError(format!("failed to get query method: {:?}", e)))?;
-        let query_fn: js_sys::Function = query_fn.dyn_into()
+        let query_fn: js_sys::Function = query_fn
+            .dyn_into()
             .map_err(|_| Error::RustError("query is not a function".into()))?;
 
-        let promise = query_fn.call2(&self.index, &js_vector, &js_options)
+        let promise = query_fn
+            .call2(&self.index, &js_vector, &js_options)
             .map_err(|e| Error::RustError(format!("failed to call query: {:?}", e)))?;
-        let promise: js_sys::Promise = promise.dyn_into()
+        let promise: js_sys::Promise = promise
+            .dyn_into()
             .map_err(|_| Error::RustError("query did not return a promise".into()))?;
 
-        let result_js = wasm_bindgen_futures::JsFuture::from(promise).await
+        let result_js = wasm_bindgen_futures::JsFuture::from(promise)
+            .await
             .map_err(|e| Error::RustError(format!("query promise failed: {:?}", e)))?;
 
         let result: serde_json::Value = serde_wasm_bindgen::from_value(result_js)

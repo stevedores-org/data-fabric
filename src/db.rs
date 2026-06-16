@@ -768,7 +768,122 @@ pub async fn create_run(
     ])?
     .run()
     .await?;
+    if let Some(projection) = aivcs_projection_from_run(tenant_id, id, body, &now) {
+        upsert_aivcs_pull_request(db, &projection).await?;
+    }
     Ok(())
+}
+
+async fn upsert_aivcs_pull_request(db: &D1Database, pr: &AivcsPullRequestUpsert) -> Result<()> {
+    db.prepare(
+        "INSERT INTO gold_aivcs_review_queue (
+            tenant_id, id, repo, run_id, title, status, source_branch, target_branch,
+            author, summary, change_set, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(tenant_id, id) DO UPDATE SET
+            repo = excluded.repo,
+            run_id = excluded.run_id,
+            title = excluded.title,
+            status = excluded.status,
+            source_branch = excluded.source_branch,
+            target_branch = excluded.target_branch,
+            author = excluded.author,
+            summary = excluded.summary,
+            change_set = excluded.change_set,
+            updated_at = excluded.updated_at",
+    )
+    .bind(&[
+        JsValue::from_str(&pr.tenant_id),
+        JsValue::from_str(&pr.id),
+        JsValue::from_str(&pr.repo),
+        JsValue::from_str(&pr.run_id),
+        JsValue::from_str(&pr.title),
+        JsValue::from_str(&pr.status),
+        opt_string(&pr.source_branch),
+        opt_string(&pr.target_branch),
+        opt_string(&pr.author),
+        opt_string(&pr.summary),
+        JsValue::from_str(&pr.change_set),
+        JsValue::from_str(&pr.created_at),
+        JsValue::from_str(&pr.updated_at),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn get_aivcs_pull_request(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<AivcsPullRequestResponse>> {
+    let row: Option<AivcsPullRequestRow> = db
+        .prepare(
+            "SELECT id, repo, run_id, title, status, source_branch, target_branch,
+                    author, summary, change_set, created_at, updated_at
+             FROM gold_aivcs_review_queue
+             WHERE tenant_id = ?1 AND id = ?2",
+        )
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.into_response()))
+}
+
+fn opt_string(s: &Option<String>) -> JsValue {
+    match s {
+        Some(s) => JsValue::from_str(s),
+        None => JsValue::NULL,
+    }
+}
+
+fn aivcs_projection_from_run(
+    tenant_id: &str,
+    run_id: &str,
+    body: &models::CreateRun,
+    now: &str,
+) -> Option<AivcsPullRequestUpsert> {
+    let change_set = body.metadata.as_ref()?.get("aivcs")?.get("change_set")?;
+    let explicit_id = json_string(change_set, &["id"]);
+    let source_id = explicit_id
+        .clone()
+        .or_else(|| json_string(change_set, &["number", "pull_request_id"]))?;
+    let id = if explicit_id.is_some() {
+        source_id.clone()
+    } else {
+        format!("{}#{}", body.repo, source_id)
+    };
+    let title = json_string(change_set, &["title"]).unwrap_or_else(|| source_id.clone());
+    let status = json_string(change_set, &["status", "state"]).unwrap_or_else(|| "open".into());
+    let created_at = json_string(change_set, &["created_at"]).unwrap_or_else(|| now.into());
+    let updated_at = json_string(change_set, &["updated_at"]).unwrap_or_else(|| now.into());
+    let change_set_json = serde_json::to_string(change_set).ok()?;
+
+    Some(AivcsPullRequestUpsert {
+        tenant_id: tenant_id.into(),
+        id,
+        repo: body.repo.clone(),
+        run_id: run_id.into(),
+        title,
+        status,
+        source_branch: json_string(change_set, &["source_branch", "head_ref", "head"]),
+        target_branch: json_string(change_set, &["target_branch", "base_ref", "base"]),
+        author: json_string(change_set, &["author", "actor"]),
+        summary: json_string(change_set, &["summary", "description"]),
+        change_set: change_set_json,
+        created_at,
+        updated_at,
+    })
+}
+
+fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(|v| match v {
+            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
 }
 
 /// List runs for `tenant_id` ordered by `(created_at DESC, id DESC)`.
@@ -919,7 +1034,10 @@ pub async fn pause_run(
         }));
     }
 
-    if matches!(current.status.as_str(), "succeeded" | "failed" | "cancelled") {
+    if matches!(
+        current.status.as_str(),
+        "succeeded" | "failed" | "cancelled"
+    ) {
         return Ok(PauseOutcome::Terminal {
             current_status: current.status,
         });
@@ -927,10 +1045,7 @@ pub async fn pause_run(
 
     let update = db
         .prepare(SQL_PAUSE_RUN)
-        .bind(&[
-            JsValue::from_str(tenant_id),
-            JsValue::from_str(run_id),
-        ])?
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
         .run()
         .await?;
 
@@ -1022,10 +1137,7 @@ pub async fn resume_run(
 
     let update = db
         .prepare(SQL_RESUME_RUN)
-        .bind(&[
-            JsValue::from_str(tenant_id),
-            JsValue::from_str(run_id),
-        ])?
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(run_id)])?
         .run()
         .await?;
 
@@ -3558,6 +3670,74 @@ pub struct RunResponse {
     pub resumed_at: Option<String>,
 }
 
+#[derive(Debug, PartialEq)]
+struct AivcsPullRequestUpsert {
+    tenant_id: String,
+    id: String,
+    repo: String,
+    run_id: String,
+    title: String,
+    status: String,
+    source_branch: Option<String>,
+    target_branch: Option<String>,
+    author: Option<String>,
+    summary: Option<String>,
+    change_set: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AivcsPullRequestRow {
+    pub id: String,
+    pub repo: String,
+    pub run_id: String,
+    pub title: String,
+    pub status: String,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub author: Option<String>,
+    pub summary: Option<String>,
+    pub change_set: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl AivcsPullRequestRow {
+    pub fn into_response(self) -> AivcsPullRequestResponse {
+        AivcsPullRequestResponse {
+            id: self.id,
+            repo: self.repo,
+            run_id: self.run_id,
+            title: self.title,
+            status: self.status,
+            source_branch: self.source_branch,
+            target_branch: self.target_branch,
+            author: self.author,
+            summary: self.summary,
+            change_set: serde_json::from_str(&self.change_set).unwrap_or(serde_json::Value::Null),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AivcsPullRequestResponse {
+    pub id: String,
+    pub repo: String,
+    pub run_id: String,
+    pub title: String,
+    pub status: String,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub author: Option<String>,
+    pub summary: Option<String>,
+    pub change_set: serde_json::Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct Ws2TaskRow {
     pub id: String,
@@ -4380,6 +4560,84 @@ pub async fn touch_integration(
     Ok(())
 }
 
+// ── Gemini Batch Jobs (WS6+) ──────────────────────────────────
+
+#[allow(dead_code)]
+pub async fn create_gemini_batch_job(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    job: &crate::integrations::gemini::BatchJob,
+    model: &str,
+    input_file: &str,
+) -> Result<()> {
+    let now = now_iso();
+    let status = serde_json::to_string(&job.state).unwrap().replace("\"", "");
+
+    db.prepare(
+        "INSERT INTO gemini_batch_jobs (id, tenant_id, job_name, model, status, input_file, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(&[
+        JsValue::from_str(id),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&job.name),
+        JsValue::from_str(model),
+        JsValue::from_str(&status),
+        JsValue::from_str(input_file),
+        JsValue::from_str(&now),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
+}
+
+pub async fn update_gemini_batch_job(
+    db: &D1Database,
+    tenant_id: &str,
+    job: &crate::integrations::gemini::BatchJob,
+) -> Result<()> {
+    let status = serde_json::to_string(&job.state).unwrap().replace("\"", "");
+    let completed_at = job.completion_time.clone();
+
+    db.prepare(
+        "UPDATE gemini_batch_jobs SET status = ?1, output_file = ?2, error_json = ?3, completed_at = ?4
+         WHERE tenant_id = ?5 AND job_name = ?6",
+    )
+    .bind(&[
+        JsValue::from_str(&status),
+        opt_str(&job.response_file),
+        opt_json(&job.error),
+        opt_str(&completed_at),
+        JsValue::from_str(tenant_id),
+        JsValue::from_str(&job.name),
+    ])?
+    .run()
+    .await?;
+
+    Ok(())
+}
+
+pub async fn list_pending_gemini_batch_jobs(
+    db: &D1Database,
+) -> Result<Vec<(String, String, String)>> {
+    #[derive(serde::Deserialize)]
+    struct JobRow {
+        tenant_id: String,
+        job_name: String,
+        model: String,
+    }
+
+    let result: D1Result = db
+        .prepare("SELECT tenant_id, job_name, model FROM gemini_batch_jobs WHERE status IN ('PENDING', 'RUNNING')")
+        .all()
+        .await?;
+
+    let rows: Vec<JobRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| (r.tenant_id, r.job_name, r.model)).collect())
+}
+
 pub async fn get_integration(
     db: &D1Database,
     tenant_id: &str,
@@ -4755,6 +5013,238 @@ pub async fn list_human_decisions_by_review(
         .collect())
 }
 
+// ── AIVCS: ci_check_run DB layer ─────────────────────────────────────────────
+
+pub async fn list_ci_check_runs_for_change_set(
+    d1: &worker::D1Database,
+    tenant_id: &str,
+    change_set_id: &str,
+    limit: u32,
+) -> Result<Vec<models::aivcs::CiCheckRun>> {
+    let sql = "SELECT id, change_set_id, name, status, conclusion, url, created_at \
+               FROM ci_check_run \
+               WHERE tenant_id = ?1 AND change_set_id = ?2 \
+               ORDER BY created_at DESC \
+               LIMIT ?3";
+    let stmt = d1
+        .prepare(sql)
+        .bind(&[tenant_id.into(), change_set_id.into(), limit.into()])?;
+    let result = stmt.all().await?;
+    let mut runs = Vec::new();
+    for row in result.results::<serde_json::Value>()? {
+        runs.push(models::aivcs::CiCheckRun {
+            id: row
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            change_set_id: row
+                .get("change_set_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: row
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            status: row
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            conclusion: row
+                .get("conclusion")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            url: row
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            created_at: row
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Ok(runs)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_ci_check_run(
+    db: &worker::D1Database,
+    tenant_id: &str,
+    id: &str,
+    change_set_id: &str,
+    name: &str,
+    status: &str,
+    conclusion: &Option<String>,
+    url: &Option<String>,
+) -> Result<()> {
+    let sql =
+        "INSERT INTO ci_check_run (tenant_id, id, change_set_id, name, status, conclusion, url) \
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+               ON CONFLICT(tenant_id, id) DO UPDATE SET \
+                   status = excluded.status, \
+                   conclusion = excluded.conclusion, \
+                   url = excluded.url";
+    db.prepare(sql)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(id),
+            JsValue::from_str(change_set_id),
+            JsValue::from_str(name),
+            JsValue::from_str(status),
+            opt_str(conclusion),
+            opt_str(url),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+// ── AIVCS: events_bronze DB layer ────────────────────────────────────────────
+
+pub async fn list_events_bronze(
+    d1: &worker::D1Database,
+    tenant_id: &str,
+    since: Option<&str>,
+    limit: u32,
+) -> Result<Vec<serde_json::Value>> {
+    let sql = if since.is_some() {
+        "SELECT id, run_id, thread_id, event_type, node_id, actor, payload, created_at \
+         FROM events_bronze \
+         WHERE tenant_id = ?1 AND created_at > ?2 \
+         ORDER BY created_at ASC \
+         LIMIT ?3"
+    } else {
+        "SELECT id, run_id, thread_id, event_type, node_id, actor, payload, created_at \
+         FROM events_bronze \
+         WHERE tenant_id = ?1 \
+         ORDER BY created_at ASC \
+         LIMIT ?2"
+    };
+
+    let stmt = if let Some(s) = since {
+        d1.prepare(sql)
+            .bind(&[tenant_id.into(), s.into(), limit.into()])?
+    } else {
+        d1.prepare(sql).bind(&[tenant_id.into(), limit.into()])?
+    };
+
+    let result = stmt.all().await?;
+    let mut events = Vec::new();
+    for row in result.results::<serde_json::Value>()? {
+        let mut evt = serde_json::Map::new();
+        evt.insert(
+            "id".into(),
+            row.get("id").unwrap_or(&serde_json::Value::Null).clone(),
+        );
+        evt.insert(
+            "run_id".into(),
+            row.get("run_id")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        evt.insert(
+            "thread_id".into(),
+            row.get("thread_id")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        evt.insert(
+            "event_type".into(),
+            row.get("event_type")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        evt.insert(
+            "node_id".into(),
+            row.get("node_id")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        evt.insert(
+            "actor".into(),
+            row.get("actor").unwrap_or(&serde_json::Value::Null).clone(),
+        );
+        if let Some(payload_str) = row.get("payload").and_then(|v| v.as_str()) {
+            if let Ok(payload_json) = serde_json::from_str::<serde_json::Value>(payload_str) {
+                evt.insert("payload".into(), payload_json);
+            }
+        }
+        evt.insert(
+            "created_at".into(),
+            row.get("created_at")
+                .unwrap_or(&serde_json::Value::Null)
+                .clone(),
+        );
+        events.push(serde_json::Value::Object(evt));
+    }
+    Ok(events)
+}
+
+// ── AIVCS: branch DB layer ───────────────────────────────────────────────────
+
+pub async fn list_branches_by_repo(
+    d1: &worker::D1Database,
+    tenant_id: &str,
+    repo: &str,
+    limit: u32,
+) -> Result<Vec<models::aivcs::Branch>> {
+    let sql = "SELECT id, repo, name, head_sha, agent_owner, status, created_at \
+               FROM branch \
+               WHERE tenant_id = ?1 AND repo = ?2 \
+               ORDER BY created_at DESC \
+               LIMIT ?3";
+    let stmt = d1
+        .prepare(sql)
+        .bind(&[tenant_id.into(), repo.into(), limit.into()])?;
+    let result = stmt.all().await?;
+    let mut branches = Vec::new();
+    for row in result.results::<serde_json::Value>()? {
+        branches.push(models::aivcs::Branch {
+            id: row
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            repo: row
+                .get("repo")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: row
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            head_sha: row
+                .get("head_sha")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            agent_owner: row
+                .get("agent_owner")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            status: row
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            created_at: row
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Ok(branches)
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5136,6 +5626,95 @@ mod tests {
         };
 
         assert!(build_entity_refs(&evt).is_none());
+    }
+
+    #[test]
+    fn aivcs_projection_from_run_extracts_change_set() {
+        let body = models::CreateRun {
+            repo: "stevedores-org/aivcs-api".into(),
+            trigger: Some("pull_request".into()),
+            actor: Some("codex".into()),
+            metadata: Some(serde_json::json!({
+                "aivcs": {
+                    "change_set": {
+                        "id": "11",
+                        "title": "Fix merge conflicts",
+                        "status": "ready_for_review",
+                        "source_branch": "codex/fmc-pr11",
+                        "target_branch": "main",
+                        "author": "codex",
+                        "summary": "Resolved PR conflicts",
+                        "labels": ["aivcs"]
+                    }
+                }
+            })),
+        };
+
+        let projection =
+            aivcs_projection_from_run("tenant-a", "run-1", &body, "2026-06-12T00:00:00.000Z")
+                .expect("projection");
+
+        assert_eq!(projection.tenant_id, "tenant-a");
+        assert_eq!(projection.id, "11");
+        assert_eq!(projection.repo, "stevedores-org/aivcs-api");
+        assert_eq!(projection.run_id, "run-1");
+        assert_eq!(projection.title, "Fix merge conflicts");
+        assert_eq!(projection.status, "ready_for_review");
+        assert_eq!(projection.source_branch.as_deref(), Some("codex/fmc-pr11"));
+        assert_eq!(projection.target_branch.as_deref(), Some("main"));
+        assert_eq!(projection.author.as_deref(), Some("codex"));
+        assert_eq!(projection.summary.as_deref(), Some("Resolved PR conflicts"));
+        assert_eq!(projection.created_at, "2026-06-12T00:00:00.000Z");
+        assert_eq!(projection.updated_at, "2026-06-12T00:00:00.000Z");
+        let change_set: serde_json::Value = serde_json::from_str(&projection.change_set).unwrap();
+        assert_eq!(change_set["labels"][0], "aivcs");
+    }
+
+    #[test]
+    fn aivcs_projection_from_run_scopes_numeric_pr_id_by_repo() {
+        let body = models::CreateRun {
+            repo: "stevedores-org/data-fabric".into(),
+            trigger: None,
+            actor: None,
+            metadata: Some(serde_json::json!({
+                "aivcs": {
+                    "change_set": {
+                        "number": 158,
+                        "state": "open",
+                        "head_ref": "feature/change-set",
+                        "base_ref": "main"
+                    }
+                }
+            })),
+        };
+
+        let projection =
+            aivcs_projection_from_run("tenant-a", "run-2", &body, "2026-06-12T00:00:00.000Z")
+                .expect("projection");
+
+        assert_eq!(projection.id, "stevedores-org/data-fabric#158");
+        assert_eq!(projection.title, "158");
+        assert_eq!(projection.status, "open");
+        assert_eq!(
+            projection.source_branch.as_deref(),
+            Some("feature/change-set")
+        );
+        assert_eq!(projection.target_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn aivcs_projection_from_run_ignores_runs_without_change_set() {
+        let body = models::CreateRun {
+            repo: "stevedores-org/data-fabric".into(),
+            trigger: None,
+            actor: None,
+            metadata: Some(serde_json::json!({ "ref": "main" })),
+        };
+
+        assert!(
+            aivcs_projection_from_run("tenant-a", "run-3", &body, "2026-06-12T00:00:00.000Z")
+                .is_none()
+        );
     }
 
     // ── Pagination helpers: list_policy_rules / list_agents ─────
@@ -5650,123 +6229,4 @@ mod tests {
             }
         }
     }
-}
-
-// ── AIVCS: ci_check_run DB layer ─────────────────────────────────────────────
-
-pub async fn list_ci_check_runs_for_change_set(
-    d1: &worker::D1Database,
-    tenant_id: &str,
-    change_set_id: &str,
-    limit: u32,
-) -> Result<Vec<models::aivcs::CiCheckRun>> {
-    let sql = "SELECT id, change_set_id, name, status, conclusion, url, created_at \
-               FROM ci_check_run \
-               WHERE tenant_id = ?1 AND change_set_id = ?2 \
-               ORDER BY created_at DESC \
-               LIMIT ?3";
-    let stmt = d1.prepare(sql)
-        .bind(&[
-            tenant_id.into(),
-            change_set_id.into(),
-            limit.into(),
-        ])?;
-    let result = stmt.all().await?;
-    let mut runs = Vec::new();
-    for row in result.results::<serde_json::Value>()? {
-        runs.push(models::aivcs::CiCheckRun {
-            id: row.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            change_set_id: row.get("change_set_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            name: row.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            status: row.get("status").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            conclusion: row.get("conclusion").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            url: row.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            created_at: row.get("created_at").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-        });
-    }
-    Ok(runs)
-}
-
-// ── AIVCS: events_bronze DB layer ────────────────────────────────────────────
-
-pub async fn list_events_bronze(
-    d1: &worker::D1Database,
-    tenant_id: &str,
-    since: Option<&str>,
-    limit: u32,
-) -> Result<Vec<serde_json::Value>> {
-    let sql = if since.is_some() {
-        "SELECT id, run_id, thread_id, event_type, node_id, actor, payload, created_at \
-         FROM events_bronze \
-         WHERE tenant_id = ?1 AND created_at > ?2 \
-         ORDER BY created_at ASC \
-         LIMIT ?3"
-    } else {
-        "SELECT id, run_id, thread_id, event_type, node_id, actor, payload, created_at \
-         FROM events_bronze \
-         WHERE tenant_id = ?1 \
-         ORDER BY created_at ASC \
-         LIMIT ?2"
-    };
-
-    let stmt = if let Some(s) = since {
-        d1.prepare(sql).bind(&[tenant_id.into(), s.into(), limit.into()])?
-    } else {
-        d1.prepare(sql).bind(&[tenant_id.into(), limit.into()])?
-    };
-
-    let result = stmt.all().await?;
-    let mut events = Vec::new();
-    for row in result.results::<serde_json::Value>()? {
-        let mut evt = serde_json::Map::new();
-        evt.insert("id".into(), row.get("id").unwrap_or(&serde_json::Value::Null).clone());
-        evt.insert("run_id".into(), row.get("run_id").unwrap_or(&serde_json::Value::Null).clone());
-        evt.insert("thread_id".into(), row.get("thread_id").unwrap_or(&serde_json::Value::Null).clone());
-        evt.insert("event_type".into(), row.get("event_type").unwrap_or(&serde_json::Value::Null).clone());
-        evt.insert("node_id".into(), row.get("node_id").unwrap_or(&serde_json::Value::Null).clone());
-        evt.insert("actor".into(), row.get("actor").unwrap_or(&serde_json::Value::Null).clone());
-        if let Some(payload_str) = row.get("payload").and_then(|v| v.as_str()) {
-            if let Ok(payload_json) = serde_json::from_str::<serde_json::Value>(payload_str) {
-                evt.insert("payload".into(), payload_json);
-            }
-        }
-        evt.insert("created_at".into(), row.get("created_at").unwrap_or(&serde_json::Value::Null).clone());
-        events.push(serde_json::Value::Object(evt));
-    }
-    Ok(events)
-}
-
-// ── AIVCS: branch DB layer ───────────────────────────────────────────────────
-
-pub async fn list_branches_by_repo(
-    d1: &worker::D1Database,
-    tenant_id: &str,
-    repo: &str,
-    limit: u32,
-) -> Result<Vec<models::aivcs::Branch>> {
-    let sql = "SELECT id, repo, name, head_sha, agent_owner, status, created_at \
-               FROM branch \
-               WHERE tenant_id = ?1 AND repo = ?2 \
-               ORDER BY created_at DESC \
-               LIMIT ?3";
-    let stmt = d1.prepare(sql)
-        .bind(&[
-            tenant_id.into(),
-            repo.into(),
-            limit.into(),
-        ])?;
-    let result = stmt.all().await?;
-    let mut branches = Vec::new();
-    for row in result.results::<serde_json::Value>()? {
-        branches.push(models::aivcs::Branch {
-            id: row.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            repo: row.get("repo").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            name: row.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            head_sha: row.get("head_sha").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            agent_owner: row.get("agent_owner").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            status: row.get("status").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            created_at: row.get("created_at").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-        });
-    }
-    Ok(branches)
 }

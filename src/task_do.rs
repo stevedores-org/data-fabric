@@ -254,9 +254,7 @@ impl DurableObject for TaskLeaseManager {
         let complete_task_id = path
             .strip_prefix("/complete/")
             .and_then(decode_task_id_segment);
-        let fail_task_id = path
-            .strip_prefix("/fail/")
-            .and_then(decode_task_id_segment);
+        let fail_task_id = path.strip_prefix("/fail/").and_then(decode_task_id_segment);
 
         match (method, path.as_str()) {
             (Method::Post, "/enqueue") => {
@@ -273,9 +271,7 @@ impl DurableObject for TaskLeaseManager {
                 // Backpressure: reject before the queue grows unbounded.
                 // Counter persists across requests so operators can see
                 // sustained pressure via a future /metrics endpoint.
-                if enqueue_decision(pending.len(), MAX_PENDING_TASKS)
-                    == EnqueueDecision::Reject
-                {
+                if enqueue_decision(pending.len(), MAX_PENDING_TASKS) == EnqueueDecision::Reject {
                     let prev_rejected: u64 = storage
                         .get(PENDING_REJECTED_TOTAL_KEY)
                         .await
@@ -283,7 +279,9 @@ impl DurableObject for TaskLeaseManager {
                         .flatten()
                         .unwrap_or(0);
                     let next_rejected = prev_rejected.saturating_add(1);
-                    storage.put(PENDING_REJECTED_TOTAL_KEY, next_rejected).await?;
+                    storage
+                        .put(PENDING_REJECTED_TOTAL_KEY, next_rejected)
+                        .await?;
 
                     let headers = Headers::new();
                     headers.set("retry-after", &ENQUEUE_RETRY_AFTER_SECS.to_string())?;
@@ -358,10 +356,10 @@ impl DurableObject for TaskLeaseManager {
                     let now = js_sys::Date::now() as u64;
                     let expires = now + (300 * 1000);
                     task.lease_expires_at = Some(
-                        js_sys::Date::new(&serde_wasm_bindgen::to_value(&expires).unwrap())
+                        js_sys::Date::new(&serde_wasm_bindgen::to_value(&expires).unwrap_or_default())
                             .to_iso_string()
                             .as_string()
-                            .unwrap(),
+                            .unwrap_or_default(),
                     );
 
                     active.insert(task.id.clone(), task.clone());
@@ -400,10 +398,10 @@ impl DurableObject for TaskLeaseManager {
                         let now = js_sys::Date::now() as u64;
                         let expires = now + (300 * 1000);
                         task.lease_expires_at = Some(
-                            js_sys::Date::new(&serde_wasm_bindgen::to_value(&expires).unwrap())
+                            js_sys::Date::new(&serde_wasm_bindgen::to_value(&expires).unwrap_or_default())
                                 .to_iso_string()
                                 .as_string()
-                                .unwrap(),
+                                .unwrap_or_default(),
                         );
 
                         storage.put("active", active).await?;
@@ -431,7 +429,7 @@ impl DurableObject for TaskLeaseManager {
                     task.status = "completed".to_string();
                     task.result = result;
                     task.completed_at =
-                        Some(js_sys::Date::new_0().to_iso_string().as_string().unwrap());
+                        Some(js_sys::Date::new_0().to_iso_string().as_string().unwrap_or_default());
 
                     let job_id = task.job_id.clone();
                     let task_tenant = task.tenant_id.clone();
@@ -516,7 +514,7 @@ impl DurableObject for TaskLeaseManager {
                         task.status = "failed".to_string();
                         task.result = Some(serde_json::json!({ "error": fail_req.error }));
                         task.completed_at =
-                            Some(js_sys::Date::new_0().to_iso_string().as_string().unwrap());
+                            Some(js_sys::Date::new_0().to_iso_string().as_string().unwrap_or_default());
                     }
                     storage.put("active", active).await?;
                     Response::from_json(&task)
@@ -572,7 +570,7 @@ impl DurableObject for TaskLeaseManager {
                     task.result =
                         Some(serde_json::json!({ "error": "lease expired and no retries left" }));
                     task.completed_at =
-                        Some(js_sys::Date::new_0().to_iso_string().as_string().unwrap());
+                        Some(js_sys::Date::new_0().to_iso_string().as_string().unwrap_or_default());
                 }
             }
         }

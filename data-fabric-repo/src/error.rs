@@ -17,7 +17,7 @@
 //! | [`NotFound`]  | 404  | no         | unknown run id, missing R2 key      |
 //! | [`Conflict`]  | 409  | no         | unique-key collision, lease taken   |
 //! | [`Internal`]  | 500  | no         | unexpected; bug or invariant break  |
-//! | [`Transient`] | 503  | **yes**   | D1 busy, R2 timeout, internal_error |
+//! | [`Transient`] | 503  | **yes**   | D1 busy, R2 timeout, `internal_error` |
 //!
 //! `Internal` and `Transient` are deliberately separate: a planner bug that
 //! produced bad SQL is *not* worth retrying, even though both surface as 5xx
@@ -107,8 +107,7 @@ impl From<worker::Error> for Error {
         match &e {
             // Cloudflare-coded transients. These come back with a stable
             // `code` from the runtime; we trust the classification.
-            W::InternalError(msg) => Error::Transient(msg.clone()),
-            W::RateLimitExceeded(msg) => Error::Transient(msg.clone()),
+            W::InternalError(msg) | W::RateLimitExceeded(msg) => Error::Transient(msg.clone()),
             W::DailyLimitExceeded(msg) => Error::Permanent(msg.clone()),
 
             // For BindingError we're sure: the worker is misconfigured.
@@ -158,7 +157,7 @@ pub(crate) fn is_transient_message(msg: &str) -> bool {
 ///
 /// D1's `first()` returns `Ok(None)` for missing rows so callers don't hit
 /// this path for the common case. We only end up here when the runtime
-/// surfaces a NotFound through an error rather than an `Option`.
+/// surfaces a `NotFound` through an error rather than an `Option`.
 pub(crate) fn is_not_found_message(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("not found") || m.contains("no such") || m.contains("404")

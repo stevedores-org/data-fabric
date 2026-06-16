@@ -10,7 +10,7 @@
 //! - construction takes a borrowed `&D1Database` so we don't double-own the
 //!   binding the worker request handler already holds;
 //! - the SQL strings (`select_sql`, `upsert_sql`, `delete_sql`) are passed
-//!   in by the caller, so each domain repo (RunsRepo, TasksRepo, …) is a
+//!   in by the caller, so each domain repo (`RunsRepo`, `TasksRepo`, …) is a
 //!   thin wrapper that supplies its own table-specific SQL + row decoder;
 //! - errors round-trip through [`Error::from(worker::Error)`] so the retry
 //!   helper can classify D1 busy / locked failures.
@@ -87,7 +87,7 @@ impl<'a, V> D1Repository<'a, V> {
 /// `src/db.rs` keys rows. We carry both as borrowed `&str` to avoid forcing
 /// a `String` allocation per call.
 #[async_trait(?Send)]
-impl<'a, V> Repository for D1Repository<'a, V>
+impl<V> Repository for D1Repository<'_, V>
 where
     V: Into<String>,
 {
@@ -99,10 +99,7 @@ where
         let stmt = self
             .db
             .prepare(self.select_sql)
-            .bind(&[
-                JsValue::from_str(tenant_id),
-                JsValue::from_str(id),
-            ])
+            .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])
             .map_err(Error::from)?;
         let res = stmt.all().await.map_err(Error::from)?;
         (self.decode)(&res)
@@ -129,10 +126,7 @@ where
         let (tenant_id, id) = key;
         self.db
             .prepare(self.delete_sql)
-            .bind(&[
-                JsValue::from_str(tenant_id),
-                JsValue::from_str(id),
-            ])
+            .bind(&[JsValue::from_str(tenant_id), JsValue::from_str(id)])
             .map_err(Error::from)?
             .run()
             .await

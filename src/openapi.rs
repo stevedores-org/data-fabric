@@ -1,116 +1,3 @@
-#[cfg(test)]
-mod tests {
-    use super::get_openapi_spec;
-
-    fn parse_spec() -> serde_json::Value {
-        serde_json::from_str(get_openapi_spec()).expect("openapi spec must be valid JSON")
-    }
-
-    /// The POST handler for `/v1/policies/check` returns 9 distinct fields.
-    /// The OpenAPI response schema must enumerate every one with the right
-    /// JSON type, or generated clients will silently strip data.
-    #[test]
-    fn openapi_documents_all_nine_policy_check_response_fields() {
-        let spec = parse_spec();
-        let props = &spec["paths"]["/v1/policies/check"]["post"]["responses"]["200"]["content"]
-            ["application/json"]["schema"]["properties"];
-        let expected = [
-            ("id", "string"),
-            ("action", "string"),
-            ("decision", "string"),
-            ("reason", "string"),
-            ("risk_level", "string"),
-            ("policy_version", "string"),
-            ("matched_rule", "string"),
-            ("escalation_id", "string"),
-            ("rate_limited", "boolean"),
-        ];
-        for (name, ty) in expected {
-            assert_eq!(
-                props[name]["type"].as_str(),
-                Some(ty),
-                "/v1/policies/check response must document field `{name}` as type `{ty}`",
-            );
-        }
-        let actual_count = props.as_object().map(|o| o.len()).unwrap_or(0);
-        assert_eq!(
-            actual_count, 9,
-            "/v1/policies/check response must document exactly 9 fields, got {actual_count}",
-        );
-    }
-
-    /// `/v1/checkpoints` POST response: `{id, thread_id, state_r2_key}`. The
-    /// previous schema documented `{id, status}`, which is wrong and breaks
-    /// any client that relies on `state_r2_key` for R2 recovery.
-    #[test]
-    fn openapi_documents_checkpoint_post_response_shape() {
-        let spec = parse_spec();
-        let props = &spec["paths"]["/v1/checkpoints"]["post"]["responses"]["200"]["content"]
-            ["application/json"]["schema"]["properties"];
-        for required in ["id", "thread_id", "state_r2_key"] {
-            assert_eq!(
-                props[required]["type"].as_str(),
-                Some("string"),
-                "/v1/checkpoints response must document field `{required}` as string",
-            );
-        }
-        assert!(
-            props["status"].is_null(),
-            "/v1/checkpoints response must NOT document a `status` field (legacy drift)",
-        );
-        let required = &spec["paths"]["/v1/checkpoints"]["post"]["responses"]["200"]["content"]
-            ["application/json"]["schema"]["required"];
-        let required_set: Vec<&str> = required
-            .as_array()
-            .expect("required must be an array")
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(required_set.contains(&"state_r2_key"));
-        assert!(required_set.contains(&"thread_id"));
-        assert!(required_set.contains(&"id"));
-    }
-
-    /// `/mcp/task/next` is documented under POST. GET is documented as
-    /// deprecated so generated clients warn / log. Confirms HTTP method
-    /// semantics are correct end-to-end (route + spec).
-    #[test]
-    fn openapi_documents_mcp_task_next_as_post_with_deprecated_get() {
-        let spec = parse_spec();
-        let path = &spec["paths"]["/mcp/task/next"];
-        assert!(
-            path["post"].is_object(),
-            "/mcp/task/next must be documented as POST (stateful claim operation)"
-        );
-        // GET kept as a deprecated compatibility shim.
-        let get_op = &path["get"];
-        assert!(
-            get_op.is_object(),
-            "/mcp/task/next GET must remain documented as a deprecation shim"
-        );
-        assert_eq!(
-            get_op["deprecated"].as_bool(),
-            Some(true),
-            "/mcp/task/next GET must be marked deprecated"
-        );
-        assert!(
-            get_op["responses"]["405"].is_object(),
-            "/mcp/task/next GET must document its 405 deprecation response"
-        );
-        // POST must document the required agent_id query parameter so
-        // generated clients carry it forward.
-        let params = path["post"]["parameters"]
-            .as_array()
-            .expect("POST must declare query parameters");
-        let agent_id_param = params
-            .iter()
-            .find(|p| p["name"].as_str() == Some("agent_id"))
-            .expect("POST /mcp/task/next must document `agent_id` parameter");
-        assert_eq!(agent_id_param["required"].as_bool(), Some(true));
-        assert_eq!(agent_id_param["in"].as_str(), Some("query"));
-    }
-}
-
 pub fn get_openapi_spec() -> &'static str {
     r#"{
   "openapi": "3.1.0",
@@ -255,6 +142,50 @@ pub fn get_openapi_spec() -> &'static str {
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/pull-requests/{id}": {
+      "get": {
+        "summary": "Get AIVCS Pull Request",
+        "description": "Returns the AIVCS review queue projection sourced from runs.metadata.aivcs.change_set.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "AIVCS pull request projection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["id", "repo", "run_id", "title", "status", "change_set", "created_at", "updated_at"],
+                  "properties": {
+                    "id": { "type": "string" },
+                    "repo": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "status": { "type": "string" },
+                    "source_branch": { "type": "string" },
+                    "target_branch": { "type": "string" },
+                    "author": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "change_set": { "type": "object" },
+                    "created_at": { "type": "string", "format": "date-time" },
+                    "updated_at": { "type": "string", "format": "date-time" }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pull request projection not found"
           }
         }
       }
@@ -564,4 +495,117 @@ pub fn get_openapi_spec() -> &'static str {
     }
   }
 }"#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_openapi_spec;
+
+    fn parse_spec() -> serde_json::Value {
+        serde_json::from_str(get_openapi_spec()).expect("openapi spec must be valid JSON")
+    }
+
+    /// The POST handler for `/v1/policies/check` returns 9 distinct fields.
+    /// The OpenAPI response schema must enumerate every one with the right
+    /// JSON type, or generated clients will silently strip data.
+    #[test]
+    fn openapi_documents_all_nine_policy_check_response_fields() {
+        let spec = parse_spec();
+        let props = &spec["paths"]["/v1/policies/check"]["post"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["properties"];
+        let expected = [
+            ("id", "string"),
+            ("action", "string"),
+            ("decision", "string"),
+            ("reason", "string"),
+            ("risk_level", "string"),
+            ("policy_version", "string"),
+            ("matched_rule", "string"),
+            ("escalation_id", "string"),
+            ("rate_limited", "boolean"),
+        ];
+        for (name, ty) in expected {
+            assert_eq!(
+                props[name]["type"].as_str(),
+                Some(ty),
+                "/v1/policies/check response must document field `{name}` as type `{ty}`",
+            );
+        }
+        let actual_count = props.as_object().map(|o| o.len()).unwrap_or(0);
+        assert_eq!(
+            actual_count, 9,
+            "/v1/policies/check response must document exactly 9 fields, got {actual_count}",
+        );
+    }
+
+    /// `/v1/checkpoints` POST response: `{id, thread_id, state_r2_key}`. The
+    /// previous schema documented `{id, status}`, which is wrong and breaks
+    /// any client that relies on `state_r2_key` for R2 recovery.
+    #[test]
+    fn openapi_documents_checkpoint_post_response_shape() {
+        let spec = parse_spec();
+        let props = &spec["paths"]["/v1/checkpoints"]["post"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["properties"];
+        for required in ["id", "thread_id", "state_r2_key"] {
+            assert_eq!(
+                props[required]["type"].as_str(),
+                Some("string"),
+                "/v1/checkpoints response must document field `{required}` as string",
+            );
+        }
+        assert!(
+            props["status"].is_null(),
+            "/v1/checkpoints response must NOT document a `status` field (legacy drift)",
+        );
+        let required = &spec["paths"]["/v1/checkpoints"]["post"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["required"];
+        let required_set: Vec<&str> = required
+            .as_array()
+            .expect("required must be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required_set.contains(&"state_r2_key"));
+        assert!(required_set.contains(&"thread_id"));
+        assert!(required_set.contains(&"id"));
+    }
+
+    /// `/mcp/task/next` is documented under POST. GET is documented as
+    /// deprecated so generated clients warn / log. Confirms HTTP method
+    /// semantics are correct end-to-end (route + spec).
+    #[test]
+    fn openapi_documents_mcp_task_next_as_post_with_deprecated_get() {
+        let spec = parse_spec();
+        let path = &spec["paths"]["/mcp/task/next"];
+        assert!(
+            path["post"].is_object(),
+            "/mcp/task/next must be documented as POST (stateful claim operation)"
+        );
+        // GET kept as a deprecated compatibility shim.
+        let get_op = &path["get"];
+        assert!(
+            get_op.is_object(),
+            "/mcp/task/next GET must remain documented as a deprecation shim"
+        );
+        assert_eq!(
+            get_op["deprecated"].as_bool(),
+            Some(true),
+            "/mcp/task/next GET must be marked deprecated"
+        );
+        assert!(
+            get_op["responses"]["405"].is_object(),
+            "/mcp/task/next GET must document its 405 deprecation response"
+        );
+        // POST must document the required agent_id query parameter so
+        // generated clients carry it forward.
+        let params = path["post"]["parameters"]
+            .as_array()
+            .expect("POST must declare query parameters");
+        let agent_id_param = params
+            .iter()
+            .find(|p| p["name"].as_str() == Some("agent_id"))
+            .expect("POST /mcp/task/next must document `agent_id` parameter");
+        assert_eq!(agent_id_param["required"].as_bool(), Some(true));
+        assert_eq!(agent_id_param["in"].as_str(), Some("query"));
+    }
 }
