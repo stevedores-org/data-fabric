@@ -10,6 +10,6 @@ on:
 jobs:
   scan:
     name: Dependency Vulnerability Scan
-    uses: lornu-ai/ciso-agent/.github/workflows/dep-scan.yml@develop
+    uses: stevedores-org/ciso-agent/.github/workflows/dep-scan.yml@develop
     secrets:
       CISO_AGENT_PAT: ${{ secrets.CISO_AGENT_PAT }}
