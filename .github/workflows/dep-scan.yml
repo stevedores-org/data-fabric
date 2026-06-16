@@ -1,0 +1,15 @@
+name: dependency-scan
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+
+jobs:
+  scan:
+    name: Dependency Vulnerability Scan
+    uses: lornu-ai/ciso-agent/.github/workflows/dep-scan.yml@develop
+    secrets:
+      CISO_AGENT_PAT: ${{ secrets.CISO_AGENT_PAT }}
