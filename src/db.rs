@@ -121,6 +121,24 @@ const SQL_LIST_FILE_ANCHORS_FOR_THREAD: &str =
     "SELECT id, thread_id, file_path, start_line, end_line, side \
      FROM file_anchor WHERE tenant_id = ?1 AND thread_id = ?2 \
      ORDER BY file_path ASC, start_line ASC, id ASC LIMIT ?3";
+
+// Issue #159 — pr_id-keyed reads. `pr_id` is the AIVCS pull-request id, i.e. the
+// `change_set` id (the native PR-equivalent); `review_thread.change_set_id` is the
+// linkage. See migration 0021_aivcs_review_projections_by_pr.sql.
+const SQL_LIST_REVIEW_THREADS_FOR_CHANGE_SET: &str =
+    "SELECT id, review_id, change_set_id, status, created_at, resolved_at \
+     FROM review_thread WHERE tenant_id = ?1 AND change_set_id = ?2 \
+     ORDER BY created_at ASC LIMIT ?3";
+
+// Every anchor across a pull request's review threads: join file_anchor →
+// review_thread on (tenant_id, thread_id) and filter by change_set_id.
+const SQL_LIST_FILE_ANCHORS_FOR_CHANGE_SET: &str =
+    "SELECT fa.id, fa.thread_id, fa.file_path, fa.start_line, fa.end_line, fa.side \
+     FROM file_anchor fa \
+     JOIN review_thread rt ON rt.tenant_id = fa.tenant_id AND rt.id = fa.thread_id \
+     WHERE fa.tenant_id = ?1 AND rt.change_set_id = ?2 \
+     ORDER BY fa.file_path ASC, fa.start_line ASC, fa.id ASC LIMIT ?3";
+
 /// Issue #148 / AIVCS slice 3 — INSERT into the `human_decision` projection.
 ///
 /// `tenant_id` is the first column (and bound to ?1) so cross-tenant
@@ -3311,6 +3329,55 @@ pub async fn list_file_anchors_for_thread(
         .bind(&[
             JsValue::from_str(tenant_id),
             JsValue::from_str(thread_id),
+            JsValue::from(limit),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<FileAnchorRow> = result.results()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.into_file_anchor())
+        .collect())
+}
+
+/// List review threads for a pull request — issue #159. `pr_id` is the
+/// `change_set` id (the native PR-equivalent — see migration 0015), linked via
+/// `review_thread.change_set_id`.
+pub async fn list_review_threads_for_change_set(
+    db: &D1Database,
+    tenant_id: &str,
+    change_set_id: &str,
+    limit: u32,
+) -> Result<Vec<models::aivcs_review::ReviewThread>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_REVIEW_THREADS_FOR_CHANGE_SET)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(change_set_id),
+            JsValue::from(limit),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<ReviewThreadRow> = result.results()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.into_review_thread())
+        .collect())
+}
+
+/// List every file anchor across a pull request's review threads — issue #159.
+/// Joins `file_anchor` → `review_thread` and filters by `change_set_id` (pr_id).
+pub async fn list_file_anchors_for_change_set(
+    db: &D1Database,
+    tenant_id: &str,
+    change_set_id: &str,
+    limit: u32,
+) -> Result<Vec<models::aivcs_review::FileAnchor>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_FILE_ANCHORS_FOR_CHANGE_SET)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(change_set_id),
             JsValue::from(limit),
         ])?
         .all()
