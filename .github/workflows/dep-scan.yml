@@ -10,6 +10,111 @@ on:
 jobs:
   scan:
     name: Dependency Vulnerability Scan
-    uses: stevedores-org/ciso-agent/.github/workflows/dep-scan.yml@develop
-    secrets:
-      CISO_AGENT_PAT: ${{ secrets.CISO_AGENT_PAT }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Checkout ciso-agent policies
+        uses: actions/checkout@v4
+        with:
+          repository: stevedores-org/ciso-agent
+          path: ciso-agent
+          token: ${{ secrets.CISO_AGENT_PAT || github.token }}
+
+      # ── Set up ecosystem tools ──────────────────────────────────────────────
+
+      - name: Check for Rust
+        id: check-rust
+        run: |
+          if [ -f "Cargo.toml" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install cargo-audit
+        if: steps.check-rust.outputs.exists == 'true'
+        run: |
+          CARGO_AUDIT_VER="v0.20.0"
+          curl -sSfL "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2F${CARGO_AUDIT_VER}/cargo-audit-x86_64-unknown-linux-gnu-${CARGO_AUDIT_VER}.tgz" -o /tmp/cargo-audit.tgz
+          tar -xzf /tmp/cargo-audit.tgz -C /tmp
+          sudo mv /tmp/cargo-audit /usr/local/bin/
+          cargo audit --version
+
+      - name: Check for JS/Bun
+        id: check-js
+        run: |
+          if [ -f "package.json" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Bun
+        if: steps.check-js.outputs.exists == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Check for Python
+        id: check-py
+        run: |
+          if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ] || [ -f "setup.py" ] || [ -f "Pipfile" ] || [ -f "poetry.lock" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Python
+        if: steps.check-py.outputs.exists == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pip-audit
+        if: steps.check-py.outputs.exists == 'true'
+        run: pip install pip-audit
+
+      - name: Check for Go
+        id: check-go
+        run: |
+          if [ -f "go.mod" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Go
+        if: steps.check-go.outputs.exists == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install govulncheck
+        if: steps.check-go.outputs.exists == 'true'
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      # ── Run audit script ───────────────────────────────────────────────────
+
+      - name: Run CISO dependency scanner
+        run: |
+          python3 ciso-agent/scripts/dep-scan.py \
+            --ignores-toml ciso-agent/policy/advisory-ignores.toml \
+            --output-report dep-scan-report.md
+
+      - name: Publish step summary
+        if: always()
+        run: |
+          if [ -f "dep-scan-report.md" ]; then
+            cat dep-scan-report.md >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Post PR comment
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f "dep-scan-report.md" ]; then
+            gh pr comment ${{ github.event.pull_request.number }} --body-file dep-scan-report.md
+          fi
