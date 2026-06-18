@@ -2416,6 +2416,63 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Response::error("missing required query parameter: pr_id", 400)
             }
         })
+        // ── AIVCS: CMDB + incident routes (migration 0022) ───────
+        .get_async("/v1/cmdb/properties", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let d1 = ctx.env.d1("DB")?;
+            let list = db::list_cmdb_properties(&d1, &tenant_ctx.tenant_id, 500).await?;
+            Response::from_json(&serde_json::json!({ "properties": list }))
+        })
+        .get_async("/v1/cmdb/endpoints", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req
+                .url()
+                .map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
+            // Sentinel reads enabled endpoints by default; `?enabled=false` lists all.
+            let only_enabled = params.get("enabled").map(|s| s.as_ref()) != Some("false");
+            let d1 = ctx.env.d1("DB")?;
+            let list =
+                db::list_cmdb_endpoints(&d1, &tenant_ctx.tenant_id, only_enabled, 1000).await?;
+            Response::from_json(&serde_json::json!({ "endpoints": list }))
+        })
+        .get_async("/v1/incidents", |req, ctx| async move {
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let url = req
+                .url()
+                .map_err(|_| Error::RustError("invalid url".into()))?;
+            let params = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
+            let status = params
+                .get("status")
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let d1 = ctx.env.d1("DB")?;
+            let list = db::list_incidents(&d1, &tenant_ctx.tenant_id, &status, 200).await?;
+            Response::from_json(&serde_json::json!({ "incidents": list }))
+        })
+        .post_async("/v1/incidents", |mut req, ctx| async move {
+            let body: models::CreateIncident = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let d1 = ctx.env.d1("DB")?;
+            let id = generate_id()?;
+            db::insert_incident(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
+            Response::from_json(&models::Created {
+                id,
+                status: "created".into(),
+            })
+        })
+        .patch_async("/v1/incidents/:id", |mut req, ctx| async move {
+            let body: models::UpdateIncident = req.json().await?;
+            let tenant_ctx = tenant::tenant_from_request(&req)?;
+            let id = ctx.param("id").map(|s| s.to_string()).unwrap_or_default();
+            let d1 = ctx.env.d1("DB")?;
+            db::update_incident(&d1, &tenant_ctx.tenant_id, &id, &body).await?;
+            Response::from_json(&serde_json::json!({ "id": id, "status": "updated" }))
+        })
         .get_async("/v1/human-decisions", |req, ctx| async move {
             let tenant_ctx = tenant::tenant_from_request(&req)?;
             let url = req
