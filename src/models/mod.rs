@@ -15,10 +15,14 @@ mod telemetry;
 // Issue #148 / AIVCS slice 3 — human decision projection.
 mod aivcs_human_decision;
 
+// AIVCS operational concepts — CMDB + incident (migration 0022).
+mod uptime;
+
 pub use aivcs_human_decision::*;
 pub use plays::*;
 pub use reasoning::*;
 pub use telemetry::*;
+pub use uptime::*;
 #[allow(dead_code)]
 mod relationships;
 mod requests;

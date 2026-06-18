@@ -3389,6 +3389,258 @@ pub async fn list_file_anchors_for_change_set(
         .collect())
 }
 
+// ── AIVCS CMDB + incident (migration 0022) ──────────────────────
+
+fn opt_i64(v: Option<i64>) -> JsValue {
+    match v {
+        Some(n) => JsValue::from_f64(n as f64),
+        None => JsValue::NULL,
+    }
+}
+
+const SQL_LIST_CMDB_PROPERTIES: &str =
+    "SELECT id, domain, name, brand_group, criticality, owner, enabled, source, \
+            updated_by, created_at, updated_at \
+     FROM cmdb_property WHERE tenant_id = ?1 ORDER BY domain ASC LIMIT ?2";
+
+const SQL_LIST_CMDB_ENDPOINTS: &str =
+    "SELECT id, property_id, url, method, check_type, expected_status, latency_slo_ms, \
+            enabled, source, updated_by, created_at, updated_at \
+     FROM cmdb_endpoint WHERE tenant_id = ?1 AND (?2 = 0 OR enabled = 1) \
+     ORDER BY property_id ASC, url ASC LIMIT ?3";
+
+const SQL_INSERT_INCIDENT: &str = "INSERT INTO incident \
+       (tenant_id, id, property_id, endpoint_id, dedup_key, type, severity, status, \
+        signal, detector, github_issue_number, github_issue_url) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10, ?11)";
+
+const SQL_LIST_INCIDENTS: &str =
+    "SELECT id, property_id, endpoint_id, dedup_key, type, severity, status, signal, \
+            detector, github_issue_number, github_issue_url, detected_at, resolved_at, \
+            mttr_seconds \
+     FROM incident WHERE tenant_id = ?1 AND (?2 = '' OR status = ?2) \
+     ORDER BY detected_at DESC LIMIT ?3";
+
+const SQL_UPDATE_INCIDENT: &str = "UPDATE incident SET \
+       status = COALESCE(?3, status), \
+       severity = COALESCE(?4, severity), \
+       signal = COALESCE(?5, signal), \
+       github_issue_number = COALESCE(?6, github_issue_number), \
+       github_issue_url = COALESCE(?7, github_issue_url), \
+       resolved_at = COALESCE(?8, resolved_at), \
+       mttr_seconds = COALESCE(?9, mttr_seconds) \
+     WHERE tenant_id = ?1 AND id = ?2";
+
+pub async fn list_cmdb_properties(
+    db: &D1Database,
+    tenant_id: &str,
+    limit: u32,
+) -> Result<Vec<models::CmdbProperty>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_CMDB_PROPERTIES)
+        .bind(&[JsValue::from_str(tenant_id), JsValue::from(limit)])?
+        .all()
+        .await?;
+    let rows: Vec<CmdbPropertyRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_property()).collect())
+}
+
+/// List CMDB endpoints. When `only_enabled` is true, returns enabled rows only
+/// (the sentinel's target list).
+pub async fn list_cmdb_endpoints(
+    db: &D1Database,
+    tenant_id: &str,
+    only_enabled: bool,
+    limit: u32,
+) -> Result<Vec<models::CmdbEndpoint>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_CMDB_ENDPOINTS)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from(if only_enabled { 1u32 } else { 0u32 }),
+            JsValue::from(limit),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<CmdbEndpointRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_endpoint()).collect())
+}
+
+pub async fn insert_incident(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::CreateIncident,
+) -> Result<()> {
+    db.prepare(SQL_INSERT_INCIDENT)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(id),
+            opt_str(&body.property_id),
+            opt_str(&body.endpoint_id),
+            JsValue::from_str(&body.dedup_key),
+            JsValue::from_str(&body.kind),
+            JsValue::from_str(&body.severity),
+            opt_str(&body.signal),
+            JsValue::from_str(&body.detector),
+            opt_i64(body.github_issue_number),
+            opt_str(&body.github_issue_url),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+pub async fn list_incidents(
+    db: &D1Database,
+    tenant_id: &str,
+    status: &str,
+    limit: u32,
+) -> Result<Vec<models::Incident>> {
+    let result: D1Result = db
+        .prepare(SQL_LIST_INCIDENTS)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(status),
+            JsValue::from(limit),
+        ])?
+        .all()
+        .await?;
+    let rows: Vec<IncidentRow> = result.results()?;
+    Ok(rows.into_iter().map(|r| r.into_incident()).collect())
+}
+
+pub async fn update_incident(
+    db: &D1Database,
+    tenant_id: &str,
+    id: &str,
+    body: &models::UpdateIncident,
+) -> Result<()> {
+    db.prepare(SQL_UPDATE_INCIDENT)
+        .bind(&[
+            JsValue::from_str(tenant_id),
+            JsValue::from_str(id),
+            opt_str(&body.status),
+            opt_str(&body.severity),
+            opt_str(&body.signal),
+            opt_i64(body.github_issue_number),
+            opt_str(&body.github_issue_url),
+            opt_str(&body.resolved_at),
+            opt_i64(body.mttr_seconds),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct CmdbPropertyRow {
+    id: String,
+    domain: String,
+    name: Option<String>,
+    brand_group: Option<String>,
+    criticality: String,
+    owner: Option<String>,
+    enabled: i64,
+    source: String,
+    updated_by: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl CmdbPropertyRow {
+    fn into_property(self) -> models::CmdbProperty {
+        models::CmdbProperty {
+            id: self.id,
+            domain: self.domain,
+            name: self.name,
+            brand_group: self.brand_group,
+            criticality: self.criticality,
+            owner: self.owner,
+            enabled: self.enabled != 0,
+            source: self.source,
+            updated_by: self.updated_by,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CmdbEndpointRow {
+    id: String,
+    property_id: String,
+    url: String,
+    method: String,
+    check_type: String,
+    expected_status: i64,
+    latency_slo_ms: Option<i64>,
+    enabled: i64,
+    source: String,
+    updated_by: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl CmdbEndpointRow {
+    fn into_endpoint(self) -> models::CmdbEndpoint {
+        models::CmdbEndpoint {
+            id: self.id,
+            property_id: self.property_id,
+            url: self.url,
+            method: self.method,
+            check_type: self.check_type,
+            expected_status: self.expected_status,
+            latency_slo_ms: self.latency_slo_ms,
+            enabled: self.enabled != 0,
+            source: self.source,
+            updated_by: self.updated_by,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct IncidentRow {
+    id: String,
+    property_id: Option<String>,
+    endpoint_id: Option<String>,
+    dedup_key: String,
+    #[serde(rename = "type")]
+    kind: String,
+    severity: String,
+    status: String,
+    signal: Option<String>,
+    detector: String,
+    github_issue_number: Option<i64>,
+    github_issue_url: Option<String>,
+    detected_at: String,
+    resolved_at: Option<String>,
+    mttr_seconds: Option<i64>,
+}
+
+impl IncidentRow {
+    fn into_incident(self) -> models::Incident {
+        models::Incident {
+            id: self.id,
+            property_id: self.property_id,
+            endpoint_id: self.endpoint_id,
+            dedup_key: self.dedup_key,
+            kind: self.kind,
+            severity: self.severity,
+            status: self.status,
+            signal: self.signal,
+            detector: self.detector,
+            github_issue_number: self.github_issue_number,
+            github_issue_url: self.github_issue_url,
+            detected_at: self.detected_at,
+            resolved_at: self.resolved_at,
+            mttr_seconds: self.mttr_seconds,
+        }
+    }
+}
+
 // ── Internal row types ──────────────────────────────────────────
 
 #[allow(dead_code)]
