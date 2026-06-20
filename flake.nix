@@ -2,10 +2,10 @@
   description = "data-fabric — Cloudflare-native data fabric for autonomous AI agent builders";
 
   nixConfig = {
-    extra-substituters = [ "https://nix-cache.stevedores.org/" ];
-    extra-trusted-substituters = [ "https://nix-cache.stevedores.org/" ];
+    extra-substituters = [ "https://nix-cache.lornu.ai" ];
+    extra-trusted-substituters = [ "https://nix-cache.lornu.ai" ];
     extra-trusted-public-keys = [
-      "stevedores-1:ZEtb+wHYNR/LDmMDhF3/EpRZDNma8exY2b1TGZ6uS2A="
+      "lornu-1:FSWe0oOoYoYzbDU3XsZOoUz6LYouAKynidEOop1Q8yc="
     ];
   };
 
