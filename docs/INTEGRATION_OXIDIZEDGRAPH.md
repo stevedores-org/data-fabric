@@ -523,5 +523,5 @@ GET /health
 
 - [data-fabric Architecture](./ARCHITECTURE.md)
 - [data-fabric Local Deployment](./LOCAL_DEPLOYMENT.md)
-- [oxidizedgraph Documentation](https://github.com/stevedores-org/oxidizedgraph)
+- [oxidizedgraph Documentation](aivcs://stevedores-org/oxidizedgraph)
 - [Cloudflare Workers](https://developers.cloudflare.com/workers/)

@@ -4,7 +4,7 @@ Closes #52. Sibling to [SOURCE_INVENTORY_MATRIX](SOURCE_INVENTORY_MATRIX.md) —
 
 ## Scope
 
-WS1A is the per-module decision layer of WS1. Parent: [#42 WS1: Source Extraction](https://github.com/stevedores-org/data-fabric/issues/42) (closed). Source crate: `lornu.ai/crates/data-fabric`. Target: this repo (Cloudflare Workers Rust + D1 + Durable Objects + R2 + Vectorize + KV + Queues).
+WS1A is the per-module decision layer of WS1. Parent: [#42 WS1: Source Extraction](aivcs://stevedores-org/data-fabric/issues/42) (closed). Source crate: `lornu.ai/crates/data-fabric`. Target: this repo (Cloudflare Workers Rust + D1 + Durable Objects + R2 + Vectorize + KV + Queues).
 
 The four missing deliverables this doc addresses:
 
@@ -239,7 +239,7 @@ The upstream `middleware/` directory contains only `auth.rs`. The four other mid
 
 ## Acceptance-criteria check
 
-Mapped against [issue #52](https://github.com/stevedores-org/data-fabric/issues/52):
+Mapped against [issue #52](aivcs://stevedores-org/data-fabric/issues/52):
 
 - [x] Every module in `crates/data-fabric` is inventoried with purpose, inputs, outputs, dependencies — see [SOURCE_INVENTORY_MATRIX §1](SOURCE_INVENTORY_MATRIX.md#1-core-crate-module-inventory-complete).
 - [x] Migration decisions are documented with explicit rationale — §2 above, 24 modules classified Keep / Adapt / Replace / Drop.

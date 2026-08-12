@@ -35,8 +35,8 @@ FROM oven/bun:1.2-bookworm
 # Add container labels (OCI standard)
 LABEL org.opencontainers.image.title="data-fabric"
 LABEL org.opencontainers.image.description="Cloudflare-native data fabric for autonomous AI agent orchestration"
-LABEL org.opencontainers.image.url="https://github.com/stevedores-org/data-fabric"
-LABEL org.opencontainers.image.source="https://github.com/stevedores-org/data-fabric"
+LABEL org.opencontainers.image.url="aivcs://stevedores-org/data-fabric"
+LABEL org.opencontainers.image.source="aivcs://stevedores-org/data-fabric"
 LABEL org.opencontainers.image.version="0.1.0"
 
 WORKDIR /app

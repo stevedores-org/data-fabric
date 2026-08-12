@@ -227,19 +227,19 @@ Lornu AI uses a **hub-and-spoke architecture** where application source code liv
 |------------|---------|----------|--------|
 | logistics-supervisor-api | Container packaging platform | AWS ECR | ✅ Active |
 | financial-agent-spoke | Intelligent email response | AWS ECR | ✅ Active |
-| [ai-agents-core](https://github.com/lornu-ai/ai-agents-core) | Centralized agent framework | AWS ECR | ✅ Active |
-| [lornu-crawler](https://github.com/lornu-ai/lornu-crawler) | Site crawler & screenshotter | GCP Artifact Registry | ✅ Active |
+| [ai-agents-core](aivcs://lornu-ai/ai-agents-core) | Centralized agent framework | AWS ECR | ✅ Active |
+| [lornu-crawler](aivcs://lornu-ai/lornu-crawler) | Site crawler & screenshotter | GCP Artifact Registry | ✅ Active |
 | [cloudflare-dns-agent](apps/cloudflare-dns-agent/README.md) | Multi-Cloud DNS Sync Agent | ECR/GAR/ACR | ✅ Active |
 | [cloudflare-edge-discovery](apps/cloudflare-edge-discovery/README.md) | Edge Discovery Worker (Hyperdrive) | Cloudflare Workers | ✅ Active |
-| [lornu.ai](https://github.com/lornu-ai/lornu.ai) | Hub repository (Crossplane/Flux) | AWS ECR | ✅ Active |
-| [agentnav](https://github.com/lornu-ai/agentnav) | Agentic Navigation module | N/A | ✅ Active |
-| [product-mindset](https://github.com/lornu-ai/product-mindset) | Product Mindset analytics | N/A | ✅ Active |
-| [cursor-agent-rules](https://github.com/lornu-ai/cursor-agent-rules) | Automated AI-Code Review | N/A | ✅ Active |
-| [autonomous-sre-agent](https://github.com/lornu-ai/autonomous-sre-agent) | Sovereign SRE drift detection + auto-remediation | N/A | ✅ Active |
-| [gcp-conversation-service](https://github.com/lornu-ai/gcp-conversation-service) | Gemini Integration hub | GCP Cloud Run | ✅ Active |
-| [email-triage](https://github.com/lornu-ai/email-triage) | Automated email triage | N/A | ✅ Active |
-| [antigravity-ide-tracker](https://github.com/lornu-ai/antigravity-ide-tracker) | IDE/Dev workflow tracking | N/A | ✅ Active |
-| [not-sure](https://github.com/lornu-ai/not-sure) | Migration of stevei101/not-sure | N/A | ✅ Active |
+| [lornu.ai](aivcs://lornu-ai/lornu.ai) | Hub repository (Crossplane/Flux) | AWS ECR | ✅ Active |
+| [agentnav](aivcs://lornu-ai/agentnav) | Agentic Navigation module | N/A | ✅ Active |
+| [product-mindset](aivcs://lornu-ai/product-mindset) | Product Mindset analytics | N/A | ✅ Active |
+| [cursor-agent-rules](aivcs://lornu-ai/cursor-agent-rules) | Automated AI-Code Review | N/A | ✅ Active |
+| [autonomous-sre-agent](aivcs://lornu-ai/autonomous-sre-agent) | Sovereign SRE drift detection + auto-remediation | N/A | ✅ Active |
+| [gcp-conversation-service](aivcs://lornu-ai/gcp-conversation-service) | Gemini Integration hub | GCP Cloud Run | ✅ Active |
+| [email-triage](aivcs://lornu-ai/email-triage) | Automated email triage | N/A | ✅ Active |
+| [antigravity-ide-tracker](aivcs://lornu-ai/antigravity-ide-tracker) | IDE/Dev workflow tracking | N/A | ✅ Active |
+| [not-sure](aivcs://lornu-ai/not-sure) | Migration of stevei101/not-sure | N/A | ✅ Active |
 
 ### **Setting Up New Satellites**
 
@@ -250,7 +250,7 @@ All container builds and multi-cloud pushes are now handled by Dockworker.ai, en
 ### **Automation & Infrastructure Satellites**
 
 **Cloudflare Workers** are managed in the **automation-hub** repository:
-- **Repository**: [lornu-ai/automation-hub](https://github.com/lornu-ai/automation-hub)
+- **Repository**: [lornu-ai/automation-hub](aivcs://lornu-ai/automation-hub)
 - **Workers**: `automation-hub` (CI automation), `lornu-edge-discovery` (agent discovery via Hyperdrive)
 - **Private RAG (Issue #565)**: R2 bucket + Vectorize for agent knowledge grounding
   - Endpoints: `/api/rag/search`, `/api/vectorize/trigger`, `/api/vectorize/status`
@@ -260,7 +260,7 @@ All container builds and multi-cloud pushes are now handled by Dockworker.ai, en
 - **Related Issues**: #589 (Edge Discovery), #542 (CI Automation), #565 (Private RAG)
 
 **GitLab CI/CD** configurations are managed in the **gitlab-container-builds** repository:
-- **Repository**: [lornu-ai/gitlab-container-builds](https://github.com/lornu-ai/gitlab-container-builds)
+- **Repository**: [lornu-ai/gitlab-container-builds](aivcs://lornu-ai/gitlab-container-builds)
 - **Purpose**: GitLab CI/CD pipelines for container builds and multi-cloud mirroring
 - **Related**: GitLab pull mirroring setup (see `docs/GITLAB_MIRROR_SETUP.md`)
 

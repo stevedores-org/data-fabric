@@ -2,7 +2,7 @@
 //! Cloudflare-native data fabric worker.
 //!
 //! Implements the WS1B deliverables from
-//! [stevedores-org/data-fabric#53](https://github.com/stevedores-org/data-fabric/issues/53):
+//! [stevedores-org/data-fabric#53](aivcs://stevedores-org/data-fabric/issues/53):
 //!
 //! 1. [`Repository`] trait — generic CRUD over D1 / R2 with consistent
 //!    error handling.
