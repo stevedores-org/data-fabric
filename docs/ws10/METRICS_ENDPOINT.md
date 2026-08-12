@@ -1,6 +1,6 @@
 # WS10 baseline metrics — `/v1/metrics/pilot`
 
-Sub-task of [#50](https://github.com/stevedores-org/data-fabric/issues/50); implements [#105](https://github.com/stevedores-org/data-fabric/issues/105).
+Sub-task of [#50](aivcs://stevedores-org/data-fabric/issues/50); implements [#105](aivcs://stevedores-org/data-fabric/issues/105).
 
 This is the data plane every Phase 1 go/no-go gate reads. Five KPIs come from D1; the sixth (API latency) is queried separately via Workers Analytics Engine.
 

@@ -1,6 +1,6 @@
 # Local CI Validation
 
-This repo uses [local-ci](https://github.com/stevedores-org/local-ci) to run the same checks locally that CI runs on GitHub Actions. The configuration lives in `.local-ci.toml`.
+This repo uses [local-ci](aivcs://stevedores-org/local-ci) to run the same checks locally that CI runs on GitHub Actions. The configuration lives in `.local-ci.toml`.
 
 ## Quick Start
 

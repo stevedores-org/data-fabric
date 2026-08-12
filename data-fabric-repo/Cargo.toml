@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Stevedores Org"]
 license = "Apache-2.0"
-repository = "https://github.com/stevedores-org/data-fabric"
+repository = "aivcs://stevedores-org/data-fabric"
 description = "Shared D1/R2 repository abstraction, typed error taxonomy, and retry policy for the data-fabric worker (WS1B / issue #53)."
 
 # This crate is a library used inside the Workers wasm runtime. It must

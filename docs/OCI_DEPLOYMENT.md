@@ -384,7 +384,7 @@ podman run --runtime runc data-fabric:latest
 
 ## Resources
 
-- [OCI Image Spec](https://github.com/opencontainers/image-spec)
+- [OCI Image Spec](aivcs://opencontainers/image-spec)
 - [Podman Documentation](https://podman.io/docs/)
 - [Buildah Documentation](https://buildah.io/)
 - [Docker to Podman Migration](https://podman.io/docs/tutorials/migrate-docker-to-podman)

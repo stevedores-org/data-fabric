@@ -468,4 +468,4 @@ jobs:
 - [D1 Documentation](https://developers.cloudflare.com/d1/)
 - [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/)
 - [data-fabric ARCHITECTURE.md](./ARCHITECTURE.md)
-- [oxidizedgraph Repository](https://github.com/stevedores-org/oxidizedgraph)
+- [oxidizedgraph Repository](aivcs://stevedores-org/oxidizedgraph)
